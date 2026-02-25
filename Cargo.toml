@@ -1,0 +1,133 @@
+[package]
+name = "vib3"
+version = "0.1.0"
+edition = "2021"
+authors = ["vib3 contributors"]
+description = "Weight-indexed inference engine for Mixture-of-Experts models"
+license = "Apache-2.0"
+repository = "https://github.com/vib3-dev/vib3"
+keywords = ["inference", "moe", "llm", "gpu", "storage-engine"]
+categories = ["science", "algorithms"]
+
+[lib]
+name = "vib3"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vib3"
+path = "tools/src/bin/run.rs"
+
+[[bin]]
+name = "vib3-serve"
+path = "tools/src/bin/serve.rs"
+
+[[bin]]
+name = "vib3-convert"
+path = "tools/src/bin/convert.rs"
+
+[[bin]]
+name = "vib3-bench"
+path = "tools/src/bin/bench.rs"
+
+[[bin]]
+name = "vib3-inspect"
+path = "tools/src/bin/inspect.rs"
+
+[dependencies]
+# Async runtime + io_uring
+tokio = { version = "1", features = ["full"] }
+io-uring = "0.7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Memory / unsafe helpers
+memmap2 = "0.9"                    # Memory-mapped file I/O
+bytemuck = { version = "1", features = ["derive"] }  # Safe transmute for page data
+zerocopy = { version = "0.8", features = ["derive"] } # Zero-copy deserialization
+
+# Concurrency
+crossbeam = "0.8"                  # Lock-free data structures
+dashmap = "6"                      # Concurrent hashmap for page table
+parking_lot = "0.12"               # Faster mutexes
+
+# CUDA FFI
+cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }  # Safe CUDA wrapper (12.6 bindings, forward-compatible with 12.8 runtime)
+
+# Compression
+lz4_flex = "0.11"                  # LZ4 block compression for page I/O
+zstd = "0.13"                      # Zstd compression for higher ratio (nvCOMP DE on Blackwell)
+
+# Numeric / SIMD
+half = { version = "2", features = ["num-traits"] }  # f16/bf16
+rayon = "1"                        # Parallel iterators for index building
+
+# Vector index (embedded HNSW for weight-space retrieval)
+usearch = "2.23"                   # Embedded HNSW ANN search (Apache 2.0)
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client (for model downloads)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Hashing (for download integrity)
+blake3 = "1"
+
+# Model format parsing
+safetensors = "0.4"
+
+# Tokenizer (HuggingFace tokenizers library)
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# Platform detection
+libc = "0.2"
+
+# HTTP server (for OpenAI-compatible API)
+axum = "0.8"
+tower = "0.5"
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Python bindings (optional)
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+proptest = "1"
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+python = ["dep:pyo3"]
+
+# Benches disabled until implemented
+# [[bench]]
+# name = "page_manager"
+# harness = false
+# 
+# [[bench]]
+# name = "partial_matmul"
+# harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true

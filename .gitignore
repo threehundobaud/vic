@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+
+# Model files (too large for git)
+/models/
+
+# Temporary debug files
+/temp/
+/dump/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
