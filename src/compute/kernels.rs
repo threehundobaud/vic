@@ -1475,9 +1475,9 @@ fn cpu_matmul_int4_grouped(
         for (group, lut_entry) in dequant_lut.iter_mut().enumerate().take(num_groups_actual) {
             let scale_idx = row_scales_start + group * 2;
             let scale = if scale_idx + 1 < w.len() {
-                // Scales are BF16 (not FP16) — must decode as BF16
+                // Scales are FP16 — matching CUDA kernel's fp16_scale_to_float
                 let s_bits = u16::from_le_bytes([w[scale_idx], w[scale_idx + 1]]);
-                let s = bf16_to_f32(s_bits);
+                let s = f16::from_bits(s_bits).to_f32();
                 if s.is_finite() && s > 0.0 {
                     s
                 } else {
@@ -1671,9 +1671,9 @@ fn cpu_swiglu_int4(
         for group in 0..ng {
             let up_scale_idx = up_scales_start + group * 2;
             let up_scale = if up_scale_idx + 1 < up_data.len() {
-                // Scales are BF16 (not FP16) — must decode as BF16
+                // Scales are FP16 — matching CUDA kernel's fp16_scale_to_float
                 let s_bits = u16::from_le_bytes([up_data[up_scale_idx], up_data[up_scale_idx + 1]]);
-                let s = bf16_to_f32(s_bits);
+                let s = f16::from_bits(s_bits).to_f32();
                 if s.is_finite() && s > 0.0 {
                     s
                 } else {
@@ -1685,10 +1685,10 @@ fn cpu_swiglu_int4(
 
             let gate_scale_idx = gate_scales_start + group * 2;
             let gate_scale = if gate_scale_idx + 1 < gate_data.len() {
-                // Scales are BF16 (not FP16) — must decode as BF16
+                // Scales are FP16 — matching CUDA kernel's fp16_scale_to_float
                 let s_bits =
                     u16::from_le_bytes([gate_data[gate_scale_idx], gate_data[gate_scale_idx + 1]]);
-                let s = bf16_to_f32(s_bits);
+                let s = f16::from_bits(s_bits).to_f32();
                 if s.is_finite() && s > 0.0 {
                     s
                 } else {
@@ -2490,9 +2490,9 @@ pub fn quantize_weights_to_int4(weights_f32: &[f32], rows: usize, cols: usize) -
             // scale such that max_abs maps to 7 (the positive range of our offset scheme)
             let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
 
-            // Store scale as BF16
-            let scale_bf16 = f32_to_bf16(scale);
-            let sb = scale_bf16.to_le_bytes();
+            // Store scale as FP16 (matching CUDA kernel's fp16_scale_to_float)
+            let scale_f16 = f16::from_f32(scale);
+            let sb = scale_f16.to_le_bytes();
             let scale_offset = (row * num_groups + group) * 2;
             scales_region[scale_offset] = sb[0];
             scales_region[scale_offset + 1] = sb[1];
@@ -2547,10 +2547,10 @@ pub fn quantize_bf16_to_int4(bf16_data: &[u8], rows: usize, cols: usize) -> Vec<
 /// This is the inverse of `quantize_weights_to_int4`.
 /// The input layout is: `[rows * packed_k INT4 bytes] [rows * num_groups * scale_bytes_each]`
 ///
-/// The scale format may be BF16 or FP16 (2 bytes each). The `scale_format` argument
-/// selects the interpretation:
-/// - `DType::BF16` → scales are BF16 (compressed-tensors format from HuggingFace)
-/// - `DType::FP16` → scales are FP16
+/// The scale format is FP16 (2 bytes each). The `scale_format` argument is retained
+/// for backward compatibility:
+/// - `DType::BF16` → scales are decoded as BF16 (legacy; not used by current converter)
+/// - `DType::FP16` or any other → scales are decoded as FP16 (standard)
 ///
 /// Dequant formula: `(nibble - 8) * scale`
 pub fn dequantize_int4_to_f32(
@@ -2618,11 +2618,11 @@ pub fn dequantize_int4_to_f32(
 
 /// Direct INT4→NVFP4 conversion without f32 intermediate.
 ///
-/// Takes INT4 packed data (with BF16 scales) from compressed-tensors format and
-/// converts to NVFP4 (E2M1 with FP16 scales) in a single pass. This is much faster
-/// than dequant→requant for model conversion.
+/// Takes INT4 packed data (with FP16 scales) and converts to NVFP4 (E2M1 with FP16
+/// scales) in a single pass. This is much faster than dequant→requant for model
+/// conversion.
 ///
-/// Input layout: `[rows * packed_k INT4 bytes] [rows * num_groups * 2 BF16 scale bytes]`
+/// Input layout: `[rows * packed_k INT4 bytes] [rows * num_groups * 2 FP16 scale bytes]`
 /// Output layout: `[rows * packed_k E2M1 bytes] [rows * num_blocks * 2 FP16 scale bytes]`
 pub fn convert_int4_to_nvfp4(
     int4_data: &[u8],
@@ -2681,7 +2681,7 @@ pub fn convert_int4_to_nvfp4(
                 let scale_offset = total_int4_bytes + (row * num_groups_in + col0 / group_size) * 2;
                 let scale0 = if scale_offset + 1 < int4_data.len() {
                     let sb = [int4_data[scale_offset], int4_data[scale_offset + 1]];
-                    bf16_to_f32(u16::from_le_bytes(sb))
+                    f16::from_le_bytes(sb).to_f32()
                 } else {
                     1.0
                 };
@@ -2692,7 +2692,7 @@ pub fn convert_int4_to_nvfp4(
                         total_int4_bytes + (row * num_groups_in + col1 / group_size) * 2;
                     let scale1 = if scale_offset1 + 1 < int4_data.len() {
                         let sb = [int4_data[scale_offset1], int4_data[scale_offset1 + 1]];
-                        bf16_to_f32(u16::from_le_bytes(sb))
+                        f16::from_le_bytes(sb).to_f32()
                     } else {
                         1.0
                     };

@@ -1740,8 +1740,8 @@ fn test_int4_lut_matmul_basic() {
     weight_buf[3] = 0x88;
 
     // Scales: both rows use scale = 1.0
-    let scale_bf16 = 0x3f80u16; // 1.0 in BF16
-    let scale_bytes = scale_bf16.to_le_bytes();
+    let scale_fp16 = 0x3C00u16; // 1.0 in FP16
+    let scale_bytes = scale_fp16.to_le_bytes();
     let scales_start = weight_bytes;
     // Row 0, group 0
     weight_buf[scales_start] = scale_bytes[0];
@@ -1802,8 +1802,8 @@ fn test_int4_lut_matmul_with_scale() {
     weight_buf[0] = 0xAA;
 
     // Scale = 0.5 → dequant(10) = 2 * 0.5 = 1.0
-    let scale_bf16 = 0x3f00u16; // 0.5 in BF16
-    let sb = scale_bf16.to_le_bytes();
+    let scale_fp16 = 0x3800u16; // 0.5 in FP16
+    let sb = scale_fp16.to_le_bytes();
     weight_buf[weight_bytes] = sb[0];
     weight_buf[weight_bytes + 1] = sb[1];
 

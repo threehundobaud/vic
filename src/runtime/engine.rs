@@ -3561,7 +3561,7 @@ impl Engine {
                 let packed_k = hidden_dim / 2; // 4096/2 = 2048
                 let num_groups = hidden_dim.div_ceil(32); // group_size=32
                 let weight_data_size = packed_k * m_slice;
-                let scale_data_size = num_groups * m_slice * 2; // BF16 = 2 bytes
+                let scale_data_size = num_groups * m_slice * 2; // FP16 = 2 bytes
                 let total_page_size = weight_data_size + scale_data_size;
 
                 // Read first 64 bytes of weight data
@@ -3581,17 +3581,17 @@ impl Engine {
                 );
                 let sc_nonzero = sc_buf.iter().filter(|b| **b != 0).count();
 
-                // Decode first 4 scales as BF16
+                // Decode first 4 scales as FP16
                 let scales_u16: Vec<u16> = sc_buf.chunks_exact(2).take(4)
                     .map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                 let scales_f32: Vec<f32> = scales_u16.iter()
-                    .map(|&bits| f32::from_bits((bits as u32) << 16)).collect();
+                    .map(|&bits| half::f16::from_bits(bits).to_f32()).collect();
 
                 tracing::error!(
                     "WEIGHT PAGE DIAG L{} e{} pg{}: total_page={}, wt_data={}, scale_data={}, \
                      wt_first8={:02x?}, wt_nonzero={}/{}, \
                      sc_first8={:02x?}, sc_nonzero={}/{}, \
-                     sc_as_bf16={:?}, sc_as_f32={:?}, \
+                     sc_as_fp16={:?}, sc_as_f32={:?}, \
                      m_slice={}, hidden_dim={}, dtype={:?}",
                     engine_layer, expert_plan.expert_id, _page_pair_idx,
                     total_page_size, weight_data_size, scale_data_size,

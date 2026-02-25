@@ -30,7 +30,7 @@ use std::path::Path;
 pub enum QuantFormat {
     /// No quantization — keep original precision (FP16/BF16).
     None,
-    /// INT4 with per-group BF16 scales (group_size=32). Dequant: (nibble-8)*scale.
+    /// INT4 with per-group FP16 scales (group_size=32). Dequant: (nibble-8)*scale.
     Int4,
     /// NVFP4 (MXFP4 E2M1) with per-block FP16 scales (block_size=32).
     /// Uses E2M1 encoding: sign + 2-bit exponent + 1-bit mantissa.
