@@ -1031,7 +1031,7 @@ mod tests {
         .unwrap();
         assert_eq!(m.layer, 5);
         assert_eq!(m.expert, 3);
-        assert_eq!(m.segment, 0); // w1 = up_proj = segment 0
+        assert_eq!(m.segment, 1); // w1 = gate_proj = segment 1
         assert!(!m.is_shared);
 
         let m = classify_tensor(
@@ -1114,7 +1114,7 @@ mod tests {
         .unwrap();
         assert!(m.is_packed);
         assert!(!m.is_scale);
-        assert_eq!(m.segment, 0);
+        assert_eq!(m.segment, 1); // w1 = gate_proj = segment 1
 
         let m = classify_tensor(
             "model.layers.1.block_sparse_moe.experts.2.w1.weight_scale",
@@ -1627,9 +1627,12 @@ fn classify_tensor(name: &str, config: &ModelConfig) -> Option<TensorMapping> {
     // Expert MoE weights
     if let Some(expert_id) = extract_expert_id(base_name) {
         if !base_name.contains("shared_expert") {
-            let segment = if base_name.contains("up_proj") || base_name.contains("w1") {
+            // Segment mapping: 0 = up_proj, 1 = gate_proj (SiLU input), 2 = down_proj.
+            // Mixtral uses w1/w2/w3 naming where w1=gate_proj, w3=up_proj.
+            // Kimi/DeepSeek uses up_proj/gate_proj naming directly.
+            let segment = if base_name.contains("up_proj") || base_name.contains("w3") {
                 0
-            } else if base_name.contains("gate_proj") || base_name.contains("w3") {
+            } else if base_name.contains("gate_proj") || base_name.contains("w1") {
                 1
             } else if base_name.contains("down_proj") || base_name.contains("w2") {
                 2
