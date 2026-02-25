@@ -3605,12 +3605,13 @@ impl Engine {
 
             if !up_page.device_ptr.is_null() && !gate_page.device_ptr.is_null() {
                 // FP32-input SwiGLU: reads FP32 moe_normed_f32, writes FP16 expert intermediate
-                // Segment 0 = up_proj (multiplied directly), Segment 1 = gate_proj (SiLU applied)
+                // NOTE: segment 0 = w1 = gate_proj (SiLU input), segment 1 = w3 = up_proj
                 // The kernel signature is (input, up_weight, gate_weight) where SiLU is applied to gate.
+                // So we pass: gate_page (w3=up_proj) as up_weight, up_page (w1=gate_proj) as gate_weight.
                 kernels::partial_swiglu_f32(
                     self.moe_normed_f32.as_ptr(),
-                    up_page.device_ptr as *const u8,    // segment 0 = up_proj (multiplied directly)
-                    gate_page.device_ptr as *const u8,  // segment 1 = gate_proj (SiLU applied)
+                    gate_page.device_ptr as *const u8,  // w3 = up_proj (multiplied directly)
+                    up_page.device_ptr as *const u8,    // w1 = gate_proj (SiLU applied)
                     // SAFETY: byte_offset is within expert_output_buf bounds
                     unsafe { self.expert_output_buf.as_mut_ptr().add(byte_offset) },
                     hidden_dim,
