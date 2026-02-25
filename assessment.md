@@ -1,13 +1,13 @@
 # vib3 Assessment: Gemini Conversation vs. Reality
 
-**Date:** February 25, 2026
+**Date:** February 25, 2026 (updated Feb 25 evening)
 **Context:** Honest audit of claims made during a Gemini Deep Research conversation about converting Kimi K2.5 to NVFP4 and running it on a custom tiered inference engine.
 
 ---
 
 ## Executive Summary
 
-The Gemini conversation painted a picture of a fully operational, custom inference engine hitting 50+ tok/s on a 1-trillion parameter model with NVFP4 quantization, cuFile DMA, and a frozen O(1) routing index. The reality is more nuanced but genuinely impressive and further along than initially assessed: vib3 is a ~24K-line Rust engine with ~2K lines of CUDA, 248 passing tests (61 unit + 186 integration + 1 doc-test, verified Feb 25), a working three-tier storage architecture, NVFP4 kernels, and verified coherent output from Mixtral-8x7B at 3.6 tok/s on Blackwell. **Critically, the Kimi K2.5 NVFP4 conversion is actively running** (Docker container `nvfp4-convert3`, processing 64 safetensors files at 555GB BF16 source -> NVFP4/E2M1 block-32 with Zstd level 3). A previous unquantized conversion (480GB `.vib3`, Feb 23) already validated the MLA code path against PyTorch ground truth. The gap between "what was implied" and "what exists" is closable and actively being closed.
+The Gemini conversation painted a picture of a fully operational, custom inference engine hitting 50+ tok/s on a 1-trillion parameter model with NVFP4 quantization, cuFile DMA, and a frozen O(1) routing index. The reality is more nuanced but genuinely impressive and further along than initially assessed: vib3 is a ~24K-line Rust engine with ~2K lines of CUDA, 248 passing tests (61 unit + 186 integration + 1 doc-test, verified Feb 25), a working three-tier storage architecture, NVFP4 kernels, and **verified correct output from Mixtral-8x7B INT4 at ~22 tok/s on Blackwell** ("The sum of 2 and 2 is 4.", "The capital of France is Paris."). Three critical bugs were diagnosed and fixed on Feb 25 (FP16/BF16 scale mismatch, router normalization, SwiGLU gate/up swap — see "Mixtral Bug Fixes" section below). **Critically, the Kimi K2.5 NVFP4 conversion is actively running** (Docker container `nvfp4-convert3`, processing 64 safetensors files at 555GB BF16 source -> NVFP4/E2M1 block-32 with Zstd level 3). A previous unquantized conversion (480GB `.vib3`, Feb 23) already validated the MLA code path against PyTorch ground truth. The gap between "what was implied" and "what exists" is closable and actively being closed.
 
 ---
 
@@ -30,7 +30,7 @@ The Gemini conversation painted a picture of a fully operational, custom inferen
 | Model conversion | **REAL** | Mixtral-8x7B converted: 87GB FP16 `.vib3` and 23GB INT4 `.vib3` files exist on disk |
 | Kimi K2.5 NVFP4 conversion | **IN PROGRESS** | Docker container `nvfp4-convert3` (restarted from convert2): 555GB BF16 source (64 safetensors) -> NVFP4/E2M1 block-32 + Zstd-3. Memory: 10.4GB/188GB (5.5%). Output on separate 3.6TB NVMe with 2.6TB free |
 | Previous Kimi K2.5 validation | **DONE** | 480GB unquantized `.vib3` (Feb 23) already used to validate MLA code path. Ground truth dumps exist at `dump/gt_mla_L1_*.f32` and `dump/gt_mla_L6_*.f32` from Feb 24 PyTorch reference comparison |
-| Real model inference | **REAL** | 3.6 tok/s decode on Mixtral-8x7B INT4, verified coherent output ("Hello! I'm" for "Hi" prompt) |
+| Real model inference | **REAL** | ~22 tok/s decode, ~700ms TTFT on Mixtral-8x7B INT4. Verified correct: "The sum of 2 and 2 is 4.", "The capital of France is Paris." Three critical bugs fixed Feb 25 (see below) |
 | Dual-mode specialist/generalist | **REAL** | Shannon entropy detection, EMA smoothing, hysteresis, specialist pinning with 70% T1 budget |
 | Tiered KV cache | **REAL** | Per-layer per-head tracking, ANN-indexed retrieval, unified eviction across weights + KV |
 | OpenAI-compatible API | **REAL** | Axum server with SSE streaming |
@@ -78,6 +78,58 @@ Ground truth tensor magnitudes from the Feb 24 validation run reveal a precision
 The `kv_latent_normed` values at ~0.004 magnitude will stress E2M1's 1-bit mantissa. Block-32 scaling mitigates this by "zooming in" on the local value range, but this tensor is the most likely source of NVFP4 degradation. **Cosine similarity** (direction preservation) is the correct primary metric here, not MAE -- downstream RMSNorm absorbs magnitude differences.
 
 The current `is_acceptable()` threshold (MAE < 0.5, cosine > 0.9) was calibrated for INT4. For NVFP4, MAE < 0.5 is meaningless on a tensor with mean 0.004 (error would be 125x the signal). Cosine > 0.99 at L1 and > 0.95 at L6 are the thresholds that matter.
+
+---
+
+## Mixtral-8x7B Bug Fixes (Feb 25)
+
+Three critical bugs were diagnosed and fixed, progressing Mixtral output from garbled tokens to verified correct answers. All three bugs were in the INT4/MoE code path.
+
+### Bug 1: FP16 vs BF16 Scale Mismatch (fixed in initial commit, 3a119ec)
+
+**Root Cause:** The INT4 CUDA kernels decoded quantization scales using `bf16_to_float()` (BF16 format), but the `.vib3` file stores scales in **FP16 format**. An FP16 scale of 0.003 interpreted as BF16 becomes 4.7e-23 — a ~10^20 error.
+
+**Fix:** Added `fp16_scale_to_float()` in `kernels.cu` at 4 call sites (partial_matmul_int4, fused_swiglu_fp16 gate path, fused_swiglu_fp16 up path, partial_matmul_int4_fp16in).
+
+### Bug 2: Softmax Router Top-K Normalization Missing (fixed in 2c7e294)
+
+**Root Cause:** `run_router_f32()` in `kernels.rs` (line ~767) computed softmax over ALL experts, selected top-k, but **didn't renormalize** the selected weights to sum to 1.0. For Mixtral top-2, weights summed to ~0.49 instead of 1.0, halving MoE contribution.
+
+**Evidence:** Engine showed e5=0.3834, e1=0.1098 (sum=0.49); BF16 reference showed e5=0.7774, e1=0.2226 (sum=1.0). After normalizing: 0.3834/0.4932=0.7774 — exact match.
+
+**Fix:** Added normalization block after `indexed.truncate(top_k)` in `run_router_f32()`. Note: the CPU fallback `gpu_run_router()` was already correct (computes softmax over only the top-k).
+
+### Bug 3: SwiGLU Gate/Up Projection Swap (fixed in 2c7e294)
+
+**Root Cause:** Mixtral's `w1 = gate_proj` (SiLU input), `w3 = up_proj` (multiplied directly). But `convert.rs` maps `w1 → segment 0 ("up")` and `w3 → segment 1 ("gate")`. The engine then passed segment 0 as `up_weight` and segment 1 as `gate_weight` to the SwiGLU kernel, computing `SiLU(w3)*w1` instead of correct `SiLU(w1)*w3`.
+
+**Evidence:** L0 MoE output had correct magnitude (ratio 0.93) but wrong direction (cosine 0.65). FP16 model showed same garbled output, proving it wasn't a quantization issue. BF16 reference comparison confirmed the MoE output vector direction was wrong.
+
+**Fix:** Swapped arguments at the call site in `execute_expert()` (engine.rs ~line 3600-3601): gate_page passed as up_weight, up_page passed as gate_weight. The naming mismatch in convert.rs (w1→"up", w3→"gate") is fundamentally wrong for Mixtral but would require model reconversion to fix properly.
+
+**Impact on Kimi K2.5:** Kimi uses `up_proj`/`gate_proj` naming (not `w1`/`w3`), so the converter mapping is correct for Kimi. The swap fix is Mixtral-specific due to the segment assignment.
+
+### Per-Layer Cosine Similarity After All Fixes (Mixtral INT4 vs BF16 Ground Truth)
+
+| Layer | BF16 GT L2 | vib3 INT4 L2 | Ratio | Cosine |
+|-------|-----------|-------------|-------|--------|
+| 0 | 2.02 | 1.95 | 0.97 | 0.857 |
+| 5 | 27.14 | 21.53 | 0.79 | 0.905 |
+| 10 | 49.66 | 42.98 | 0.87 | 0.905 |
+| 15 | 89.84 | 81.29 | 0.90 | 0.889 |
+| 20 | 233.11 | 198.46 | 0.85 | 0.861 |
+| 31 | 602.84 | 536.06 | 0.89 | 0.582 |
+
+Cosine degrades gradually (expected for INT4 vs BF16 over 32 layers), but magnitude ratios are stable 0.79-0.97. Output is coherent and factually correct despite cosine drift. The L1 expert 3 "explosion" (SwiGLU L2≈2750 at BOS pos=0) was confirmed as legitimate model behavior — BF16 reference shows identical L2=2749.
+
+### Verified Output
+
+```
+Prompt: "What is 2+2?"  → "The sum of 2 and 2 is 4."
+Prompt: "What is the capital of France?" → "The capital of France is Paris."
+```
+
+Speed: ~22 tok/s decode, ~700ms TTFT, 100% T1 hit rate (entire Mixtral INT4 model fits in 96GB VRAM).
 
 ---
 
@@ -441,7 +493,7 @@ These are things the Gemini conversation implied were operational ("What do you 
 
 ### 1. "50+ tokens/sec on a 1-trillion parameter model"
 
-**Current reality:** 3.6 tok/s on Mixtral-8x7B (46B parameters, ~23GB INT4). This is 22x smaller than Kimi K2.5 (1T parameters, ~570GB INT4).
+**Current reality:** ~22 tok/s on Mixtral-8x7B (46B parameters, ~23GB INT4) with verified correct output. This is 22x smaller than Kimi K2.5 (1T parameters, ~570GB INT4). The 3.6 tok/s figure from earlier was measured before the three bug fixes and with heavy diagnostic logging enabled; 22 tok/s is measured with `RUST_LOG=error`.
 
 **Gap:** The whitepaper's own I/O analysis shows ~200 tok/s ceiling from compressed RAM on Blackwell. The 50+ target is theoretically achievable IF the prefetch pipeline keeps T1 hits near 100%. But this has not been demonstrated on any model larger than Mixtral.
 
@@ -701,15 +753,20 @@ All modified after the assessment.md was written, in order of last modification:
 9. `src/core/config.rs` — 14:43
 10. `src/core/types.rs` — 14:42
 
-No git history (not a git repo), so individual changes cannot be tracked. **Recommendation: initialize git immediately to enable tracking what changed between runs.**
+**Git repo initialized Feb 25.** Two commits on `master`: `3a119ec` (initial commit with FP16/BF16 scale fix) and `2c7e294` (router normalization + gate/up swap fixes). Working tree clean.
 
 ### Next Steps for Debugging
+
+**Mixtral-8x7B: RESOLVED.** Three bugs found and fixed (see "Mixtral Bug Fixes" section). Output verified correct. No further Mixtral debugging needed unless new failure modes appear.
+
+**Kimi K2.5 (still blocked at L6):**
 
 1. **L6 triage (highest priority):**
    - Check VRAM vs disk comparison output at L6 — is expert page data correct?
    - Compare engine's L6 router output (expert IDs + weights) against ref_check.py for the same token
    - Add L5 and L4 per-expert accumulation diagnostics (same as L6) to see if the explosion pattern starts earlier
    - Run with `--max-layers 6` (skip L6 MoE) to confirm the attention path is clean
+   - Note: the three Mixtral bugs do NOT explain the Kimi L6 issue (different code paths)
 
 2. **L2/L3 investigation (lower priority):**
    - Dump L2 and L3 MLA intermediates (currently only L1 and L6 are dumped)
@@ -717,26 +774,27 @@ No git history (not a git repo), so individual changes cannot be tracked. **Reco
    - Check whether the L3 L2-norm undershoot is consistent across different prompts
 
 3. **Process improvement:**
-   - **Init git and commit baseline** — cannot track debugging changes without VCS
+   - ~~Init git and commit baseline~~ — **DONE.** Two commits on `master`.
    - Add a `--validate` mode that runs ref_check.py in parallel and compares per-layer outputs automatically
    - Consider adding per-layer cosine as a CI metric
+   - Clean up debug diagnostics in engine.rs (heavy logging at ~15 locations, should be gated behind a flag)
 
 ---
 
 ## Bottom Line
 
-**What's real:** A complete, working, tested inference engine with NVFP4 support, tiered storage, predictive prefetching, and Blackwell GPU integration. This is not vaporware -- 24K lines of Rust, 2K lines of CUDA, 248 tests (all passing as of Feb 25), 87GB of converted Mixtral files, 3.6 tok/s measured benchmarks on Mixtral-8x7B INT4, and a 480GB unquantized Kimi K2.5 `.vib3` conversion that validates through layer 5 (cosine >0.92 vs PyTorch ground truth). The MLA attention path works — L0 through L5 produce directionally correct hidden states. The 555GB NVFP4 conversion has completed or is near completion.
+**What's real:** A complete, working, tested inference engine with NVFP4 support, tiered storage, predictive prefetching, and Blackwell GPU integration. This is not vaporware -- 24K lines of Rust, 2K lines of CUDA, 248 tests (all passing as of Feb 25), 87GB of converted Mixtral files, **~22 tok/s with verified correct output on Mixtral-8x7B INT4** ("The sum of 2 and 2 is 4.", "The capital of France is Paris."), and a 480GB unquantized Kimi K2.5 `.vib3` conversion that validates through layer 5 (cosine >0.92 vs PyTorch ground truth). Three critical bugs were found and fixed on Feb 25 (FP16/BF16 scale mismatch, router normalization, SwiGLU gate/up swap — see "Mixtral Bug Fixes" section). Git repo initialized with two commits tracking all fixes.
 
-**What's broken right now:** Layer 6 MoE output explodes catastrophically (L2 norm 91.8 vs ground truth 2.85, cosine -0.092). The signal is intact through L6 attention (prenorm cosine 0.804) but the MoE expert computation destroys it — a 32x norm explosion that produces anti-correlated output. This is a bug, not a quantization issue. Additionally, L2/L3 show faster-than-expected cosine degradation (~0.025-0.027 per layer vs expected ~0.01), with L3 being the first layer where vib3's L2 norm undershoots ground truth (0.94x ratio). Ten source files were modified during debugging on Feb 25 but no git history exists to track what changed.
+**What's broken right now (Kimi K2.5 only):** Layer 6 MoE output explodes catastrophically (L2 norm 91.8 vs ground truth 2.85, cosine -0.092). The signal is intact through L6 attention (prenorm cosine 0.804) but the MoE expert computation destroys it — a 32x norm explosion that produces anti-correlated output. This is a bug, not a quantization issue (the Kimi model is unquantized BF16→FP16). Note: the three Mixtral bugs (scale mismatch, router normalization, SwiGLU swap) are NOT the cause of the Kimi L6 issue — the scale fix applies to INT4 only, the router normalization applies to softmax routing (Mixtral) not sigmoid routing (Kimi), and the SwiGLU swap is Mixtral-specific (Kimi's converter mapping is already correct). The Kimi L6 bug is a separate, undiagnosed issue.
 
-**What's not real yet:** The 50+ tok/s on 1T claim. That's the target, not the current state. The current state is 3.6 tok/s on Mixtral-8x7B (46B model) and broken output on Kimi K2.5 past layer 6. The routing index is architecturally complete but uncalibrated. The sidecar index format (`.vib3.idx`) and synthetic building pipeline are designed but not yet implemented.
+**What's not real yet:** The 50+ tok/s on 1T claim. That's the target, not the current state. The current state is ~22 tok/s on Mixtral-8x7B (46B model) and broken output on Kimi K2.5 past layer 6. The routing index is architecturally complete but uncalibrated. The sidecar index format (`.vib3.idx`) and synthetic building pipeline are designed but not yet implemented.
 
 **What the Gemini conversation got right:** The fundamental architecture (tiered storage, page-level access, predictive routing, NVFP4 quantization) is sound and implemented. Gemini understood the concept correctly. Gemini was also right that the Kimi conversion was in progress.
 
 **What the Gemini conversation oversold:** The conversation implied inference was operational at Kimi K2.5 scale with cuFile DMA and a frozen O(1) routing index. It accepted "Yes" to "did you freeze the router into a static hash table?" without asking for evidence. It quoted wrong numbers (2GB per expert, actually ~24MB). It offered to build tools that already existed.
 
-**What the desk check revealed:** The MLA CUDA kernels (RoPE split, Q absorption, KV cache append) are correctly implemented at the instruction level. YaRN parameters match spec. Sigmoid routing with bias correctly separates selection from weighting. However, end-to-end correctness through MoE layers is NOT validated — the L6 explosion proves that something in the MoE expert dispatch path (page loading, SwiGLU, down_proj, weighted accumulation, or shared expert) has a bug that manifests when hidden state error accumulates past a threshold.
+**What the desk check revealed:** The MLA CUDA kernels (RoPE split, Q absorption, KV cache append) are correctly implemented at the instruction level. YaRN parameters match spec. Sigmoid routing with bias correctly separates selection from weighting. The Mixtral MoE path is now end-to-end correct after three bug fixes. The Kimi K2.5 MoE path has a separate bug manifesting at L6 that remains undiagnosed.
 
-**The honest pitch:** vib3 is a serious, well-engineered prototype that has proven its core thesis on Mixtral-8x7B. The Kimi K2.5 MLA attention path works through 6 layers with gradually degrading accuracy. The blocking issue is a bug in the MoE expert computation at L6 that causes a catastrophic output explosion. This is a debugging problem, not a research problem — the diagnostic infrastructure to find it is extensive (per-expert accumulation tracing, VRAM-vs-disk page comparison, MLA intermediate dumps). Once the L6 bug is fixed, the next gate is whether the per-layer cosine degradation (~0.02-0.03/layer) is inherent to the unquantized-to-FP16 conversion or a fixable precision issue. If per-layer cosine holds above 0.99, the 61 layers of Kimi K2.5 would maintain cosine >0.5 at the final layer — marginal but possibly usable. If per-layer cosine stays at the current ~0.97, it will degrade to ~0.16 by layer 61 — not usable. The sidecar index format means index iteration is decoupled from the multi-hundred-GB model file once correctness is achieved.
+**The honest pitch:** vib3 is a serious, well-engineered prototype that has **proven its core thesis on Mixtral-8x7B** with verified correct output at ~22 tok/s. The debugging methodology works: three bugs found through systematic comparison against BF16 ground truth, each with clear root cause and targeted fix. The Kimi K2.5 MLA attention path works through 6 layers with gradually degrading accuracy. The blocking issue for Kimi is a separate bug in the L6 MoE expert computation. The diagnostic infrastructure is extensive. Once the Kimi L6 bug is fixed, the next gate is whether the per-layer cosine degradation (~0.02-0.03/layer on the unquantized conversion) is inherent to BF16→FP16 truncation or a fixable precision issue. The sidecar index format means index iteration is decoupled from the multi-hundred-GB model file once correctness is achieved.
 
-**The best description of what vib3 actually is:** A database engine where the "rows" are quantized neural network weight pages, the "queries" are expert routing decisions, and the "query optimizer" uses profiled access patterns to prefetch data before the query arrives. The neural router is the query; the tiered storage engine is the database; the profiler-driven vector index is the covering index that makes it fast. The index is a versioned, auto-tuned artifact that evolves from weight statistics (epoch 0) through synthetic router probing (epoch 1) to full calibration (epoch 2+), persisted in a <1MB sidecar file that hot-swaps without touching the multi-hundred-GB model data. Strip the AI terminology and it's enterprise data architecture applied to inference. **Currently blocked on an L6 MoE correctness bug that must be fixed before any performance claims are meaningful.**
+**The best description of what vib3 actually is:** A database engine where the "rows" are quantized neural network weight pages, the "queries" are expert routing decisions, and the "query optimizer" uses profiled access patterns to prefetch data before the query arrives. The neural router is the query; the tiered storage engine is the database; the profiler-driven vector index is the covering index that makes it fast. The index is a versioned, auto-tuned artifact that evolves from weight statistics (epoch 0) through synthetic router probing (epoch 1) to full calibration (epoch 2+), persisted in a <1MB sidecar file that hot-swaps without touching the multi-hundred-GB model data. Strip the AI terminology and it's enterprise data architecture applied to inference. **Mixtral-8x7B INT4 is fully working. Kimi K2.5 is blocked on an L6 MoE bug. No `.vib3` file exists for Kimi NVFP4 yet (conversion status unknown — container may have completed or stalled).**

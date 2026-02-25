@@ -243,6 +243,11 @@ pub struct Engine {
     /// selection but NOT used in final expert weights.
     /// Loaded from external binary file at startup.
     e_score_correction_bias: Option<Vec<Vec<f32>>>,
+
+    /// Enable verbose per-layer diagnostics (MoE norms, SwiGLU intermediates,
+    /// VRAM-vs-disk comparisons, MLA dumps, etc.). Set via `VIB3_DIAG=1` env var.
+    /// Off by default to avoid overhead in normal inference.
+    diag_enabled: bool,
 }
 
 // SAFETY: Engine is only accessed through a tokio::sync::Mutex in the API server,
@@ -751,6 +756,7 @@ impl Engine {
             task_context: None,
             gear_profiles: std::collections::HashMap::new(),
             e_score_correction_bias: None,
+            diag_enabled: std::env::var("VIB3_DIAG").map_or(false, |v| v == "1"),
         })
     }
 
@@ -1225,7 +1231,7 @@ impl Engine {
             )?;
 
             // Debug: log embedding output for last token in prefill
-            if tok_idx == tokens.len() - 1 {
+            if self.diag_enabled && tok_idx == tokens.len() - 1 {
                 self.stream.synchronize().ok();
                 let hidden_bytes = hidden_dim * std::mem::size_of::<f16>();
                 let mut h_buf = vec![0u8; hidden_bytes];
@@ -1256,7 +1262,7 @@ impl Engine {
                 self.run_attention_layer(layer_idx).await?;
 
                 // Detailed diagnostic: after attention, before MoE
-                if is_last_token && layer_idx <= 5 {
+                if self.diag_enabled && is_last_token && layer_idx <= 5 {
                     self.stream.synchronize()?;
                     // Read FP32 accumulator (the authoritative hidden state)
                     let f32_bytes = hidden_dim * 4;
@@ -1290,7 +1296,7 @@ impl Engine {
 
                 // Diagnostic: log hidden state stats after each layer for the last prefill token
                 // NOTE: We read hidden_state_f32 (the actual accumulator), not hidden_state (stale FP16)
-                if is_last_token && (layer_idx <= 15 || layer_idx % 5 == 0 || layer_idx >= num_layers as u16 - 2) {
+                if self.diag_enabled && is_last_token && (layer_idx <= 15 || layer_idx % 5 == 0 || layer_idx >= num_layers as u16 - 2) {
                     self.stream.synchronize()?;
                     let f32_bytes = hidden_dim * 4;
                     let mut diag_buf = vec![0u8; f32_bytes];
@@ -1409,9 +1415,9 @@ impl Engine {
                     )?;
 
                     // Diagnostic: log o_proj output magnitude during prefill and decode
-                    let diag_attn = (self.decode_step <= 3 && (layer_idx <= 2 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30 || layer_idx == 60))
+                    let diag_attn = self.diag_enabled && ((self.decode_step <= 3 && (layer_idx <= 2 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30 || layer_idx == 60))
                         || (self.decode_step == 0 && (layer_idx <= 1 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30 || layer_idx == 60))
-                        || (self.decode_step == 3 && layer_idx >= 11 && layer_idx <= 29);
+                        || (self.decode_step == 3 && layer_idx >= 11 && layer_idx <= 29));
                     if diag_attn {
                         self.stream.synchronize()?;
                         let f32_o_bytes = hidden_dim * 4;
@@ -2183,7 +2189,8 @@ impl Engine {
                 // The o_proj will read F32 directly to avoid FP16 truncation.
 
                 // ── MLA intermediate diagnostics for L1 and L6 at pos 0 ──
-                let mla_diag = self.position == 0 && (layer_idx == 1 || layer_idx == 6);
+                // Gated behind VIB3_DIAG=1 to avoid overhead in normal inference.
+                let mla_diag = self.diag_enabled && self.position == 0 && (layer_idx == 1 || layer_idx == 6);
                 if mla_diag {
                     self.stream.synchronize()?;
 
@@ -2690,7 +2697,8 @@ impl Engine {
         // ═══ CRITICAL DIAGNOSTIC: Check moe_normed_f32 after RMSNorm ═══
         // This isolates whether the MoE all-zeros bug is in the norm or the SwiGLU kernel.
         // Fires on decode_step 0 for first 3 layers + L31, to minimize overhead.
-        if self.decode_step <= 1 && (layer_idx <= 2 || layer_idx == 31) {
+        // Gated behind VIB3_DIAG=1 to avoid overhead in normal inference.
+        if self.diag_enabled && self.decode_step <= 1 && (layer_idx <= 2 || layer_idx == 31) {
             self.stream.synchronize()?;
             let f32_bytes = hidden_dim * std::mem::size_of::<f32>();
             let mut normed_buf = vec![0u8; f32_bytes];
@@ -2721,7 +2729,7 @@ impl Engine {
         // ═══ END CRITICAL DIAGNOSTIC ═══
 
          // Diagnostic: log pre-norm and post-norm magnitudes for last prefill token
-        if self.position > 0 && (layer_idx == 1 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30) {
+        if self.diag_enabled && self.position > 0 && (layer_idx == 1 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30) {
             self.stream.synchronize()?;
             let mut h_buf = vec![0u8; hidden_bytes];
             self.hidden_state.copy_to_host(&mut h_buf)?;
@@ -2764,9 +2772,9 @@ impl Engine {
 
         // Diagnostic: log expert plan details for first decode step, first MoE layer
         // Also log for layers 1-10 at pos=0 to investigate explosion
-        if (self.decode_step == 1 && layer_idx == 1)
+        if self.diag_enabled && ((self.decode_step == 1 && layer_idx == 1)
             || (self.position == 0 && layer_idx <= 10)
-            || (layer_idx == 5 || layer_idx == 6) {
+            || (layer_idx == 5 || layer_idx == 6)) {
             tracing::info!(
                 "EXPERT PLAN DIAG L{} pos={}: {} experts activated, router=({:?})",
                 layer_idx, self.position, plan.experts.len(),
@@ -2791,7 +2799,7 @@ impl Engine {
             self.execute_expert(expert_plan, hidden_dim).await?;
 
             // Diagnostic: after each expert at layer 6, check accumulated output (now FP32)
-            if layer_idx == 6 && self.position == 26 {
+            if self.diag_enabled && layer_idx == 6 && self.position == 26 {
                 self.stream.synchronize()?;
                 let mut out_buf = vec![0u8; hidden_dim * 4]; // FP32
                 self.layer_output_buf.copy_to_host(&mut out_buf)?;
@@ -2811,9 +2819,9 @@ impl Engine {
         }
 
         // Diagnostic: log layer output magnitude for decode step 1 or prefill layers 1-10 (now FP32)
-        if (self.decode_step == 1 && (layer_idx == 1 || layer_idx == 30 || layer_idx == 60))
+        if self.diag_enabled && ((self.decode_step == 1 && (layer_idx == 1 || layer_idx == 30 || layer_idx == 60))
             || (self.position == 0 && layer_idx <= 10)
-            || (layer_idx == 5 || layer_idx == 6) {
+            || (layer_idx == 5 || layer_idx == 6)) {
             self.stream.synchronize()?;
             let mut out_buf = vec![0u8; hidden_dim * 4]; // FP32
             self.layer_output_buf.copy_to_host(&mut out_buf)?;
@@ -3096,8 +3104,8 @@ impl Engine {
                     let resid_us = t_res.elapsed().as_micros() as u64;
 
                     // Diagnostic: log MoE output magnitude for steps 1-3 (now FP32)
-                    if (step <= 3 && (layer_idx <= 2 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30 || layer_idx >= num_layers as u16 - 2))
-                        || (step == 3 && layer_idx >= 11 && layer_idx <= 29) {
+                    if self.diag_enabled && ((step <= 3 && (layer_idx <= 2 || layer_idx == 5 || layer_idx == 6 || layer_idx == 10 || layer_idx == 30 || layer_idx >= num_layers as u16 - 2))
+                        || (step == 3 && layer_idx >= 11 && layer_idx <= 29)) {
                         self.stream.synchronize()?;
                         let mut lo_buf = vec![0u8; hidden_dim * 4]; // FP32
                         self.layer_output_buf.copy_to_host(&mut lo_buf)?;
@@ -3447,9 +3455,10 @@ impl Engine {
         // Check whether the bytes the CUDA kernel is about to read in VRAM
         // actually match what's stored on disk in the .vib3 file.
         // Runs at position 0 for layers 1,5,6,7,8 to isolate where corruption starts.
+        // Gated behind VIB3_DIAG=1 to avoid overhead in normal inference.
         {
 
-            if self.position == 0
+            if self.diag_enabled && self.position == 0
                 && (engine_layer == 1 || engine_layer == 5 || engine_layer == 6
                     || engine_layer == 7 || engine_layer == 8)
             {
@@ -3546,7 +3555,8 @@ impl Engine {
 
             // ═══ WEIGHT PAGE DATA DIAGNOSTIC ═══
             // Read first weight bytes AND scale bytes from device to verify they're nonzero
-            if self.position == 0 && (engine_layer <= 1) && _page_pair_idx == 0 {
+            // Gated behind VIB3_DIAG=1 to avoid overhead in normal inference.
+            if self.diag_enabled && self.position == 0 && (engine_layer <= 1) && _page_pair_idx == 0 {
                 self.stream.synchronize()?;
                 let packed_k = hidden_dim / 2; // 4096/2 = 2048
                 let num_groups = hidden_dim.div_ceil(32); // group_size=32
@@ -3617,7 +3627,8 @@ impl Engine {
         }
 
         // ═══ CRITICAL DIAGNOSTIC: SwiGLU intermediate (fires L0-L2, L31 on first token) ═══
-        if self.position <= 1 && (engine_layer <= 2 || engine_layer == 31) {
+        // Gated behind VIB3_DIAG=1 to avoid overhead in normal inference.
+        if self.diag_enabled && self.position <= 1 && (engine_layer <= 2 || engine_layer == 31) {
             self.stream.synchronize()?;
             let expert_hidden_dim_diag = self.model_config.expert_hidden_dim as usize;
             let mut inter_buf = vec![0u8; expert_hidden_dim_diag * 2]; // FP16
@@ -3675,7 +3686,7 @@ impl Engine {
         }
 
         // Diagnostic: per-expert down_proj output at L6, pos=0
-        if engine_layer == 6 && self.position == 0 {
+        if self.diag_enabled && engine_layer == 6 && self.position == 0 {
             self.stream.synchronize()?;
             let mut down_buf = vec![0u8; hidden_dim * 2];
             self.down_proj_buf.copy_to_host(&mut down_buf)?;
@@ -3772,7 +3783,7 @@ impl Engine {
                 )?;
 
                 // Diagnostic: shared expert output at L6, pos=0
-                if layer == 6 && self.position == 0 {
+                if self.diag_enabled && layer == 6 && self.position == 0 {
                     self.stream.synchronize()?;
                     let mut se_buf = vec![0u8; hidden_dim * 2];
                     self.shared_expert_down_dev.copy_to_host(&mut se_buf)?;
