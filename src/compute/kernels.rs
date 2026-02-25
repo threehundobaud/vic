@@ -778,7 +778,18 @@ pub fn run_router_f32(
                         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     indexed.truncate(top_k);
 
-                    return Ok(indexed.iter().map(|&(i, w)| (i as u16, w)).collect());
+                    // Normalize top-k weights to sum to 1.0
+                    // (softmax over all experts leaves probability mass on non-selected experts)
+                    let topk_sum: f32 = indexed.iter().map(|&(_, w)| w).sum();
+                    let mut topk: Vec<(u16, f32)> =
+                        indexed.iter().map(|&(i, w)| (i as u16, w)).collect();
+                    if topk_sum > 0.0 {
+                        for (_, w) in topk.iter_mut() {
+                            *w /= topk_sum;
+                        }
+                    }
+
+                    return Ok(topk);
                 }
             }
         }

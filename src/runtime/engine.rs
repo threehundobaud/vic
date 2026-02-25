@@ -1255,19 +1255,26 @@ impl Engine {
                 // ── Attention sublayer (with pre-norm + residual) ──
                 self.run_attention_layer(layer_idx).await?;
 
-                // Layer 6 detailed diagnostic: after attention, before MoE
-                if is_last_token && (layer_idx == 5 || layer_idx == 6) {
+                // Detailed diagnostic: after attention, before MoE
+                if is_last_token && layer_idx <= 5 {
                     self.stream.synchronize()?;
-                    let mut h_buf = vec![0u8; hidden_dim * 2];
-                    self.hidden_state.copy_to_host(&mut h_buf)?;
-                    let h_f16 = unsafe { std::slice::from_raw_parts(h_buf.as_ptr() as *const f16, hidden_dim) };
-                    let h_l2 = h_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
-                    let h_max = h_f16.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
-                    let h_min = h_f16.iter().map(|v| v.to_f32()).fold(f32::INFINITY, f32::min);
+                    // Read FP32 accumulator (the authoritative hidden state)
+                    let f32_bytes = hidden_dim * 4;
+                    let mut diag_buf = vec![0u8; f32_bytes];
+                    self.hidden_state_f32.copy_to_host(&mut diag_buf)?;
+                    let h_f32 = unsafe { std::slice::from_raw_parts(diag_buf.as_ptr() as *const f32, hidden_dim) };
+                    let h_l2 = h_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let h_max = h_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let h_min = h_f32.iter().cloned().fold(f32::INFINITY, f32::min);
                     tracing::info!(
-                        "LAYER{} DIAG after_attn: L2={:.4}, min={:.4}, max={:.4}",
-                        layer_idx, h_l2, h_min, h_max,
+                        "LAYER{} DIAG after_attn (f32): L2={:.4}, min={:.6}, max={:.6}, first4=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx, h_l2, h_min, h_max, h_f32[0], h_f32[1], h_f32[2], h_f32[3],
                     );
+                    // Dump to file
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let _ = std::fs::create_dir_all(dump_dir);
+                    let dump_path = format!("{}/vib3_mixtral_after_attn_f32_L{}_lastpos.bin", dump_dir, layer_idx);
+                    let _ = std::fs::write(&dump_path, &diag_buf);
                 }
 
                 // ── MoE/FFN sublayer (with pre-norm + residual) ──
@@ -1301,11 +1308,11 @@ impl Engine {
                         tok_idx, layer_idx, h_min, h_max, h_mean, h_l2, h_nan,
                     );
 
-                    // Dump FP32 hidden state for layers 0-6 to compare with Python GT
-                    if layer_idx <= 6 {
-                        let dump_dir = "/model/dump";
+                    // Dump FP32 hidden state for selected layers to compare with Python GT
+                    if matches!(layer_idx, 0 | 1 | 2 | 5 | 10 | 15 | 20 | 25 | 30 | 31) {
+                        let dump_dir = "/home/brian/code/vib3/dump";
                         let _ = std::fs::create_dir_all(dump_dir);
-                        let dump_path = format!("{}/hidden_f32_L{}_pos{}.bin", dump_dir, layer_idx, tok_idx);
+                        let dump_path = format!("{}/vib3_mixtral_hidden_f32_L{}_lastpos.bin", dump_dir, layer_idx);
                         let _ = std::fs::write(&dump_path, &diag_buf);
                         tracing::info!("DUMPED FP32 hidden state to {} ({} bytes)", dump_path, diag_buf.len());
                     }
@@ -3588,10 +3595,13 @@ impl Engine {
 
             if !up_page.device_ptr.is_null() && !gate_page.device_ptr.is_null() {
                 // FP32-input SwiGLU: reads FP32 moe_normed_f32, writes FP16 expert intermediate
+                // NOTE: segment 0 = w1 = gate_proj (SiLU input), segment 1 = w3 = up_proj
+                // The kernel signature is (input, up_weight, gate_weight) where SiLU is applied to gate.
+                // So we pass: gate_page (w3=up_proj) as up_weight, up_page (w1=gate_proj) as gate_weight.
                 kernels::partial_swiglu_f32(
                     self.moe_normed_f32.as_ptr(),
-                    up_page.device_ptr as *const u8,
-                    gate_page.device_ptr as *const u8,
+                    gate_page.device_ptr as *const u8,  // w3 = up_proj (multiplied directly)
+                    up_page.device_ptr as *const u8,    // w1 = gate_proj (SiLU applied)
                     // SAFETY: byte_offset is within expert_output_buf bounds
                     unsafe { self.expert_output_buf.as_mut_ptr().add(byte_offset) },
                     hidden_dim,
