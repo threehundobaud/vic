@@ -17,6 +17,7 @@
 ▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀
 ```
 
+```
 ATZ
 OK
 ATDT 1-800-VIC-CORE
@@ -38,3 +39,4 @@ bong-bong-krrrrr-shhhhhhhhhhhhhhhhhhhhhh
 [ NO CARRIER... YET ]
 [ CONNECTION ESTABLISHED: COMING SOON ]
 _
+```
