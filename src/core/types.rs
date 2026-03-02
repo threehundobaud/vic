@@ -67,6 +67,103 @@ pub mod kimi_k25 {
     pub const QUANT_SYMMETRIC: bool = true;
 }
 
+// ─── Qwen3.5-122B-A10B defaults ────────────────────────────────────────
+
+pub mod qwen35_122b {
+    // Core dimensions
+    pub const HIDDEN_DIM: u32 = 3072;
+    pub const NUM_LAYERS: u32 = 48;
+    pub const VOCAB_SIZE: u32 = 248_320;
+    pub const MAX_SEQ_LEN: u32 = 262_144;
+
+    // Full attention layers (every 4th layer: 3, 7, 11, ..., 47)
+    pub const FULL_ATTN_INTERVAL: u32 = 4;
+    pub const NUM_ATTN_LAYERS: u32 = 12; // 48 / 4
+    pub const NUM_DELTANET_LAYERS: u32 = 36; // 48 - 12
+    pub const NUM_ATTN_HEADS: u32 = 32;
+    pub const NUM_KV_HEADS: u32 = 2;
+    pub const HEAD_DIM: u32 = 256;
+    pub const PARTIAL_ROTARY_FACTOR: f64 = 0.25; // 64 of 256 dims get RoPE
+    pub const ROPE_THETA: f64 = 10_000_000.0;
+
+    // DeltaNet (linear attention) config — 36 of 48 layers
+    pub const DELTANET_NUM_KEY_HEADS: u32 = 16;
+    pub const DELTANET_NUM_VALUE_HEADS: u32 = 64;
+    pub const DELTANET_KEY_HEAD_DIM: u32 = 128;
+    pub const DELTANET_VALUE_HEAD_DIM: u32 = 128;
+    pub const DELTANET_CONV_KERNEL: u32 = 4;
+    pub const DELTANET_INNER_DIM: u32 = 8192; // 64 * 128
+
+    // MoE config — every layer (both DeltaNet and attention)
+    pub const NUM_EXPERTS: u32 = 256;
+    pub const NUM_ACTIVE_EXPERTS: u32 = 8;
+    pub const NUM_SHARED_EXPERTS: u32 = 1;
+    pub const EXPERT_INTERMEDIATE_SIZE: u32 = 1024;
+    pub const SHARED_EXPERT_INTERMEDIATE_SIZE: u32 = 1024;
+
+    // Router config
+    pub const SCORING_FUNC: &str = "softmax";
+
+    // Norm config
+    pub const RMS_NORM_EPS: f64 = 1e-6;
+
+    // IMRoPE (Interleaved Multi-RoPE) dimension sections
+    pub const MROPE_SECTIONS: [u32; 3] = [11, 11, 10]; // temporal, height, width
+
+    /// Returns true if layer `i` is a full attention layer.
+    pub const fn is_attention_layer(layer_idx: u32) -> bool {
+        (layer_idx + 1) % FULL_ATTN_INTERVAL == 0
+    }
+}
+
+// ─── Qwen3.5-35B-A3B defaults ─────────────────────────────────────────
+pub mod qwen35_35b {
+    // Core dimensions
+    pub const HIDDEN_DIM: u32 = 2048;
+    pub const NUM_LAYERS: u32 = 40;
+    pub const VOCAB_SIZE: u32 = 248_320;
+    pub const MAX_SEQ_LEN: u32 = 262_144;
+
+    // Full attention layers (every 4th layer: 3, 7, 11, ..., 39)
+    pub const FULL_ATTN_INTERVAL: u32 = 4;
+    pub const NUM_ATTN_LAYERS: u32 = 10; // 40 / 4
+    pub const NUM_DELTANET_LAYERS: u32 = 30; // 40 - 10
+    pub const NUM_ATTN_HEADS: u32 = 16;
+    pub const NUM_KV_HEADS: u32 = 2;
+    pub const HEAD_DIM: u32 = 256;
+    pub const PARTIAL_ROTARY_FACTOR: f64 = 0.25; // 64 of 256 dims get RoPE
+    pub const ROPE_THETA: f64 = 10_000_000.0;
+
+    // DeltaNet (linear attention) config — 30 of 40 layers
+    pub const DELTANET_NUM_KEY_HEADS: u32 = 16;
+    pub const DELTANET_NUM_VALUE_HEADS: u32 = 32;
+    pub const DELTANET_KEY_HEAD_DIM: u32 = 128;
+    pub const DELTANET_VALUE_HEAD_DIM: u32 = 128;
+    pub const DELTANET_CONV_KERNEL: u32 = 4;
+    pub const DELTANET_INNER_DIM: u32 = 4096; // 32 * 128
+
+    // MoE config — every layer (both DeltaNet and attention)
+    pub const NUM_EXPERTS: u32 = 256;
+    pub const NUM_ACTIVE_EXPERTS: u32 = 8;
+    pub const NUM_SHARED_EXPERTS: u32 = 1;
+    pub const EXPERT_INTERMEDIATE_SIZE: u32 = 512;
+    pub const SHARED_EXPERT_INTERMEDIATE_SIZE: u32 = 512;
+
+    // Router config
+    pub const SCORING_FUNC: &str = "softmax";
+
+    // Norm config
+    pub const RMS_NORM_EPS: f64 = 1e-6;
+
+    // IMRoPE (Interleaved Multi-RoPE) dimension sections
+    pub const MROPE_SECTIONS: [u32; 3] = [11, 11, 10]; // temporal, height, width
+
+    /// Returns true if layer `i` is a full attention layer.
+    pub const fn is_attention_layer(layer_idx: u32) -> bool {
+        (layer_idx + 1) % FULL_ATTN_INTERVAL == 0
+    }
+}
+
 // ─── Page Identity ───────────────────────────────────────────────────────
 
 /// Sentinel value for shared weight pages (attention, embeddings, norms).

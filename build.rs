@@ -53,14 +53,15 @@ fn compile_cuda() {
     //   sm_89  = Ada Lovelace (RTX 4090)
     //   sm_90  = Hopper (H100/H200)
     //   sm_100 = Blackwell (RTX 5090, B200)
-    //   sm_120 = Blackwell Ultra (RTX PRO 6000)
-    // The last entry also embeds PTX (compute_120) for forward compatibility
+    //   sm_120  = Blackwell (RTX PRO 6000 base)
+    //   sm_120a = Blackwell with block-scaled MMA (required for NVFP4 Tensor Core MMA)
+    // The last entry also embeds PTX (compute_120a) for forward compatibility
     // with future architectures that can JIT-compile from PTX.
     let arch_flags = [
         "-gencode=arch=compute_89,code=sm_89",
         "-gencode=arch=compute_90,code=sm_90",
         "-gencode=arch=compute_100,code=sm_100",
-        "-gencode=arch=compute_120,code=[sm_120,compute_120]",
+        "-gencode=arch=compute_120a,code=[sm_120a,compute_120a]",
     ];
 
     let out_dir = std::env::var("OUT_DIR").unwrap();

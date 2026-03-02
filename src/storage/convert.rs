@@ -646,6 +646,432 @@ pub fn convert_safetensors_dir(
     })
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// GGUF → .vib3 Conversion
+// ═════════════════════════════════════════════════════════════════════════════
+
+use crate::storage::gguf::{GgmlType, GgufFile};
+
+/// Classify a GGUF tensor name into (layer, expert, segment) mapping.
+///
+/// GGUF uses `blk.N.xxx` naming convention (from llama.cpp).
+fn classify_gguf_tensor(name: &str) -> Option<TensorMapping> {
+    // Global tensors (no layer)
+    if name == "token_embd.weight" {
+        return Some(TensorMapping {
+            layer: 0,
+            expert: 0xFFFF,
+            segment: 10,
+            is_shared: true,
+            is_packed: false,
+            is_scale: false,
+            is_zero_point: false,
+        });
+    }
+    if name == "output.weight" {
+        return Some(TensorMapping {
+            layer: 0,
+            expert: 0xFFFF,
+            segment: 11,
+            is_shared: true,
+            is_packed: false,
+            is_scale: false,
+            is_zero_point: false,
+        });
+    }
+    if name == "output_norm.weight" {
+        return Some(TensorMapping {
+            layer: 0xFFFF,
+            expert: 0xFFFF,
+            segment: 8,
+            is_shared: true,
+            is_packed: false,
+            is_scale: false,
+            is_zero_point: false,
+        });
+    }
+
+    // Layer tensors: blk.N.xxx
+    let layer = if name.starts_with("blk.") {
+        let rest = &name[4..];
+        let dot = rest.find('.')?;
+        rest[..dot].parse::<u16>().ok()?
+    } else {
+        return None;
+    };
+
+    let suffix = {
+        let rest = &name[4..];
+        let dot = rest.find('.')?;
+        &rest[dot + 1..]
+    };
+
+    let shared = |segment: u16| -> Option<TensorMapping> {
+        Some(TensorMapping {
+            layer,
+            expert: 0xFFFF,
+            segment,
+            is_shared: true,
+            is_packed: false,
+            is_scale: false,
+            is_zero_point: false,
+        })
+    };
+
+    // Stacked expert tensors (3D, 256 experts packed in one tensor)
+    let stacked = |segment: u16| -> Option<TensorMapping> {
+        Some(TensorMapping {
+            layer,
+            expert: 0xFFFD,
+            segment,
+            is_shared: false,
+            is_packed: false,
+            is_scale: false,
+            is_zero_point: false,
+        })
+    };
+
+    match suffix {
+        // ── Norms and biases (F32 → FP16 shared) ──
+        "attn_norm.weight" => shared(6),
+        "post_attention_norm.weight" => shared(7),
+        "attn_q_norm.weight" => shared(27),
+        "attn_k_norm.weight" => shared(28),
+
+        // ── Full attention projections (Q8_0 → FP16 shared) ──
+        "attn_q.weight" => shared(4), // Doubled: [hidden, num_heads*2*head_dim] for Qwen3.5
+        "attn_k.weight" => shared(12),
+        "attn_v.weight" => shared(13),
+        "attn_output.weight" => shared(5),
+
+        // ── DeltaNet (linear attention) tensors ──
+        "attn_qkv.weight" => shared(30), // in_proj_qkv (DeltaNet layers)
+        "attn_gate.weight" => shared(31), // in_proj_z (DeltaNet output gate)
+        "ssm_alpha.weight" => shared(33), // in_proj_a (decay projection)
+        "ssm_beta.weight" => shared(32), // in_proj_b (write strength projection)
+        "ssm_conv1d.weight" => shared(34), // conv1d weight
+        "ssm_dt.bias" => shared(35),     // dt_bias
+        "ssm_a" => shared(36),           // A_log
+        "ssm_norm.weight" => shared(37), // per-head norm
+        "ssm_out.weight" => shared(38),  // out_proj
+
+        // ── MoE router and shared expert ──
+        "ffn_gate_inp.weight" => shared(3), // Router weights
+        "ffn_gate_inp_shexp.weight" => shared(26), // Shared expert sigmoid gate
+        "ffn_gate_shexp.weight" => shared(15), // Shared expert gate_proj
+        "ffn_up_shexp.weight" => shared(14), // Shared expert up_proj
+        "ffn_down_shexp.weight" => shared(16), // Shared expert down_proj
+
+        // ── Stacked expert weights (MXFP4, 3D [dim_a, dim_b, 256]) ──
+        "ffn_gate_exps.weight" => stacked(1), // Expert gate_proj (w3)
+        "ffn_up_exps.weight" => stacked(0),   // Expert up_proj (w1)
+        "ffn_down_exps.weight" => stacked(2), // Expert down_proj (w2)
+
+        _ => {
+            tracing::debug!("GGUF: unclassified tensor: {}", name);
+            None
+        }
+    }
+}
+
+/// Convert GGUF files from a directory to .vib3 format.
+///
+/// Handles multi-shard GGUF files with MXFP4 expert weights, Q8_0 shared weights,
+/// and F32 norms. Splits stacked 3D expert tensors into per-expert pages.
+pub fn convert_gguf_dir(
+    dir: &Path,
+    config: &ModelConfig,
+    output: &Path,
+    options: &ConvertOptions,
+) -> Result<ConvertResult, String> {
+    let start = std::time::Instant::now();
+
+    // Open and parse all GGUF shards
+    let gguf = GgufFile::open_dir(dir)?;
+
+    // Create the output writer (clone config so we can set file-level dtype)
+    let mut file_config = config.clone();
+
+    // Determine expert_dtype from GGUF source data: scan for the first stacked expert
+    // tensor and use its type to decide the file-level expert_dtype.
+    // MXFP4 source → NVFP4 output; Q8_0 source → respects options.quantize_experts.
+    {
+        let tensor_names_tmp: Vec<String> = gguf.tensors.keys().cloned().collect();
+        for tname in &tensor_names_tmp {
+            let info = &gguf.tensors[tname];
+            if let Some(mapping) = classify_gguf_tensor(tname) {
+                if mapping.expert == 0xFFFD {
+                    match info.dtype {
+                        GgmlType::Mxfp4 => {
+                            file_config.expert_dtype = DType::NVFP4;
+                        }
+                        GgmlType::Q8_0 => match options.quantize_experts {
+                            QuantFormat::Nvfp4 => file_config.expert_dtype = DType::NVFP4,
+                            QuantFormat::Int4 => file_config.expert_dtype = DType::INT4,
+                            QuantFormat::None => file_config.expert_dtype = DType::FP16,
+                        },
+                        _ => {}
+                    }
+                    break; // all stacked experts have the same type
+                }
+            }
+        }
+    }
+
+    tracing::info!("File expert_dtype set to {:?}", file_config.expert_dtype);
+
+    let temp_dir = output.parent();
+    let mut writer = Vib3Writer::with_temp_dir(file_config, temp_dir);
+    writer.set_compression(options.compress);
+
+    let mut total_tensors = 0usize;
+    let mut converted_experts = 0usize;
+    let mut converted_shared = 0usize;
+    let mut skipped = Vec::new();
+    let mut total_source_bytes = 0u64;
+    let mut total_output_bytes = 0u64;
+    let num_experts = config.num_experts as usize;
+
+    // Collect tensor names and sort for deterministic processing
+    let mut tensor_names: Vec<String> = gguf.tensors.keys().cloned().collect();
+    tensor_names.sort();
+
+    for tensor_name in &tensor_names {
+        let info = &gguf.tensors[tensor_name];
+        total_tensors += 1;
+        total_source_bytes += info.data_bytes() as u64;
+
+        let mapping = match classify_gguf_tensor(tensor_name) {
+            Some(m) => m,
+            None => {
+                skipped.push(tensor_name.clone());
+                continue;
+            }
+        };
+
+        // Skip scale/packed/zero_point (not applicable for GGUF but guard anyway)
+        if mapping.is_scale || mapping.is_zero_point || mapping.is_packed {
+            continue;
+        }
+
+        let raw_data = gguf.tensor_data(info);
+        let layer = mapping.layer;
+        let segment = mapping.segment;
+
+        // ── Stacked expert tensors: split and convert ──
+        if mapping.expert == 0xFFFD {
+            let n_experts = if info.shape.len() >= 3 {
+                info.shape[2] as usize // [ne0, ne1, n_experts]
+            } else {
+                tracing::warn!(
+                    "Stacked tensor {} has {} dims, expected 3",
+                    tensor_name,
+                    info.shape.len()
+                );
+                continue;
+            };
+
+            if n_experts != num_experts {
+                tracing::warn!(
+                    "Stacked tensor {} has {} experts, expected {}",
+                    tensor_name,
+                    n_experts,
+                    num_experts
+                );
+            }
+
+            let ne0 = info.shape[0] as usize; // innermost dim (quantized along this axis)
+            let ne1 = info.shape[1] as usize; // rows per expert
+
+            // Compute bytes per expert slice
+            let (block_elems, block_bytes) = info.dtype.block_layout();
+            let blocks_per_row = ne0.div_ceil(block_elems);
+            let row_bytes = blocks_per_row * block_bytes;
+            let expert_bytes = ne1 * row_bytes;
+
+            tracing::info!(
+                "Splitting stacked tensor {} [{},{},{}] type={:?} → {} experts × {} bytes",
+                tensor_name,
+                ne0,
+                ne1,
+                n_experts,
+                info.dtype,
+                n_experts,
+                expert_bytes
+            );
+
+            for expert_idx in 0..n_experts {
+                let expert_slice =
+                    &raw_data[expert_idx * expert_bytes..(expert_idx + 1) * expert_bytes];
+
+                match info.dtype {
+                    GgmlType::Mxfp4 => {
+                        // MXFP4 → NVFP4 (lossless E2M1 copy, E8M0→FP16 scale conversion)
+                        let nvfp4_data =
+                            crate::storage::gguf::convert_mxfp4_to_nvfp4(expert_slice, ne1, ne0);
+                        add_pages_from_data(
+                            &mut writer,
+                            layer,
+                            expert_idx as u16,
+                            segment,
+                            ne1,
+                            ne0,
+                            &nvfp4_data,
+                            DType::NVFP4,
+                        );
+                        total_output_bytes += nvfp4_data.len() as u64;
+                        converted_experts += 1;
+                    }
+                    GgmlType::Q8_0 => {
+                        // Q8_0 → FP16, then optionally quantize to NVFP4
+                        let fp16_data =
+                            crate::storage::gguf::dequant_q8_0_to_fp16(expert_slice, ne1, ne0);
+                        match options.quantize_experts {
+                            QuantFormat::Nvfp4 => {
+                                let nvfp4 = kernels::quantize_fp16_to_nvfp4(&fp16_data, ne1, ne0);
+                                add_pages_from_data(
+                                    &mut writer,
+                                    layer,
+                                    expert_idx as u16,
+                                    segment,
+                                    ne1,
+                                    ne0,
+                                    &nvfp4,
+                                    DType::NVFP4,
+                                );
+                                total_output_bytes += nvfp4.len() as u64;
+                            }
+                            QuantFormat::Int4 => {
+                                let int4 = kernels::quantize_fp16_to_int4(&fp16_data, ne1, ne0);
+                                add_pages_from_data(
+                                    &mut writer,
+                                    layer,
+                                    expert_idx as u16,
+                                    segment,
+                                    ne1,
+                                    ne0,
+                                    &int4,
+                                    DType::INT4,
+                                );
+                                total_output_bytes += int4.len() as u64;
+                            }
+                            QuantFormat::None => {
+                                add_shared_pages(&mut writer, layer, 0xFFFF, segment, &fp16_data);
+                                total_output_bytes += fp16_data.len() as u64;
+                            }
+                        }
+                        converted_experts += 1;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Unsupported type {:?} for stacked expert {}",
+                            info.dtype,
+                            tensor_name
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ── Shared tensors (attention, norms, embeddings, etc.) ──
+        if mapping.is_shared {
+            let ne0 = info.shape.first().copied().unwrap_or(1) as usize;
+            let n_rows: usize = info.shape.iter().skip(1).product::<u64>().max(1) as usize;
+
+            let fp16_data = match info.dtype {
+                GgmlType::Q8_0 => crate::storage::gguf::dequant_q8_0_to_fp16(raw_data, n_rows, ne0),
+                GgmlType::F32 => crate::storage::gguf::convert_f32_to_fp16(raw_data, ne0 * n_rows),
+                GgmlType::F16 => raw_data.to_vec(),
+                GgmlType::BF16 => {
+                    crate::storage::gguf::convert_bf16_to_fp16(raw_data, ne0 * n_rows)
+                }
+                GgmlType::Q5K => crate::storage::gguf::dequant_q5k_to_fp16(raw_data, n_rows, ne0),
+                GgmlType::Q6K => crate::storage::gguf::dequant_q6k_to_fp16(raw_data, n_rows, ne0),
+                _ => {
+                    tracing::warn!(
+                        "Unsupported type {:?} for shared tensor {}",
+                        info.dtype,
+                        tensor_name
+                    );
+                    skipped.push(tensor_name.clone());
+                    continue;
+                }
+            };
+
+            // ── V-head order for DeltaNet QKV (segment 30) and Z gate (segment 31) ──
+            // The llama.cpp GGUF converter DOES apply V-head reordering to both
+            // `.in_proj_qkv.` and `.in_proj_z.` via `_LinearAttentionVReorderBase`,
+            // converting them from grouped to tiled order at conversion time.
+            // All other per-value-head tensors (alpha, beta, A_log, dt_bias,
+            // conv1d, out_proj) are also reordered to tiled order.
+            // Therefore NO additional reorder is needed here — the GGUF data is
+            // already in tiled order for all V-head-indexed tensors.
+
+            add_shared_pages(&mut writer, layer, 0xFFFF, segment, &fp16_data);
+            total_output_bytes += fp16_data.len() as u64;
+            converted_shared += 1;
+            continue;
+        }
+
+        // Shouldn't reach here — all tensors are either stacked or shared
+        skipped.push(tensor_name.clone());
+    }
+
+    let page_count = writer.page_count();
+    let elapsed = start.elapsed();
+
+    tracing::info!(
+        "GGUF conversion complete: {} tensors → {} pages in {:.1}s ({} expert, {} shared, {} skipped)",
+        total_tensors, page_count, elapsed.as_secs_f64(),
+        converted_experts, converted_shared, skipped.len(),
+    );
+
+    // Finalize: write .vib3 file
+    writer
+        .finalize(output)
+        .map_err(|e| format!("Failed to finalize: {}", e))?;
+
+    Ok(ConvertResult {
+        total_tensors,
+        converted_experts,
+        converted_shared,
+        skipped_tensors: skipped,
+        source_bytes: total_source_bytes,
+        output_bytes: total_output_bytes,
+        page_count,
+        index_vectors: 0, // TODO: build indexes
+    })
+}
+
+/// Add shared tensor data as pages (FP16 passthrough, no quantization).
+fn add_shared_pages(
+    writer: &mut Vib3Writer,
+    layer: u16,
+    expert: u16,
+    segment: u16,
+    fp16_data: &[u8],
+) {
+    // Split into 2MB pages
+    let num_pages = fp16_data.len().div_ceil(PAGE_SIZE);
+    for page_idx in 0..num_pages {
+        let start = page_idx * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(fp16_data.len());
+        let page_data = &fp16_data[start..end];
+
+        writer.add_page(
+            layer,
+            expert,
+            segment,
+            page_idx as u16,
+            0, // row_start (not applicable for shared)
+            0, // row_count
+            0, // cols
+            page_data,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1600,6 +2026,20 @@ fn compute_expert_page_signatures(
 //   segment 14-16 = shared expert up/gate/down
 //   segment 17-19 = dense MLP up/gate/down
 //   segment 20-25 = MLA projections and layernorms
+//   segment 26    = shared expert gate (sigmoid gate, 1×hidden_dim)
+//   segment 27    = attn Q norm (per-head)
+//   segment 28    = attn K norm (per-head)
+//
+// DeltaNet (Qwen3.5) segments:
+//   segment 30 = linear_attn.in_proj_qkv  (QKV joint projection)
+//   segment 31 = linear_attn.in_proj_z    (output gate projection)
+//   segment 32 = linear_attn.in_proj_b    (beta/write strength projection)
+//   segment 33 = linear_attn.in_proj_a    (alpha/decay projection)
+//   segment 34 = linear_attn.conv1d       (causal depthwise conv1d)
+//   segment 35 = linear_attn.dt_bias      (time step bias)
+//   segment 36 = linear_attn.A_log        (log decay rate)
+//   segment 37 = linear_attn.norm         (per-head RMSNorm for gated output)
+//   segment 38 = linear_attn.out_proj     (output projection)
 
 struct TensorMapping {
     layer: u16,
@@ -1624,7 +2064,36 @@ fn classify_tensor(name: &str, config: &ModelConfig) -> Option<TensorMapping> {
 
     let layer_num = extract_layer_num(base_name);
 
-    // Expert MoE weights
+    // Stacked expert tensors (Qwen3.5: all experts in one tensor)
+    // e.g., "model.language_model.layers.0.mlp.experts.gate_up_proj" shape (256, 2048, 3072)
+    //        "model.language_model.layers.0.mlp.experts.down_proj"     shape (256, 3072, 1024)
+    // These need special handling in the converter (split by expert dim).
+    // We classify them with expert=0xFFFD (EXPERT_STACKED sentinel) to flag them.
+    if base_name.contains("mlp.experts.gate_up_proj") || base_name.contains("mlp.experts.down_proj")
+    {
+        if let Some(layer) = layer_num {
+            if !base_name.contains("shared_expert") {
+                // gate_up_proj packs gate + up: segments 0+1 interleaved
+                // down_proj: segment 2
+                let segment = if base_name.contains("gate_up_proj") {
+                    0 // will be split into gate(1) + up(0) during conversion
+                } else {
+                    2
+                };
+                return Some(TensorMapping {
+                    layer: layer as u16,
+                    expert: 0xFFFD, // sentinel: stacked, needs per-expert split
+                    segment,
+                    is_shared: false,
+                    is_packed,
+                    is_scale,
+                    is_zero_point,
+                });
+            }
+        }
+    }
+
+    // Individual expert MoE weights (Mixtral-style: experts.{N}.w1/w2/w3)
     if let Some(expert_id) = extract_expert_id(base_name) {
         if !base_name.contains("shared_expert") {
             let segment = if base_name.contains("up_proj") || base_name.contains("w1") {
@@ -1727,6 +2196,58 @@ fn classify_tensor(name: &str, config: &ModelConfig) -> Option<TensorMapping> {
         }
     }
 
+    // DeltaNet / linear attention tensors (Qwen3.5)
+    if base_name.contains("linear_attn") {
+        if let Some(layer) = layer_num {
+            let segment = if base_name.contains("in_proj_qkv") {
+                30
+            } else if base_name.contains("in_proj_z") {
+                31
+            } else if base_name.contains("in_proj_b") {
+                32
+            } else if base_name.contains("in_proj_a") {
+                33
+            } else if base_name.contains("conv1d") {
+                34
+            } else if base_name.contains("dt_bias") {
+                35
+            } else if base_name.contains("A_log") {
+                36
+            } else if base_name.contains("norm.weight") {
+                37
+            } else if base_name.contains("out_proj") {
+                38
+            } else {
+                return None;
+            };
+
+            return Some(TensorMapping {
+                layer: layer as u16,
+                expert: 0xFFFF,
+                segment,
+                is_shared: true,
+                is_packed,
+                is_scale,
+                is_zero_point,
+            });
+        }
+    }
+
+    // Shared expert gate (sigmoid gate for shared expert output, Qwen3.5)
+    if base_name.contains("shared_expert_gate") && !base_name.contains("gate_proj") {
+        if let Some(layer) = layer_num {
+            return Some(TensorMapping {
+                layer: layer as u16,
+                expert: 0xFFFF,
+                segment: 26,
+                is_shared: true,
+                is_packed,
+                is_scale,
+                is_zero_point,
+            });
+        }
+    }
+
     // Attention projections (MLA + standard)
     if base_name.contains("self_attn") || base_name.contains("attention") {
         if let Some(layer) = layer_num {
@@ -1777,6 +2298,7 @@ fn classify_tensor(name: &str, config: &ModelConfig) -> Option<TensorMapping> {
     if base_name.contains("embed_tokens")
         || base_name.contains("token_embedding")
         || base_name == "model.embed_tokens.weight"
+        || base_name == "model.language_model.embed_tokens.weight"
     {
         return Some(TensorMapping {
             layer: 0,
@@ -1803,9 +2325,13 @@ fn classify_tensor(name: &str, config: &ModelConfig) -> Option<TensorMapping> {
     }
 
     // Final norm (text model only — skip vision tower norms)
-    if (base_name.contains("model.norm") || base_name.contains("final_layernorm"))
+    if (base_name.contains("model.norm")
+        || base_name.contains("language_model.norm")
+        || base_name.contains("final_layernorm"))
         && !base_name.contains("vision_tower")
         && !base_name.contains("vision_model")
+        && !base_name.contains("linear_attn")
+        && !base_name.contains("layernorm")
     {
         return Some(TensorMapping {
             layer: 0xFFFF,
@@ -1843,6 +2369,14 @@ fn classify_attention_tensor(name: &str) -> Option<u16> {
     }
     if name.contains("kv_b_proj") {
         return Some(23);
+    }
+
+    // Attention Q/K norms (Qwen3.5 gated attention — check before projections)
+    if name.contains("q_norm") {
+        return Some(27);
+    }
+    if name.contains("k_norm") {
+        return Some(28);
     }
 
     // Standard attention projections

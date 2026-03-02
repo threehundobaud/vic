@@ -81,7 +81,7 @@ fn gpu_partial_matmul(
 ) -> Result<()> {
     let err = match weight_dtype {
         DType::FP16 | DType::BF16 => unsafe {
-            cuda_ffi::vib3_launch_partial_matmul_fp16(
+            cuda_ffi::vib3_launch_partial_matmul_fp16_fast(
                 input,
                 weight_page,
                 output,
@@ -599,6 +599,970 @@ pub fn partial_swiglu_f32(
     Err(Error::Cuda("partial_swiglu_f32 requires GPU".to_string()))
 }
 
+/// FP32-in/FP32-out SwiGLU for NVFP4 weights. Eliminates FP16 truncation
+/// of the SwiGLU intermediate that gets amplified by the subsequent down_proj.
+pub fn partial_swiglu_f32_f32out(
+    input: *const u8,   // [1, hidden_dim] FP32
+    up_page: *const u8, // NVFP4 packed weight page
+    gate_page: *const u8,
+    output: *mut u8, // [1, M_slice] FP32 (NOT FP16!)
+    hidden_dim: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = hidden_dim.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+
+            let up_scales = unsafe { up_page.add(weight_data_size) };
+            let gate_scales = unsafe { gate_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_fused_swiglu_nvfp4_f32out(
+                    input,
+                    up_page,
+                    up_scales,
+                    gate_page,
+                    gate_scales,
+                    output,
+                    hidden_dim as i32,
+                    m_slice as i32,
+                    NVFP4_BLOCK_SIZE as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "fused_swiglu_nvfp4_f32out launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "partial_swiglu_f32_f32out requires GPU".to_string(),
+    ))
+}
+
+/// FP32-in/FP32-out matmul for NVFP4 weights. Pairs with partial_swiglu_f32_f32out
+/// to keep the entire routed expert pipeline in FP32, eliminating FP16 truncation.
+pub fn partial_matmul_nvfp4_f32(
+    input: *const u8,       // [1, K] FP32
+    weight_page: *const u8, // NVFP4 packed weight page
+    output: *mut u8,        // [1, M_slice] FP32
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let scales_ptr = unsafe { weight_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_partial_matmul_nvfp4_f32out(
+                    input,
+                    weight_page,
+                    scales_ptr,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    NVFP4_BLOCK_SIZE as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "partial_matmul_nvfp4_f32out launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "partial_matmul_nvfp4_f32 requires GPU".to_string(),
+    ))
+}
+
+/// Blackwell MMA GEMV for NVFP4 weights. Uses m16n8k64 block-scaled FP4
+/// Tensor Core MMA. FP32 input, FP32 output. No model re-conversion needed:
+/// sequential nibbles are repacked to split-half in-kernel.
+pub fn gemv_mma_nvfp4(
+    input: *const u8,       // [1, K] FP32
+    weight_page: *const u8, // NVFP4 packed weight page ([data | scales])
+    output: *mut u8,        // [1, M_slice] FP32
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let scales_ptr = unsafe { weight_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_gemv_mma_nvfp4(
+                    input,
+                    weight_page,
+                    scales_ptr,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "gemv_mma_nvfp4 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("gemv_mma_nvfp4 requires GPU".to_string()))
+}
+
+/// Blackwell MMA fused SwiGLU for NVFP4 weights. Two GEMV MMA passes
+/// (up + gate) with shared input quantization, fused SiLU activation.
+/// FP32 input, FP32 output. No model re-conversion needed.
+pub fn fused_swiglu_mma_nvfp4(
+    input: *const u8,     // [1, K] FP32
+    up_page: *const u8,   // NVFP4 packed weight page (up_proj)
+    gate_page: *const u8, // NVFP4 packed weight page (gate_proj)
+    output: *mut u8,      // [1, M_slice] FP32
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+
+            let up_scales = unsafe { up_page.add(weight_data_size) };
+            let gate_scales = unsafe { gate_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_fused_swiglu_mma_nvfp4(
+                    input,
+                    up_page,
+                    up_scales,
+                    gate_page,
+                    gate_scales,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "fused_swiglu_mma_nvfp4 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "fused_swiglu_mma_nvfp4 requires GPU".to_string(),
+    ))
+}
+
+/// Pre-quantize FP32 activation vector to FP4 E2M1 split-half + E8M0 scales.
+/// Done once per MoE layer, reused by all expert kernels to eliminate redundant
+/// per-kernel FP32→FP4 quantization (the dominant MMA bottleneck).
+pub fn quantize_activation_fp4(
+    input: *const u8,    // [K] FP32 activation
+    act_fp4: *mut u8,    // [K/2] pre-quantized FP4 output
+    act_scales: *mut u8, // [K/32] E8M0 scales output
+    k: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_quantize_activation_fp4(
+                    input,
+                    act_fp4,
+                    act_scales,
+                    k as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "quantize_activation_fp4 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "quantize_activation_fp4 requires GPU".to_string(),
+    ))
+}
+
+/// Blackwell MMA GEMV with pre-quantized activations. Skips FP32→FP4
+/// quantization inside the kernel — uses activations pre-quantized by
+/// quantize_activation_fp4().
+pub fn gemv_mma_nvfp4_preq(
+    act_fp4: *const u8,     // [K/2] pre-quantized split-half FP4
+    act_scales: *const u8,  // [K/32] E8M0 scales
+    weight_page: *const u8, // NVFP4 packed weight page ([data | scales])
+    output: *mut u8,        // [M_slice] FP32
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let scales_ptr = unsafe { weight_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_gemv_mma_nvfp4_preq(
+                    act_fp4,
+                    act_scales,
+                    weight_page,
+                    scales_ptr,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "gemv_mma_nvfp4_preq launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("gemv_mma_nvfp4_preq requires GPU".to_string()))
+}
+
+/// Blackwell MMA fused SwiGLU with pre-quantized activations.
+pub fn fused_swiglu_mma_nvfp4_preq(
+    act_fp4: *const u8,    // [K/2] pre-quantized split-half FP4
+    act_scales: *const u8, // [K/32] E8M0 scales
+    up_page: *const u8,    // NVFP4 packed weight page (up_proj)
+    gate_page: *const u8,  // NVFP4 packed weight page (gate_proj)
+    output: *mut u8,       // [M_slice] FP32
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+
+            let up_scales = unsafe { up_page.add(weight_data_size) };
+            let gate_scales = unsafe { gate_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_fused_swiglu_mma_nvfp4_preq(
+                    act_fp4,
+                    act_scales,
+                    up_page,
+                    up_scales,
+                    gate_page,
+                    gate_scales,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "fused_swiglu_mma_nvfp4_preq launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "fused_swiglu_mma_nvfp4_preq requires GPU".to_string(),
+    ))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Optimized launchers: cached capability, batched expert, norepack
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// In-place repack weight data from sequential to split-half format on GPU.
+/// Only repacks the FP4 data portion (not scales).
+pub fn repack_weights_inplace(
+    weight_data_ptr: *mut u8,
+    weight_data_bytes: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_repack_weights_inplace(
+                    weight_data_ptr,
+                    weight_data_bytes as i64,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "repack_weights_inplace failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "repack_weights_inplace requires GPU".to_string(),
+    ))
+}
+
+/// Batched expert: single call for full expert pipeline.
+/// Weights must be pre-repacked to split-half format.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_batched(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    up_page: *const u8,   // NVFP4 weight page (repacked split-half)
+    gate_page: *const u8, // NVFP4 weight page (repacked split-half)
+    down_page: *const u8, // NVFP4 weight page (repacked split-half)
+    layer_output: *mut f32,
+    expert_weight: f32,
+    k_in: usize,  // hidden_dim
+    m_mid: usize, // expert_hidden_dim (up/gate output rows)
+    m_out: usize, // hidden_dim (down output rows)
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k_in = k_in.div_ceil(2);
+            let packed_k_mid = m_mid.div_ceil(2); // down_proj input dim = expert_hidden_dim
+            let up_data_size = packed_k_in * m_mid;
+            let gate_data_size = packed_k_in * m_mid;
+            let down_data_size = packed_k_mid * m_out;
+
+            let up_scales_ptr = unsafe { up_page.add(up_data_size) };
+            let gate_scales_ptr = unsafe { gate_page.add(gate_data_size) };
+            let down_scales_ptr = unsafe { down_page.add(down_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_expert_batched(
+                    act_fp4,
+                    act_scales,
+                    up_page,
+                    up_scales_ptr,
+                    gate_page,
+                    gate_scales_ptr,
+                    down_page,
+                    down_scales_ptr,
+                    layer_output,
+                    expert_weight,
+                    k_in as i32,
+                    m_mid as i32,
+                    m_mid as i32, // K_mid = expert_hidden_dim = M_mid
+                    m_out as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "expert_batched launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("expert_batched requires GPU".to_string()))
+}
+
+/// Fused multi-expert MoE layer: processes all selected experts with
+/// 4 kernel launches (up GEMV, gate GEMV, SwiGLU+quantize, down+accumulate).
+///
+/// `expert_pages` is a slice of (up_page, gate_page, down_page, weight) tuples.
+/// All page pointers must point to pre-repacked split-half NVFP4 data.
+/// `layer_output` must be pre-zeroed.
+pub fn moe_experts_fused(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    expert_pages: &[(*const u8, *const u8, *const u8, f32)], // (up, gate, down, weight)
+    k_in: usize,
+    m_mid: usize,
+    m_out: usize,
+    layer_output: *mut f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() && !expert_pages.is_empty() {
+            let num_experts = expert_pages.len().min(8);
+            let packed_k_in = k_in.div_ceil(2);
+            let packed_k_mid = m_mid.div_ceil(2);
+            let up_data_size = packed_k_in * m_mid;
+            let gate_data_size = packed_k_in * m_mid;
+            let down_data_size = packed_k_mid * m_out;
+
+            // Build pointer arrays (host side)
+            let mut up_w = [std::ptr::null::<u8>(); 8];
+            let mut up_s = [std::ptr::null::<u8>(); 8];
+            let mut gate_w = [std::ptr::null::<u8>(); 8];
+            let mut gate_s = [std::ptr::null::<u8>(); 8];
+            let mut down_w = [std::ptr::null::<u8>(); 8];
+            let mut down_s = [std::ptr::null::<u8>(); 8];
+            let mut weights = [0.0f32; 8];
+
+            for (i, &(up_page, gate_page, down_page, weight)) in
+                expert_pages.iter().take(num_experts).enumerate()
+            {
+                up_w[i] = up_page;
+                up_s[i] = unsafe { up_page.add(up_data_size) };
+                gate_w[i] = gate_page;
+                gate_s[i] = unsafe { gate_page.add(gate_data_size) };
+                down_w[i] = down_page;
+                down_s[i] = unsafe { down_page.add(down_data_size) };
+                weights[i] = weight;
+            }
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_moe_experts_fused(
+                    act_fp4,
+                    act_scales,
+                    up_w.as_ptr() as *const *const u8,
+                    up_s.as_ptr() as *const *const u8,
+                    gate_w.as_ptr() as *const *const u8,
+                    gate_s.as_ptr() as *const *const u8,
+                    down_w.as_ptr() as *const *const u8,
+                    down_s.as_ptr() as *const *const u8,
+                    weights.as_ptr(),
+                    num_experts as i32,
+                    k_in as i32,
+                    m_mid as i32,
+                    m_mid as i32,
+                    m_out as i32,
+                    layer_output,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "moe_experts_fused launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("moe_experts_fused requires GPU".to_string()))
+}
+
+/// GPU-only fused multi-expert MoE layer: reads expert IDs and weights
+/// directly from device memory (written by router), looks up weight page
+/// pointers from a prebuilt device-side table. Zero host synchronization.
+///
+/// `page_table`: device pointer to [num_moe_layers * num_experts * 3] u64
+/// `expert_ids`: device pointer to [num_active] u16 (from router topk)
+/// `expert_weights`: device pointer to [num_active] f32 (from router topk)
+/// `moe_layer`: MoE layer index (0-based, NOT storage layer)
+pub fn moe_experts_fused_gpu(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    page_table: *const u8,     // device: [layers * experts * 3] u64
+    expert_ids: *const u8,     // device: [num_active] u16
+    expert_weights: *const u8, // device: [num_active] f32
+    moe_layer: usize,
+    num_experts_total: usize,
+    num_active: usize,
+    k_in: usize,
+    m_mid: usize,
+    m_out: usize,
+    layer_output: *mut f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() && num_active > 0 {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_moe_experts_fused_gpu(
+                    act_fp4,
+                    act_scales,
+                    page_table as *const u64,
+                    expert_ids as *const u16,
+                    expert_weights as *const f32,
+                    moe_layer as i32,
+                    num_experts_total as i32,
+                    num_active as i32,
+                    k_in as i32,
+                    m_mid as i32,
+                    m_mid as i32, // K_mid == M_mid for SwiGLU output
+                    m_out as i32,
+                    layer_output,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "moe_experts_fused_gpu launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    let _ = (
+        act_fp4,
+        act_scales,
+        page_table,
+        expert_ids,
+        expert_weights,
+        moe_layer,
+        num_experts_total,
+        num_active,
+        k_in,
+        m_mid,
+        m_out,
+        layer_output,
+        stream,
+    );
+    Err(Error::Cuda(
+        "moe_experts_fused_gpu requires GPU".to_string(),
+    ))
+}
+
+/// Convert FP16 weight matrix [M, K] to NVFP4 MMA format at runtime.
+/// Returns a DeviceBuffer containing:
+///   - [0 .. M*K/2):           FP4 data in split-half packing
+///   - [M*K/2 .. M*K/2 + M*(K/32)*2): BF16 block scales
+/// The caller must keep the returned DeviceBuffer alive.
+pub fn fp16_to_nvfp4_weight(
+    input: *const u8,
+    m: usize,
+    k: usize,
+    stream: &CudaStream,
+) -> Result<cuda_ffi::DeviceBuffer> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let data_bytes = m * k / 2;
+            let scale_bytes = m * (k / 32) * 2;
+            let total_bytes = data_bytes + scale_bytes;
+            let buf = cuda_ffi::DeviceBuffer::new(total_bytes)?;
+            let data_ptr = buf.as_mut_ptr();
+            let scale_ptr = unsafe { data_ptr.add(data_bytes) };
+            let err = unsafe {
+                cuda_ffi::vib3_launch_fp16_to_nvfp4_weight(
+                    input,
+                    data_ptr,
+                    scale_ptr,
+                    m as i32,
+                    k as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "fp16_to_nvfp4_weight failed (err={})",
+                    err
+                )));
+            }
+            return Ok(buf);
+        }
+    }
+    Err(Error::Cuda("fp16_to_nvfp4_weight requires GPU".to_string()))
+}
+
+/// Fast MMA GEMV preq with cached capability check.
+/// Uses shared-memory staging for coalesced global reads.
+pub fn gemv_mma_nvfp4_preq_fast(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    weight_page: *const u8,
+    output: *mut u8,
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let scales_ptr = unsafe { weight_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_gemv_mma_nvfp4_preq_fast(
+                    act_fp4,
+                    act_scales,
+                    weight_page,
+                    scales_ptr,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "gemv_mma_nvfp4_preq_fast failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "gemv_mma_nvfp4_preq_fast requires GPU".to_string(),
+    ))
+}
+
+/// Scalar GEMV with K-dimension parallelism for maximum memory bandwidth.
+/// 1 row per thread block, all threads cooperate along K → coalesced access.
+/// Uses LUT-based FP4 dequant + FMA instead of MMA instructions.
+pub fn gemv_scalar_nvfp4(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    weight_page: *const u8,
+    output: *mut u8,
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let scales_ptr = unsafe { weight_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_gemv_scalar_nvfp4(
+                    act_fp4,
+                    act_scales,
+                    weight_page,
+                    scales_ptr,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "gemv_scalar_nvfp4 failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("gemv_scalar_nvfp4 requires GPU".to_string()))
+}
+
+/// Repack weight data from row-major split-half to tiled layout on GPU.
+/// Tiled layout: 16 rows × 32 bytes per K-tile contiguous.
+/// M must be divisible by 16, K must be divisible by 64.
+/// temp_buf must be at least M * (K/2) bytes.
+pub fn repack_row_to_tiled(
+    weight_data_ptr: *mut u8,
+    temp_buf: *mut u8,
+    m: usize,
+    k: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_repack_row_to_tiled(
+                    weight_data_ptr,
+                    temp_buf,
+                    m as i32,
+                    k as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "repack_row_to_tiled failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("repack_row_to_tiled requires GPU".to_string()))
+}
+
+/// Tiled MMA GEMV: reads weights from tiled layout for coalesced access.
+/// Weights must have been repacked via repack_row_to_tiled().
+/// Scales remain in row-major layout.
+pub fn gemv_mma_nvfp4_tiled(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    weight_page: *const u8,
+    output: *mut u8,
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let scales_ptr = unsafe { weight_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_gemv_mma_nvfp4_tiled(
+                    act_fp4,
+                    act_scales,
+                    weight_page,
+                    scales_ptr,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "gemv_mma_nvfp4_tiled failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("gemv_mma_nvfp4_tiled requires GPU".to_string()))
+}
+
+/// Batched multi-matrix MMA GEMV with shared pre-quantized FP4 activation.
+/// Processes multiple NVFP4 weight matrices in a single kernel launch.
+/// All matrices must share the same K dimension and the same FP4 activation input.
+///
+/// # Arguments
+/// * `act_fp4` - Pre-quantized FP4 activation data [K/2 bytes]
+/// * `act_scales` - FP4 activation E8M0 scales [K/32 bytes]
+/// * `weight_pages` - Array of NVFP4 buffer pointers (each packed [FP4 data | BF16 scales])
+/// * `m_slices` - Array of M dimensions for each matrix
+/// * `outputs` - Array of FP32 output pointers
+/// * `k` - Shared K dimension (must be divisible by 64)
+/// * `stream` - CUDA stream
+pub fn batched_gemv_mma_nvfp4_preq(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    weight_pages: &[*const u8],
+    m_slices: &[i32],
+    outputs: &[*mut u8],
+    k: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let n = weight_pages.len();
+    assert_eq!(n, m_slices.len());
+    assert_eq!(n, outputs.len());
+    assert!(n > 0 && n <= 5, "batched GEMV supports 1-5 matrices");
+
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_batched_gemv_mma_nvfp4_preq(
+                    act_fp4,
+                    act_scales,
+                    n as i32,
+                    weight_pages.as_ptr(),
+                    m_slices.as_ptr(),
+                    outputs.as_ptr(),
+                    k as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "batched_gemv_mma_nvfp4_preq failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "batched_gemv_mma_nvfp4_preq requires GPU".to_string(),
+    ))
+}
+
+/// Batched tiled MMA GEMV with K-parallel decomposition + atomicAdd.
+/// Processes multiple NVFP4 weight matrices (in tiled layout) in a single kernel launch.
+/// All matrices share the same FP4 activation and K dimension.
+///
+/// # Arguments
+/// * `act_fp4` - Pre-quantized FP4 activation data [K/2 bytes]
+/// * `act_scales` - FP4 activation E8M0 scales [K/32 bytes]
+/// * `weight_pages` - Array of NVFP4 buffer pointers (each packed [tiled FP4 data | BF16 scales])
+/// * `m_slices` - Array of M dimensions for each matrix
+/// * `outputs` - Array of FP32 output pointers
+/// * `k` - Shared K dimension (must be divisible by 64)
+/// * `stream` - CUDA stream
+pub fn batched_gemv_mma_nvfp4_tiled(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    weight_pages: &[*const u8],
+    m_slices: &[i32],
+    outputs: &[*mut u8],
+    k: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let n = weight_pages.len();
+    assert_eq!(n, m_slices.len());
+    assert_eq!(n, outputs.len());
+    assert!(n > 0 && n <= 5, "batched tiled GEMV supports 1-5 matrices");
+
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+
+            // Split each weight_page into tiled FP4 data ptr and BF16 scales ptr
+            let mut tiled_ptrs: [*const u8; 5] = [std::ptr::null(); 5];
+            let mut scale_ptrs: [*const u8; 5] = [std::ptr::null(); 5];
+            for i in 0..n {
+                tiled_ptrs[i] = weight_pages[i];
+                let data_size = packed_k * m_slices[i] as usize;
+                scale_ptrs[i] = unsafe { weight_pages[i].add(data_size) };
+            }
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_batched_gemv_mma_nvfp4_tiled(
+                    act_fp4,
+                    act_scales,
+                    n as i32,
+                    tiled_ptrs.as_ptr(),
+                    scale_ptrs.as_ptr(),
+                    outputs.as_ptr(),
+                    m_slices.as_ptr(),
+                    k as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "batched_gemv_mma_nvfp4_tiled failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "batched_gemv_mma_nvfp4_tiled requires GPU".to_string(),
+    ))
+}
+
+/// Fast activation quantization with cached capability check.
+pub fn quantize_activation_fp4_fast(
+    input: *const u8,
+    act_fp4: *mut u8,
+    act_scales: *mut u8,
+    k: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_quantize_activation_fp4_fast(
+                    input,
+                    act_fp4,
+                    act_scales,
+                    k as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "quantize_activation_fp4_fast failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "quantize_activation_fp4_fast requires GPU".to_string(),
+    ))
+}
+
+/// Fast fused SwiGLU MMA preq with cached capability check.
+pub fn fused_swiglu_mma_nvfp4_preq_fast(
+    act_fp4: *const u8,
+    act_scales: *const u8,
+    up_page: *const u8,
+    gate_page: *const u8,
+    output: *mut u8,
+    k: usize,
+    m_slice: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let packed_k = k.div_ceil(2);
+            let weight_data_size = packed_k * m_slice;
+            let up_scales = unsafe { up_page.add(weight_data_size) };
+            let gate_scales = unsafe { gate_page.add(weight_data_size) };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_fused_swiglu_mma_nvfp4_preq_fast(
+                    act_fp4,
+                    act_scales,
+                    up_page,
+                    up_scales,
+                    gate_page,
+                    gate_scales,
+                    output,
+                    k as i32,
+                    m_slice as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "fused_swiglu_mma_nvfp4_preq_fast failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "fused_swiglu_mma_nvfp4_preq_fast requires GPU".to_string(),
+    ))
+}
+
 /// FP32 RMSNorm: reads FP32 input from accumulator, writes FP32 output.
 pub fn rms_norm_f32(
     input: *const u8,  // FP32 hidden state
@@ -668,6 +1632,49 @@ pub fn rms_norm_f32_to_f16(
         }
     }
     Err(Error::Cuda("rms_norm_f32_to_f16 requires GPU".to_string()))
+}
+
+/// Fused RMSNorm + FP4 quantize: reads FP32 hidden state, applies RMSNorm
+/// with FP16 weight, then directly quantizes to split-half FP4 + E8M0 scales.
+/// Optionally produces FP16 normalized output (pass null to skip).
+/// Eliminates 2 kernel launches and a global memory round-trip.
+pub fn fused_rms_norm_quantize_fp4(
+    input: *const u8,       // [K] FP32 hidden state
+    norm_weight: *const u8, // [K] FP16 norm weight
+    act_fp4: *mut u8,       // [K/2] split-half FP4 output
+    act_scales: *mut u8,    // [K/32] E8M0 scales output
+    opt_f16_out: *mut u8,   // [K] optional FP16 output (null to skip)
+    k: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_fused_rms_norm_quantize_fp4(
+                    input,
+                    norm_weight,
+                    act_fp4,
+                    act_scales,
+                    opt_f16_out,
+                    k as i32,
+                    eps,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "fused_rms_norm_quantize_fp4 failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "fused_rms_norm_quantize_fp4 requires GPU".to_string(),
+    ))
 }
 
 /// FP32-input router scoring with bias.
@@ -765,7 +1772,8 @@ pub fn run_router_f32(
                     return Ok(topk);
                 }
                 RouterScoringFunc::Softmax => {
-                    // Simple softmax topk (not used for Kimi K2.5)
+                    // Softmax over ALL experts, then top-k, then renormalize
+                    // to sum to 1.0 (matches llama.cpp norm_w=true behavior).
                     let max_s = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let exp_scores: Vec<f32> =
                         raw_scores.iter().map(|&s| (s - max_s).exp()).collect();
@@ -778,23 +1786,170 @@ pub fn run_router_f32(
                         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     indexed.truncate(top_k);
 
-                    // Normalize top-k weights to sum to 1.0
-                    // (softmax over all experts leaves probability mass on non-selected experts)
-                    let topk_sum: f32 = indexed.iter().map(|&(_, w)| w).sum();
-                    let mut topk: Vec<(u16, f32)> =
-                        indexed.iter().map(|&(i, w)| (i as u16, w)).collect();
+                    // Renormalize top-k weights to sum to 1.0
+                    let topk_sum: f32 = indexed.iter().map(|(_, w)| w).sum();
                     if topk_sum > 0.0 {
-                        for (_, w) in topk.iter_mut() {
-                            *w /= topk_sum;
-                        }
+                        return Ok(indexed
+                            .iter()
+                            .map(|&(i, w)| (i as u16, w / topk_sum))
+                            .collect());
                     }
-
-                    return Ok(topk);
+                    return Ok(indexed.iter().map(|&(i, w)| (i as u16, w)).collect());
                 }
             }
         }
     }
     Err(Error::Cuda("run_router_f32 requires GPU".to_string()))
+}
+
+/// GPU-fused router: GEMV + softmax/sigmoid + top-k + normalize.
+///
+/// Eliminates the stream.synchronize() bottleneck by doing ALL router work
+/// on the GPU and only transferring back the final top-k results (tiny D2H).
+///
+/// Returns Vec<(expert_id, weight)> sorted by weight descending.
+pub fn run_router_gpu_topk(
+    hidden_state_f32: *const u8, // FP32 normalized hidden state (device)
+    router_weights: *const u8,   // FP16 router weight matrix (device)
+    num_experts: usize,
+    hidden_dim: usize,
+    top_k: usize,
+    scoring_func: RouterScoringFunc,
+    scores_dev: *mut f32,      // [num_experts] temp buffer (device)
+    topk_ids_dev: *mut u8,     // [top_k] u16 output (device)
+    topk_weights_dev: *mut u8, // [top_k] f32 output (device)
+    stream: &CudaStream,
+) -> Result<Vec<(u16, f32)>> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let (scoring_mode, scaling_factor) = match scoring_func {
+                RouterScoringFunc::Softmax => (0i32, 1.0f32),
+                RouterScoringFunc::Sigmoid {
+                    scaling_factor,
+                    normalize: _,
+                } => (1i32, scaling_factor),
+            };
+
+            // Launch fused GEMV + top-k on GPU (no sync needed between steps)
+            let err = unsafe {
+                cuda_ffi::vib3_launch_router_topk(
+                    hidden_state_f32,
+                    router_weights,
+                    scores_dev,
+                    std::ptr::null(), // no bias (NULL)
+                    topk_ids_dev as *mut u16,
+                    topk_weights_dev as *mut f32,
+                    hidden_dim as i32,
+                    num_experts as i32,
+                    top_k as i32,
+                    scoring_mode,
+                    scaling_factor,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "router_topk launch failed (err={})",
+                    err
+                )));
+            }
+
+            // Single sync to wait for the tiny output (instead of syncing after GEMV)
+            stream.synchronize()?;
+
+            // Small D2H: top_k × (u16 + f32) = top_k × 6 bytes
+            let id_bytes = top_k * std::mem::size_of::<u16>();
+            let weight_bytes = top_k * std::mem::size_of::<f32>();
+
+            let mut id_buf = vec![0u16; top_k];
+            let mut weight_buf = vec![0f32; top_k];
+
+            cuda_ffi::memcpy_d2h(id_buf.as_mut_ptr() as *mut u8, topk_ids_dev, id_bytes)?;
+            cuda_ffi::memcpy_d2h(
+                weight_buf.as_mut_ptr() as *mut u8,
+                topk_weights_dev,
+                weight_bytes,
+            )?;
+
+            let result: Vec<(u16, f32)> = id_buf
+                .iter()
+                .zip(weight_buf.iter())
+                .map(|(&id, &w)| (id, w))
+                .collect();
+
+            return Ok(result);
+        }
+    }
+    Err(Error::Cuda("run_router_gpu_topk requires GPU".to_string()))
+}
+
+/// GPU router that launches the kernel but does NOT synchronize or D2H.
+/// Expert IDs and weights remain on device for consumption by
+/// `moe_experts_fused_gpu`. No host-side expert list is returned.
+pub fn run_router_gpu_topk_nosync(
+    hidden_state_f32: *const u8, // FP32 normalized hidden state (device)
+    router_weights: *const u8,   // FP16 router weight matrix (device)
+    num_experts: usize,
+    hidden_dim: usize,
+    top_k: usize,
+    scoring_func: RouterScoringFunc,
+    scores_dev: *mut f32,      // [num_experts] temp buffer (device)
+    topk_ids_dev: *mut u8,     // [top_k] u16 output (device)
+    topk_weights_dev: *mut u8, // [top_k] f32 output (device)
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let (scoring_mode, scaling_factor) = match scoring_func {
+                RouterScoringFunc::Softmax => (0i32, 1.0f32),
+                RouterScoringFunc::Sigmoid {
+                    scaling_factor,
+                    normalize: _,
+                } => (1i32, scaling_factor),
+            };
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_router_topk(
+                    hidden_state_f32,
+                    router_weights,
+                    scores_dev,
+                    std::ptr::null(),
+                    topk_ids_dev as *mut u16,
+                    topk_weights_dev as *mut f32,
+                    hidden_dim as i32,
+                    num_experts as i32,
+                    top_k as i32,
+                    scoring_mode,
+                    scaling_factor,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "router_topk nosync launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    let _ = (
+        hidden_state_f32,
+        router_weights,
+        num_experts,
+        hidden_dim,
+        top_k,
+        scoring_func,
+        scores_dev,
+        topk_ids_dev,
+        topk_weights_dev,
+        stream,
+    );
+    Err(Error::Cuda(
+        "run_router_gpu_topk_nosync requires GPU".to_string(),
+    ))
 }
 
 /// Weighted accumulation: output += weight × expert_output.
@@ -876,6 +2031,161 @@ pub fn weighted_accumulate_f32(
     let inp = unsafe { std::slice::from_raw_parts(expert_output as *const f16, dim) };
     for (o, i) in out.iter_mut().zip(inp.iter()) {
         *o += weight * i.to_f32();
+    }
+    Ok(())
+}
+
+/// FP32→FP32 weighted accumulate: output[i] += weight * expert_output[i].
+/// Both buffers are FP32 — no FP16 truncation anywhere in the pipeline.
+pub fn weighted_accumulate_f32_f32(
+    output: *mut u8,          // [dim] FP32, accumulated
+    expert_output: *const u8, // [dim] FP32, single expert
+    weight: f32,
+    dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_weighted_accumulate_f32_f32(
+                    output,
+                    expert_output,
+                    weight,
+                    dim as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "weighted_accumulate_f32_f32 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+
+    // CPU fallback
+    let out = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, dim) };
+    let inp = unsafe { std::slice::from_raw_parts(expert_output as *const f32, dim) };
+    for (o, i) in out.iter_mut().zip(inp.iter()) {
+        *o += weight * i;
+    }
+    Ok(())
+}
+
+/// Sigmoid-gated FP16→FP32 accumulate: output[i] += sigmoid(gate_dev[0]) * f16(expert[i]).
+/// Gate scalar is read from device memory; sigmoid computed on-GPU. No sync needed.
+pub fn sigmoid_gated_accumulate_f32(
+    output: *mut u8,          // [dim] FP32, accumulated
+    expert_output: *const u8, // [dim] FP16, shared expert output
+    gate_dev: *const u8,      // [1] FP32, gate scalar on device
+    dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_sigmoid_gated_accumulate_f32(
+                    output,
+                    expert_output,
+                    gate_dev,
+                    dim as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "sigmoid_gated_accumulate_f32 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+
+    // CPU fallback: read gate, apply sigmoid, accumulate
+    let gate_raw = unsafe { *(gate_dev as *const f32) };
+    let gate_sigmoid = 1.0 / (1.0 + (-gate_raw).exp());
+    let out = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, dim) };
+    let inp = unsafe { std::slice::from_raw_parts(expert_output as *const half::f16, dim) };
+    for (o, i) in out.iter_mut().zip(inp.iter()) {
+        *o += gate_sigmoid * i.to_f32();
+    }
+    Ok(())
+}
+
+/// FP32 SwiGLU fuse: output[i] = silu(gate[i]) * up[i], all FP32.
+pub fn swiglu_fuse_f32(
+    gate: *const u8,
+    up: *const u8,
+    output: *mut u8,
+    dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_swiglu_fuse_f32(
+                    gate,
+                    up,
+                    output,
+                    dim as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "swiglu_fuse_f32 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("swiglu_fuse_f32 requires GPU".to_string()))
+}
+
+/// Sigmoid-gated accumulate with FP32 expert output (NVFP4 MMA path).
+/// output[i] += sigmoid(gate_dev[0]) * expert_output[i], all FP32.
+pub fn sigmoid_gated_accumulate_f32in(
+    output: *mut u8,
+    expert_output: *const u8,
+    gate_dev: *const u8,
+    dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_sigmoid_gated_accumulate_f32in(
+                    output,
+                    expert_output,
+                    gate_dev,
+                    dim as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "sigmoid_gated_accumulate_f32in launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    // CPU fallback
+    let gate_raw = unsafe { *(gate_dev as *const f32) };
+    let gate_sigmoid = 1.0 / (1.0 + (-gate_raw).exp());
+    let out = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, dim) };
+    let inp = unsafe { std::slice::from_raw_parts(expert_output as *const f32, dim) };
+    for (o, i) in out.iter_mut().zip(inp.iter()) {
+        *o += gate_sigmoid * i;
     }
     Ok(())
 }
@@ -1475,9 +2785,9 @@ fn cpu_matmul_int4_grouped(
         for (group, lut_entry) in dequant_lut.iter_mut().enumerate().take(num_groups_actual) {
             let scale_idx = row_scales_start + group * 2;
             let scale = if scale_idx + 1 < w.len() {
-                // Scales are FP16 — matching CUDA kernel's fp16_scale_to_float
+                // Scales are BF16 (not FP16) — must decode as BF16
                 let s_bits = u16::from_le_bytes([w[scale_idx], w[scale_idx + 1]]);
-                let s = f16::from_bits(s_bits).to_f32();
+                let s = bf16_to_f32(s_bits);
                 if s.is_finite() && s > 0.0 {
                     s
                 } else {
@@ -1671,9 +2981,9 @@ fn cpu_swiglu_int4(
         for group in 0..ng {
             let up_scale_idx = up_scales_start + group * 2;
             let up_scale = if up_scale_idx + 1 < up_data.len() {
-                // Scales are FP16 — matching CUDA kernel's fp16_scale_to_float
+                // Scales are BF16 (not FP16) — must decode as BF16
                 let s_bits = u16::from_le_bytes([up_data[up_scale_idx], up_data[up_scale_idx + 1]]);
-                let s = f16::from_bits(s_bits).to_f32();
+                let s = bf16_to_f32(s_bits);
                 if s.is_finite() && s > 0.0 {
                     s
                 } else {
@@ -1685,10 +2995,10 @@ fn cpu_swiglu_int4(
 
             let gate_scale_idx = gate_scales_start + group * 2;
             let gate_scale = if gate_scale_idx + 1 < gate_data.len() {
-                // Scales are FP16 — matching CUDA kernel's fp16_scale_to_float
+                // Scales are BF16 (not FP16) — must decode as BF16
                 let s_bits =
                     u16::from_le_bytes([gate_data[gate_scale_idx], gate_data[gate_scale_idx + 1]]);
-                let s = f16::from_bits(s_bits).to_f32();
+                let s = bf16_to_f32(s_bits);
                 if s.is_finite() && s > 0.0 {
                     s
                 } else {
@@ -2490,9 +3800,9 @@ pub fn quantize_weights_to_int4(weights_f32: &[f32], rows: usize, cols: usize) -
             // scale such that max_abs maps to 7 (the positive range of our offset scheme)
             let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
 
-            // Store scale as FP16 (matching CUDA kernel's fp16_scale_to_float)
-            let scale_f16 = f16::from_f32(scale);
-            let sb = scale_f16.to_le_bytes();
+            // Store scale as BF16
+            let scale_bf16 = f32_to_bf16(scale);
+            let sb = scale_bf16.to_le_bytes();
             let scale_offset = (row * num_groups + group) * 2;
             scales_region[scale_offset] = sb[0];
             scales_region[scale_offset + 1] = sb[1];
@@ -2547,10 +3857,10 @@ pub fn quantize_bf16_to_int4(bf16_data: &[u8], rows: usize, cols: usize) -> Vec<
 /// This is the inverse of `quantize_weights_to_int4`.
 /// The input layout is: `[rows * packed_k INT4 bytes] [rows * num_groups * scale_bytes_each]`
 ///
-/// The scale format is FP16 (2 bytes each). The `scale_format` argument is retained
-/// for backward compatibility:
-/// - `DType::BF16` → scales are decoded as BF16 (legacy; not used by current converter)
-/// - `DType::FP16` or any other → scales are decoded as FP16 (standard)
+/// The scale format may be BF16 or FP16 (2 bytes each). The `scale_format` argument
+/// selects the interpretation:
+/// - `DType::BF16` → scales are BF16 (compressed-tensors format from HuggingFace)
+/// - `DType::FP16` → scales are FP16
 ///
 /// Dequant formula: `(nibble - 8) * scale`
 pub fn dequantize_int4_to_f32(
@@ -2618,11 +3928,11 @@ pub fn dequantize_int4_to_f32(
 
 /// Direct INT4→NVFP4 conversion without f32 intermediate.
 ///
-/// Takes INT4 packed data (with FP16 scales) and converts to NVFP4 (E2M1 with FP16
-/// scales) in a single pass. This is much faster than dequant→requant for model
-/// conversion.
+/// Takes INT4 packed data (with BF16 scales) from compressed-tensors format and
+/// converts to NVFP4 (E2M1 with FP16 scales) in a single pass. This is much faster
+/// than dequant→requant for model conversion.
 ///
-/// Input layout: `[rows * packed_k INT4 bytes] [rows * num_groups * 2 FP16 scale bytes]`
+/// Input layout: `[rows * packed_k INT4 bytes] [rows * num_groups * 2 BF16 scale bytes]`
 /// Output layout: `[rows * packed_k E2M1 bytes] [rows * num_blocks * 2 FP16 scale bytes]`
 pub fn convert_int4_to_nvfp4(
     int4_data: &[u8],
@@ -2681,7 +3991,7 @@ pub fn convert_int4_to_nvfp4(
                 let scale_offset = total_int4_bytes + (row * num_groups_in + col0 / group_size) * 2;
                 let scale0 = if scale_offset + 1 < int4_data.len() {
                     let sb = [int4_data[scale_offset], int4_data[scale_offset + 1]];
-                    f16::from_le_bytes(sb).to_f32()
+                    bf16_to_f32(u16::from_le_bytes(sb))
                 } else {
                     1.0
                 };
@@ -2692,7 +4002,7 @@ pub fn convert_int4_to_nvfp4(
                         total_int4_bytes + (row * num_groups_in + col1 / group_size) * 2;
                     let scale1 = if scale_offset1 + 1 < int4_data.len() {
                         let sb = [int4_data[scale_offset1], int4_data[scale_offset1 + 1]];
-                        f16::from_le_bytes(sb).to_f32()
+                        bf16_to_f32(u16::from_le_bytes(sb))
                     } else {
                         1.0
                     };
@@ -3182,4 +4492,425 @@ pub fn residual_add_fp32(
         }
     }
     Err(Error::Cuda("residual_add_fp32 requires GPU".to_string()))
+}
+
+/// Causal depthwise 1D convolution with SiLU activation.
+/// Processes one new token, updates `conv_state` in-place.
+/// conv_state: [num_channels, kernel_size-1], conv_weight: [num_channels, kernel_size].
+pub fn causal_conv1d(
+    conv_state: *mut u8,    // [num_channels, kernel_size-1] FP32, updated in-place
+    new_input: *const u8,   // [num_channels] FP32
+    conv_weight: *const u8, // [num_channels, kernel_size] FP32
+    output: *mut u8,        // [num_channels] FP32
+    num_channels: usize,
+    kernel_size: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_causal_conv1d(
+                    conv_state,
+                    new_input,
+                    conv_weight,
+                    output,
+                    num_channels as i32,
+                    kernel_size as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "causal_conv1d launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("causal_conv1d requires GPU".to_string()))
+}
+
+/// L2 normalization: output[i] = input[i] / ||input[i]||_2.
+/// Each of `num_vecs` vectors of length `dim` is normalized independently.
+pub fn l2_norm(
+    input: *const u8, // [num_vecs, dim] FP32
+    output: *mut u8,  // [num_vecs, dim] FP32
+    num_vecs: usize,
+    dim: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_l2_norm(
+                    input,
+                    output,
+                    num_vecs as i32,
+                    dim as i32,
+                    eps,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!("l2_norm launch failed (err={})", err)));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("l2_norm requires GPU".to_string()))
+}
+
+/// Tiled repeat FP32 vectors: expand [num_groups, dim] → [num_groups*repeat, dim].
+/// Result: [G0,G1,...,G_{n-1}, G0,G1,...,G_{n-1}, ...] (all groups tiled).
+/// Matches the V-head tiled order produced by llama.cpp's _LinearAttentionVReorderBase.
+pub fn repeat_tile_f32(
+    input: *const u8, // [num_groups, dim] FP32
+    output: *mut u8,  // [num_groups * repeat, dim] FP32
+    num_groups: usize,
+    dim: usize,
+    repeat: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_repeat_tile_f32(
+                    input,
+                    output,
+                    num_groups as i32,
+                    dim as i32,
+                    repeat as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "repeat_tile_f32 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("repeat_tile_f32 requires GPU".to_string()))
+}
+
+/// DeltaNet gate computation: gate = -exp(A_log) * softplus(alpha + dt_bias).
+pub fn deltanet_gate(
+    alpha: *const u8,   // [num_heads] FP32
+    dt_bias: *const u8, // [num_heads] FP32
+    a_log: *const u8,   // [num_heads] FP32
+    gate_out: *mut u8,  // [num_heads] FP32
+    num_heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_deltanet_gate(
+                    alpha,
+                    dt_bias,
+                    a_log,
+                    gate_out,
+                    num_heads as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "deltanet_gate launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("deltanet_gate requires GPU".to_string()))
+}
+
+/// Fused DeltaNet autoregressive step for all heads.
+/// Per head: decay → retrieve → delta → update → query.
+/// state: [num_heads, vdim, vdim] (mutable), q/k/v: [num_heads, vdim],
+/// gate: [num_heads] (scalar decay), beta: [num_heads] (write strength).
+pub fn deltanet_step(
+    state: *mut u8,  // [num_heads, vdim, vdim] FP32, updated in-place
+    q: *const u8,    // [num_heads, vdim] FP32
+    k: *const u8,    // [num_heads, vdim] FP32
+    v: *const u8,    // [num_heads, vdim] FP32
+    gate: *const u8, // [num_heads] FP32
+    beta: *const u8, // [num_heads] FP32
+    output: *mut u8, // [num_heads, vdim] FP32
+    num_heads: usize,
+    vdim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_deltanet_step(
+                    state,
+                    q,
+                    k,
+                    v,
+                    gate,
+                    beta,
+                    output,
+                    num_heads as i32,
+                    vdim as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "deltanet_step launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("deltanet_step requires GPU".to_string()))
+}
+
+/// In-place FP32 scale: data[i] *= scale.
+pub fn scale_f32(
+    data: *mut u8, // [n] FP32, scaled in-place
+    n: usize,
+    scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err =
+                unsafe { cuda_ffi::vib3_launch_scale_f32(data, n as i32, scale, stream.raw_ptr()) };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "scale_f32 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("scale_f32 requires GPU".to_string()))
+}
+
+/// Element-wise sigmoid: output[i] = 1 / (1 + exp(-input[i])).
+pub fn sigmoid(
+    input: *const u8, // [n] FP32
+    output: *mut u8,  // [n] FP32 (can alias input for in-place)
+    n: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err =
+                unsafe { cuda_ffi::vib3_launch_sigmoid(input, output, n as i32, stream.raw_ptr()) };
+            if err != 0 {
+                return Err(Error::Cuda(format!("sigmoid launch failed (err={})", err)));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("sigmoid requires GPU".to_string()))
+}
+
+/// Gated RMSNorm: output = RMSNorm(x, weight) * SiLU(gate).
+/// Per-head normalization: `num_groups` independent heads, each over `group_dim` elements.
+/// weight has shape [norm_dim] and cycles across each head's `group_dim`.
+pub fn gated_rmsnorm(
+    x: *const u8,      // [num_groups * group_dim] FP32
+    gate: *const u8,   // [num_groups * group_dim] FP32
+    weight: *const u8, // [norm_dim] FP32
+    output: *mut u8,   // [num_groups * group_dim] FP32
+    num_groups: usize,
+    group_dim: usize,
+    norm_dim: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_gated_rmsnorm(
+                    x,
+                    gate,
+                    weight,
+                    output,
+                    num_groups as i32,
+                    group_dim as i32,
+                    norm_dim as i32,
+                    eps,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "gated_rmsnorm launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("gated_rmsnorm requires GPU".to_string()))
+}
+
+/// Deinterleave FP16: splits [A0(chunk), B0(chunk), A1(chunk), B1(chunk), ...]
+/// into output_a = [A0, A1, ...] and output_b = [B0, B1, ...].
+/// Used for Qwen3.5 Q+gate extraction from doubled Q projection.
+pub fn deinterleave_f16(
+    input: *const u8,  // [num_chunks * 2 * chunk_size] FP16 interleaved
+    output_a: *mut u8, // [num_chunks * chunk_size] FP16
+    output_b: *mut u8, // [num_chunks * chunk_size] FP16
+    chunk_size: usize,
+    num_chunks: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_deinterleave_f16(
+                    input,
+                    output_a,
+                    output_b,
+                    chunk_size as i32,
+                    num_chunks as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "deinterleave_f16 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("deinterleave_f16 requires GPU".to_string()))
+}
+
+/// Partial RoPE in-place (FP16). Applies rotary embeddings to only the
+/// first `rope_dim` dimensions of each head, leaving the rest unchanged.
+/// data: [num_heads, head_dim] with given stride between heads.
+/// d_position: device pointer to int32 position scalar.
+pub fn partial_rope(
+    data: *mut u8, // [num_heads * stride] FP16, modified in-place
+    head_dim: usize,
+    rope_dim: usize,
+    stride: usize,
+    num_heads: usize,
+    d_position: *const u8, // device pointer to int32
+    rope_base: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_partial_rope(
+                    data,
+                    head_dim as i32,
+                    rope_dim as i32,
+                    stride as i32,
+                    num_heads as i32,
+                    d_position,
+                    rope_base,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "partial_rope launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("partial_rope requires GPU".to_string()))
+}
+
+/// Per-head RMSNorm in-place (FP16). Normalizes each head independently.
+/// data: [num_heads * stride] FP16, weight: [head_dim] FP16.
+/// stride = distance between heads in elements (2*head_dim for interleaved Q+gate,
+/// head_dim for contiguous K).
+pub fn per_head_rmsnorm(
+    data: *mut u8,     // [num_heads * stride] FP16, modified in-place
+    weight: *const u8, // [head_dim] FP16
+    head_dim: usize,
+    stride: usize,
+    num_heads: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_per_head_rmsnorm(
+                    data,
+                    weight,
+                    head_dim as i32,
+                    stride as i32,
+                    num_heads as i32,
+                    eps,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "per_head_rmsnorm launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("per_head_rmsnorm requires GPU".to_string()))
+}
+
+/// Sigmoid-gated multiply (FP16): output[i] = input[i] * sigmoid(gate[i]).
+/// output can alias input for in-place gating.
+pub fn sigmoid_mul_f16(
+    output: *mut u8,  // [n] FP16
+    input: *const u8, // [n] FP16
+    gate: *const u8,  // [n] FP16
+    n: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_sigmoid_mul_f16(
+                    output,
+                    input,
+                    gate,
+                    n as i32,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "sigmoid_mul_f16 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda("sigmoid_mul_f16 requires GPU".to_string()))
 }

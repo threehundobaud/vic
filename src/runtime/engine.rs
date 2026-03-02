@@ -34,6 +34,51 @@ pub struct GenerateResult {
     pub stats: StatsSnapshot,
 }
 
+/// Pre-assembled weight storage — either a borrowed T1 page pointer (single-page)
+/// or an owned contiguous DeviceBuffer (multi-page, assembled once at init).
+enum PreAssembledWeight {
+    /// Single-page tensor: raw pointer into T1 page slot. Zero-copy, zero extra VRAM.
+    /// The T1 page is pinned for the lifetime of inference (model is fully resident).
+    SinglePage { ptr: *const u8, size: usize },
+    /// Multi-page tensor: contiguous DeviceBuffer assembled via D2D from T1 pages.
+    /// Allocated once at startup, never freed during inference.
+    Assembled(DeviceBuffer),
+    /// NVFP4-converted weight: [FP4 data (M*K/2) | BF16 scales (M*(K/32)*2)] in one buffer.
+    /// Converted from FP16 at preassembly time for ~4x bandwidth reduction.
+    /// Uses MMA GEMV instead of scalar FP16 GEMV.
+    Nvfp4 { buf: DeviceBuffer, m: usize, k: usize },
+}
+
+impl PreAssembledWeight {
+    fn ptr(&self) -> *const u8 {
+        match self {
+            PreAssembledWeight::SinglePage { ptr, .. } => *ptr,
+            PreAssembledWeight::Assembled(buf) => buf.as_ptr(),
+            PreAssembledWeight::Nvfp4 { buf, .. } => buf.as_ptr(),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            PreAssembledWeight::SinglePage { size, .. } => *size,
+            PreAssembledWeight::Assembled(buf) => buf.size(),
+            PreAssembledWeight::Nvfp4 { buf, .. } => buf.size(),
+        }
+    }
+
+    fn is_nvfp4(&self) -> bool {
+        matches!(self, PreAssembledWeight::Nvfp4 { .. })
+    }
+
+    /// For NVFP4 weights, return (m, k) dimensions.
+    fn nvfp4_dims(&self) -> Option<(usize, usize)> {
+        match self {
+            PreAssembledWeight::Nvfp4 { m, k, .. } => Some((*m, *k)),
+            _ => None,
+        }
+    }
+}
+
 /// The vib3 inference engine.
 pub struct Engine {
     config: EngineConfig,
@@ -47,6 +92,10 @@ pub struct Engine {
     tokenizer: TokenizerWrapper,
     sampler: Sampler,
     stream: CudaStream,
+    /// Separate stream for router GEMV to avoid flushing the main compute pipeline
+    router_stream: CudaStream,
+    /// Event for synchronizing router stream with compute stream
+    router_event: cuda_ffi::CudaEvent,
 
     // ── GPU working buffers (DeviceBuffer: VRAM when CUDA is active, host otherwise) ──
     /// Hidden state buffer (FP16, [hidden_dim]) — on device.
@@ -59,6 +108,9 @@ pub struct Engine {
     hidden_state_f32: DeviceBuffer,
     /// Expert output scratch buffer (FP16, [expert_hidden_dim]) — on device.
     expert_output_buf: DeviceBuffer,
+    /// Expert output scratch buffer (FP32, [expert_hidden_dim]) — on device.
+    /// Used for NVFP4 routed experts to eliminate FP16 truncation of SwiGLU intermediate.
+    expert_output_f32_buf: DeviceBuffer,
     /// Accumulated layer output buffer (FP32, [hidden_dim]) — on device.
     /// FP32 to eliminate truncation errors when accumulating 8+ expert outputs.
     layer_output_buf: DeviceBuffer,
@@ -68,20 +120,51 @@ pub struct Engine {
     /// Down-projection scratch buffer (FP16, [hidden_dim]) — on device.
     /// Pre-allocated to avoid per-call cudaMalloc in execute_expert.
     down_proj_buf: DeviceBuffer,
+    /// Down-projection scratch buffer (FP32, [hidden_dim]) — on device.
+    /// Used for NVFP4 routed experts to eliminate FP16 truncation of down_proj output.
+    down_proj_f32_buf: DeviceBuffer,
     /// FP32 normalized hidden state for MoE sublayer (FP32, [hidden_dim]).
     /// Used as input to FP32-input expert matmuls and FP32-input router.
     moe_normed_f32: DeviceBuffer,
 
+    // ── Pre-quantized activation buffers for MMA (VRAM) ──
+    // Pre-quantized FP4 E2M1 + E8M0 scales for the MoE normalized hidden state.
+    // Computed once per MoE layer before the expert loop, reused across all expert SwiGLU calls.
+    /// Pre-quantized activation FP4 data ([hidden_dim/2] bytes, split-half format).
+    preq_act_fp4: DeviceBuffer,
+    /// Pre-quantized activation E8M0 scales ([hidden_dim/32] bytes).
+    preq_act_scales: DeviceBuffer,
+    /// Pre-quantized activation FP4 data for down_proj ([expert_hidden_dim/2]).
+    preq_down_act_fp4: DeviceBuffer,
+    /// Pre-quantized activation E8M0 scales for down_proj ([expert_hidden_dim/32]).
+    preq_down_act_scales: DeviceBuffer,
+    /// Pre-quantized activation FP4 data for inner_dim projections ([inner_dim/2]).
+    /// Used when DeltaNet/GQA output projection weights are NVFP4.
+    preq_inner_act_fp4: DeviceBuffer,
+    /// Pre-quantized activation E8M0 scales for inner_dim ([inner_dim/32]).
+    preq_inner_act_scales: DeviceBuffer,
+    /// FP32 normalized hidden state for attention sublayer.
+    /// Used as source for FP4 activation quantization when NVFP4 weights are used.
+    attn_normed_f32: DeviceBuffer,
+    /// FP32 scratch buffer for NVFP4 GEMV output. Sized to max(q_dim, qkv_dim, inner_dim, attn_dim) * 4.
+    /// Used for projections where output is FP32 but downstream expects FP16.
+    nvfp4_f32_scratch: DeviceBuffer,
+
     // ── Pre-allocated attention projection scratch buffers (VRAM) ──
     // These eliminate 4x cudaMalloc + cudaFree per layer (128 calls/token).
-    /// Q projection scratch (FP16, [q_dim] = [hidden_dim]).
+    /// Q projection scratch (FP16). For gated attention (Qwen3.5): [num_heads * 2 * head_dim] = [16384].
+    /// For standard GQA: [hidden_dim].
     q_proj_dev: DeviceBuffer,
     /// K projection scratch (FP16, [kv_dim] = [num_kv_heads * head_dim]).
     k_proj_dev: DeviceBuffer,
     /// V projection scratch (FP16, [kv_dim]).
     v_proj_dev: DeviceBuffer,
-    /// Attention output scratch for O projection input (FP16, [hidden_dim]).
+    /// Attention output scratch for O projection input (FP16, [num_heads * head_dim]).
+    /// For Qwen3.5: [8192] (differs from hidden_dim=3072).
     attn_dev: DeviceBuffer,
+    /// Deinterleaved gate for gated attention (FP16, [num_heads * head_dim]).
+    /// Only used by Qwen3.5. Holds sigmoid gate extracted from doubled Q projection.
+    gated_attn_gate_dev: DeviceBuffer,
 
     // ── Pre-allocated SwiGLU temp buffers for INT4 decomposition (VRAM) ──
     // INT4 SwiGLU decomposes into 2 matmuls + silu_mul, needing temp space.
@@ -94,6 +177,18 @@ pub struct Engine {
     // ── Pre-allocated router scores buffer (VRAM) ──
     /// Router output scores (f32, [num_experts]).
     router_scores_dev: DeviceBuffer,
+    /// GPU top-k output: expert IDs (u16, [top_k]).
+    router_topk_ids_dev: DeviceBuffer,
+    /// GPU top-k output: routing weights (f32, [top_k]).
+    router_topk_weights_dev: DeviceBuffer,
+
+    /// Pre-allocated logits device buffer (FP32, [vocab_size]).
+    /// Used by `compute_logits` to avoid per-token device_alloc/free.
+    logits_dev: DeviceBuffer,
+
+    /// NVFP4-converted lm_head weight, lazily populated on first token.
+    /// Layout: [FP4 data (M*K/2) | BF16 scales (M*(K/32)*2)] where M=vocab_size, K=hidden_dim.
+    lm_head_nvfp4: Option<DeviceBuffer>,
 
     // ── Pre-allocated MLA projection scratch buffers (VRAM) ──
     // Eliminates CPU GEMV for MLA attention projections (q_a, q_b, kv_a, o_proj).
@@ -149,6 +244,100 @@ pub struct Engine {
     gpu_kv_v: Vec<DeviceBuffer>,
     #[allow(dead_code)]
     max_kv_len: usize,
+
+    // ── DeltaNet (Gated Delta Rule) state for Qwen3.5 hybrid models ──
+    // Per-layer recurrent state S ∈ R^{num_v_heads × v_head_dim × v_head_dim} (FP32).
+    // Only allocated for DeltaNet layers (36 of 48 for Qwen3.5-122B).
+    dn_recurrent_state: Vec<DeviceBuffer>,
+    // Per-layer conv1d state: [(kernel_size-1) × qkv_dim] FP32.
+    dn_conv_state: Vec<DeviceBuffer>,
+    // Scratch buffers for DeltaNet computation (allocated once, reused per layer):
+    /// QKV projection output (FP16, [qkv_dim=12288]).
+    dn_qkv_proj_dev: DeviceBuffer,
+    /// QKV projection converted to FP32 (FP32, [qkv_dim=12288]).
+    dn_qkv_f32_dev: DeviceBuffer,
+    /// Conv1d output (FP32, [qkv_dim=12288]).
+    dn_conv_out_dev: DeviceBuffer,
+    /// Z gate projection output (FP16, [inner_dim=8192]).
+    dn_z_proj_dev: DeviceBuffer,
+    /// Z gate converted to FP32 (FP32, [inner_dim=8192]).
+    dn_z_f32_dev: DeviceBuffer,
+    /// Alpha projection output (FP16, [num_v_heads=64]).
+    dn_alpha_proj_dev: DeviceBuffer,
+    /// Alpha F32 (FP32, [num_v_heads=64]).
+    dn_alpha_f32_dev: DeviceBuffer,
+    /// Beta projection output (FP16, [num_v_heads=64]).
+    dn_beta_proj_dev: DeviceBuffer,
+    /// Beta F32 after sigmoid (FP32, [num_v_heads=64]).
+    dn_beta_f32_dev: DeviceBuffer,
+    /// Gate output (FP32, [num_v_heads=64]).
+    dn_gate_dev: DeviceBuffer,
+    /// Q after L2 norm (FP32, [num_key_heads × key_head_dim = 2048]).
+    dn_q_norm_dev: DeviceBuffer,
+    /// K after L2 norm (FP32, [num_key_heads × key_head_dim = 2048]).
+    dn_k_norm_dev: DeviceBuffer,
+    /// Q after tiled repeat 16→64 heads (FP32, [num_v_heads × key_head_dim = 8192]).
+    dn_q_rep_dev: DeviceBuffer,
+    /// K after tiled repeat 16→64 heads (FP32, [num_v_heads × key_head_dim = 8192]).
+    dn_k_rep_dev: DeviceBuffer,
+    /// DeltaNet step output (FP32, [inner_dim=8192]).
+    dn_step_out_dev: DeviceBuffer,
+    /// Gated RMSNorm output (FP32, [inner_dim=8192]).
+    dn_norm_out_dev: DeviceBuffer,
+    /// O-projection output (FP32, [hidden_dim=3072]).
+    dn_o_out_dev: DeviceBuffer,
+    /// Small buffer for per-head scalars: A values (FP32, [num_v_heads]).
+    /// Loaded once per layer from segment 36.
+    dn_a_f32_dev: DeviceBuffer,
+    /// Small buffer for dt_bias (FP32, [num_v_heads]).
+    /// Loaded once per layer from segment 35.
+    dn_dt_bias_f32_dev: DeviceBuffer,
+    /// Small buffer for norm weight (FP32, [value_head_dim=128]).
+    /// Loaded once per layer from segment 37.
+    dn_norm_weight_f32_dev: DeviceBuffer,
+
+    // ── Pre-allocated DeltaNet weight staging buffers ──
+    // Eliminates per-layer cudaMalloc/cudaFree overhead (~30ms/token).
+    // One buffer per DeltaNet weight segment, reused across all layers.
+    // Populated via D2D copy from T1 pages at the start of each layer.
+    /// seg 30: QKV weight [qkv_dim × hidden_dim] (BF16)
+    dn_w_qkv: DeviceBuffer,
+    /// seg 31: Z gate weight [inner_dim × hidden_dim] (BF16)
+    dn_w_z: DeviceBuffer,
+    /// seg 32: Beta weight [num_v_heads × hidden_dim] (BF16)
+    dn_w_beta: DeviceBuffer,
+    /// seg 33: Alpha weight [num_v_heads × hidden_dim] (BF16)
+    dn_w_alpha: DeviceBuffer,
+    /// seg 34: Conv1d weight [qkv_dim × conv_kernel] (BF16)
+    dn_w_conv: DeviceBuffer,
+    /// seg 35: dt_bias [num_v_heads] (BF16)
+    dn_w_dt_bias: DeviceBuffer,
+    /// seg 36: A_log [num_v_heads × key_head_dim] (BF16)
+    dn_w_a_log: DeviceBuffer,
+    /// seg 37: Norm weight [value_head_dim] (BF16)
+    dn_w_norm: DeviceBuffer,
+    /// seg 38: Out projection [inner_dim × hidden_dim] (BF16)
+    dn_w_out: DeviceBuffer,
+    /// Pre-allocated conv weight FP32 buffer (avoids cudaMalloc per layer)
+    dn_conv_w_f32_dev: DeviceBuffer,
+
+    // ── Pre-allocated GQA attention weight staging buffers ──
+    // Eliminates 12× cudaMalloc(156MB) + cudaFree per token.
+    // One buffer per weight type, reused across all GQA layers.
+    /// seg 4: Q weight [q_dim × hidden_dim] (FP16) — ~96MB for Qwen3.5
+    gqa_w_q: DeviceBuffer,
+    /// seg 5: O projection [hidden_dim × attn_dim] (FP16) — ~48MB for Qwen3.5
+    gqa_w_o: DeviceBuffer,
+    /// seg 12: K weight [kv_dim × hidden_dim] (FP16) — ~6MB
+    gqa_w_k: DeviceBuffer,
+    /// seg 13: V weight [kv_dim × hidden_dim] (FP16) — ~6MB
+    gqa_w_v: DeviceBuffer,
+    /// seg 27: q_norm [head_dim] (FP16) — 512B
+    gqa_w_qnorm: DeviceBuffer,
+    /// seg 28: k_norm [head_dim] (FP16) — 512B
+    gqa_w_knorm: DeviceBuffer,
+    /// seg 6: attention pre-norm weight [hidden_dim] (FP16) — ~6KB
+    attn_norm_w: DeviceBuffer,
 
     /// KV cache for attention layers (flat, in-memory — used when tiered KV is disabled).
     kv_cache: KvCacheSet,
@@ -225,6 +414,17 @@ pub struct Engine {
     /// embeddings, norms, QKV projections, router weights, lm_head, etc.
     shared_tensor_cache_device: std::collections::HashMap<u32, DeviceBuffer>,
 
+    /// Pre-assembled shared weight tensors — eliminates ALL per-token D2D copies.
+    ///
+    /// Populated once at startup (after model preload). For single-page tensors
+    /// (norms, biases), stores the T1 page pointer directly (zero-copy).
+    /// For multi-page tensors (Q/K/V/O projections, DeltaNet QKV/Z/Out),
+    /// assembles pages into a contiguous DeviceBuffer once and caches permanently.
+    ///
+    /// Key: `(layer as u32) << 16 | segment as u32`.
+    /// Value: `(device_ptr, size_bytes)`.
+    pre_assembled_weights: std::collections::HashMap<u32, PreAssembledWeight>,
+
     // ── Task context (Gearbox integration — Phase A/B) ─────────────
     /// Current task context from Clank's Gearbox or an external classifier.
     /// When Some, drives mode detection override, cache warming, HNSW filtering,
@@ -248,6 +448,54 @@ pub struct Engine {
     /// VRAM-vs-disk comparisons, MLA dumps, etc.). Set via `VIB3_DIAG=1` env var.
     /// Off by default to avoid overhead in normal inference.
     diag_enabled: bool,
+
+    /// NVFP4-converted shared expert weights for MMA GEMV fast path.
+    /// Key: `(layer as u32) << 16 | segment as u32` for segments 14/15/16.
+    /// Value: DeviceBuffer containing [FP4 data | BF16 scales] in MMA-ready format.
+    /// Populated lazily on first use via `fp16_to_nvfp4_weight()` runtime conversion.
+    #[allow(dead_code)]
+    shared_expert_nvfp4: std::collections::HashMap<u32, DeviceBuffer>,
+
+    /// FP32 intermediate buffer for shared expert SwiGLU (MMA outputs FP32).
+    /// Size: shared_intermediate_size * 4 bytes.
+    #[allow(dead_code)]
+    shared_expert_swiglu_f32: DeviceBuffer,
+
+    /// FP32 output buffer for shared expert down_proj (MMA outputs FP32).
+    /// Size: hidden_dim * 4 bytes.
+    #[allow(dead_code)]
+    shared_expert_down_f32: DeviceBuffer,
+
+    /// Pre-quantized FP4 buffer for shared expert mid activation (after SwiGLU).
+    /// Size: shared_intermediate_size / 2 bytes (FP4 data) + shared_intermediate_size / 32 bytes (E8M0 scales).
+    #[allow(dead_code)]
+    shared_expert_mid_fp4: DeviceBuffer,
+    #[allow(dead_code)]
+    shared_expert_mid_scales: DeviceBuffer,
+
+    /// Device-side page pointer table for GPU-only MoE dispatch (zero host sync).
+    /// Layout: [num_moe_layers * num_experts * 3] u64 page pointers.
+    /// Index: moe_layer * num_experts * 3 + expert_id * 3 + segment (0=up, 1=gate, 2=down).
+    /// Built once at init after preload when model is fully resident.
+    /// None when model is not fully resident or expert dtype is not NVFP4.
+    moe_page_table_dev: Option<DeviceBuffer>,
+
+    /// Device-side position scalar (int32). Written via H2D memcpy before each
+    /// decode step. Kernels that need position (RoPE, KV append, decode attention)
+    /// read from this pointer, enabling CUDA graph capture with static arguments.
+    d_position: DeviceBuffer,
+
+    /// Cached CUDA graph executable for the 48-layer decode forward pass.
+    /// Captured on the second decode step (after warmup), replayed on all subsequent steps.
+    /// None before capture or if graph is not supported.
+    cuda_graph_exec: Option<*mut std::ffi::c_void>,
+
+    /// Raw CUDA graph handle (kept alive for the lifetime of the exec).
+    cuda_graph: Option<*mut std::ffi::c_void>,
+
+    /// True while CUDA graph capture is in progress. Used to suppress operations
+    /// that are illegal during capture (e.g. cudaFree from HashMap::retain).
+    capturing_graph: bool,
 }
 
 // SAFETY: Engine is only accessed through a tokio::sync::Mutex in the API server,
@@ -258,8 +506,11 @@ unsafe impl Sync for Engine {}
 
 impl Engine {
     fn normalize_prompt_for_model(model_arch: &str, prompt: &str) -> String {
+        // If the prompt already contains a chat template, preserve it as-is.
+        if prompt.contains("<|im_start|>") || prompt.contains("<|im_end|>") {
+            return prompt.to_string();
+        }
         // Mixtral/Mistral instruct checkpoints typically expect [INST] wrappers.
-        // If the user already provided a template, preserve it as-is.
         if model_arch.eq_ignore_ascii_case("mixtral")
             && !prompt.contains("[INST]")
             && !prompt.contains("[/INST]")
@@ -467,10 +718,16 @@ impl Engine {
         } else {
             CudaStream::cpu_only()
         };
+        let router_stream = if gpu_mode {
+            CudaStream::new(&device)?
+        } else {
+            CudaStream::cpu_only()
+        };
+        let router_event = cuda_ffi::CudaEvent::new()?;
 
         // Allocate working buffers as DeviceBuffers (VRAM on GPU, host on CPU).
         let hidden_dim = model_config.hidden_dim as usize;
-        let _vocab_size = model_config.vocab_size as usize;
+        let vocab_size = model_config.vocab_size as usize;
         let expert_hidden = model_config.expert_hidden_dim as usize;
         let hidden_bytes = hidden_dim * std::mem::size_of::<f16>();
         let expert_bytes = expert_hidden * std::mem::size_of::<f16>();
@@ -478,14 +735,26 @@ impl Engine {
         // Pre-compute sizes for attention projection scratch buffers
         let num_heads = model_config.num_heads as usize;
         let num_kv_heads = model_config.num_kv_heads as usize;
-        let head_dim = if num_heads > 0 {
-            hidden_dim / num_heads
+        let head_dim = model_config.effective_head_dim() as usize;
+        // Gated attention (Qwen3.5): Q projection outputs 2x (Q + gate interleaved)
+        // q_proj_dev must hold num_heads * 2 * head_dim FP16 elements
+        let is_gated_attn = model_config.deltanet.is_some();
+        let q_proj_elems = if is_gated_attn {
+            num_heads * 2 * head_dim // 32 * 2 * 256 = 16384
         } else {
-            128
+            hidden_dim // standard: hidden_dim = num_heads * head_dim
         };
-        let q_proj_bytes = hidden_dim * 2; // FP16
+        let q_proj_bytes = q_proj_elems * 2; // FP16
         let kv_proj_bytes = num_kv_heads * head_dim * 2; // FP16
+        // attn_dev holds attention output: num_heads * head_dim (may differ from hidden_dim)
+        let attn_out_elems = num_heads * head_dim; // 32 * 256 = 8192 for Qwen3.5
+        let attn_out_bytes = attn_out_elems * 2; // FP16
+        // gate_buf for deinterleaved attention gate (Qwen3.5 only)
+        let gate_buf_bytes = if is_gated_attn { attn_out_elems * 2 } else { 64 };
         let router_scores_bytes = (model_config.num_experts as usize).max(1) * 4; // f32
+        let top_k = model_config.num_active_experts as usize;
+        let router_topk_ids_bytes = top_k.max(1) * 2; // u16
+        let router_topk_weights_bytes = top_k.max(1) * 4; // f32
 
         // Pre-compute MLA projection scratch buffer sizes
         let mla_q_compressed_bytes;
@@ -576,7 +845,7 @@ impl Engine {
         };
 
         // Initialize tiered KV cache (Section 8) if enabled
-        let head_dim = hidden_dim / model_config.num_heads as usize;
+        let head_dim = model_config.effective_head_dim() as usize;
         let (tiered_kv, eviction_policy) = if config.kv_cache.enabled {
             let tkv = TieredKvCache::new(
                 model_config.num_layers as usize,
@@ -689,7 +958,40 @@ impl Engine {
             tracing::info!("CPU mode: working buffers in host memory");
         }
 
-        Ok(Self {
+        // ── Allocate DeltaNet recurrent + conv1d state (per DeltaNet layer) ──
+        let mut dn_recurrent_state = Vec::new();
+        let mut dn_conv_state = Vec::new();
+        if let Some(ref dn) = model_config.deltanet {
+            let num_dn_layers = dn.layer_is_attention.iter().filter(|&&is_attn| !is_attn).count();
+            let state_bytes = dn.state_size_floats() * 4; // FP32
+            let conv_bytes = dn.conv_state_size_floats() * 4; // FP32
+            for _ in 0..num_dn_layers {
+                let s = DeviceBuffer::new(state_bytes)?;
+                s.zero();
+                dn_recurrent_state.push(s);
+                let c = DeviceBuffer::new(conv_bytes)?;
+                c.zero();
+                dn_conv_state.push(c);
+            }
+            tracing::info!(
+                "DeltaNet state allocated: {} layers × ({} MB recurrent + {} KB conv) = {} MB total",
+                num_dn_layers,
+                state_bytes / (1024 * 1024),
+                conv_bytes / 1024,
+                (state_bytes + conv_bytes) * num_dn_layers / (1024 * 1024),
+            );
+        }
+
+        // DeltaNet scratch buffer sizes (0 if no DeltaNet)
+        let dn_qkv_dim = model_config.deltanet.as_ref().map_or(0, |d| d.qkv_dim() as usize);
+        let dn_inner_dim = model_config.deltanet.as_ref().map_or(0, |d| d.inner_dim as usize);
+        let dn_num_v_heads = model_config.deltanet.as_ref().map_or(0, |d| d.num_value_heads as usize);
+        let dn_key_dim = model_config.deltanet.as_ref().map_or(0, |d| d.key_dim() as usize);
+        let dn_v_head_dim = model_config.deltanet.as_ref().map_or(0, |d| d.value_head_dim as usize);
+        // Minimum 1 byte for DeviceBuffer (avoid zero-size allocations)
+        let dn_min = |sz: usize| if sz == 0 { 1 } else { sz };
+
+        let mut engine = Self {
             config,
             model_file,
             buffer_mgr,
@@ -700,20 +1002,43 @@ impl Engine {
             tokenizer,
             sampler,
             stream,
+            router_stream,
+            router_event,
             hidden_state: DeviceBuffer::new(hidden_bytes)?,
             hidden_state_f32: DeviceBuffer::new(hidden_dim * 4)?, // FP32 accumulator
             expert_output_buf: DeviceBuffer::new(expert_bytes)?,
+            expert_output_f32_buf: DeviceBuffer::new(expert_hidden * 4)?, // FP32 SwiGLU intermediate
             layer_output_buf: DeviceBuffer::new(hidden_dim * 4)?, // FP32 for precision
             moe_normed_f32: DeviceBuffer::new(hidden_dim * 4)?, // FP32 normalized hidden state for MoE
+            preq_act_fp4: DeviceBuffer::new(hidden_dim / 2)?, // FP4 split-half for hidden_dim
+            preq_act_scales: DeviceBuffer::new(hidden_dim / 32)?, // E8M0 scales
+            preq_down_act_fp4: DeviceBuffer::new(expert_hidden.max(1) / 2)?, // FP4 for expert_hidden_dim
+            preq_down_act_scales: DeviceBuffer::new(expert_hidden.max(1) / 32)?, // E8M0 scales
+            preq_inner_act_fp4: DeviceBuffer::new(dn_inner_dim.max(1) / 2)?, // FP4 for inner_dim (8192)
+            preq_inner_act_scales: DeviceBuffer::new(dn_inner_dim.max(1) / 32)?, // E8M0 scales
+            attn_normed_f32: DeviceBuffer::new(hidden_dim * 4)?, // FP32 normalized state for NVFP4 GEMV
+            nvfp4_f32_scratch: DeviceBuffer::new({
+                let max_proj_dim = q_proj_elems.max(dn_qkv_dim).max(dn_inner_dim).max(attn_out_elems);
+                // Extra space for batched GQA Q+K+V output: q_dim + kv_dim + kv_dim (all FP32)
+                let kv_elems = kv_proj_bytes / 2;
+                let batched_qkv = q_proj_elems + kv_elems * 2;
+                max_proj_dim.max(batched_qkv).max(1) * 4
+            })?, // FP32 scratch for NVFP4 GEMV output
             residual_buf: DeviceBuffer::new(hidden_bytes)?,
             down_proj_buf: DeviceBuffer::new(hidden_bytes)?,
+            down_proj_f32_buf: DeviceBuffer::new(hidden_dim * 4)?, // FP32 down_proj output
             q_proj_dev: DeviceBuffer::new(q_proj_bytes)?,
             k_proj_dev: DeviceBuffer::new(kv_proj_bytes)?,
             v_proj_dev: DeviceBuffer::new(kv_proj_bytes)?,
-            attn_dev: DeviceBuffer::new(hidden_bytes)?,
+            attn_dev: DeviceBuffer::new(attn_out_bytes)?,
+            gated_attn_gate_dev: DeviceBuffer::new(gate_buf_bytes)?,
             swiglu_up_tmp: DeviceBuffer::new(expert_bytes)?,
             swiglu_gate_tmp: DeviceBuffer::new(expert_bytes)?,
             router_scores_dev: DeviceBuffer::new(router_scores_bytes)?,
+            router_topk_ids_dev: DeviceBuffer::new(router_topk_ids_bytes)?,
+            router_topk_weights_dev: DeviceBuffer::new(router_topk_weights_bytes)?,
+            logits_dev: DeviceBuffer::new(vocab_size * std::mem::size_of::<f32>())?,
+            lm_head_nvfp4: None,
             mla_q_compressed_dev: DeviceBuffer::new(mla_q_compressed_bytes)?,
             mla_q_full_dev: DeviceBuffer::new(mla_q_full_bytes)?,
             mla_kv_a_dev: DeviceBuffer::new(mla_kv_a_bytes)?,
@@ -730,6 +1055,49 @@ impl Engine {
             gpu_kv_k,
             gpu_kv_v,
             max_kv_len,
+            // DeltaNet state and scratch buffers
+            dn_recurrent_state,
+            dn_conv_state,
+            dn_qkv_proj_dev: DeviceBuffer::new(dn_min(dn_qkv_dim * 2))?, // FP16
+            dn_qkv_f32_dev: DeviceBuffer::new(dn_min(dn_qkv_dim * 4))?, // FP32
+            dn_conv_out_dev: DeviceBuffer::new(dn_min(dn_qkv_dim * 4))?, // FP32
+            dn_z_proj_dev: DeviceBuffer::new(dn_min(dn_inner_dim * 2))?, // FP16
+            dn_z_f32_dev: DeviceBuffer::new(dn_min(dn_inner_dim * 4))?, // FP32
+            dn_alpha_proj_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 2))?, // FP16
+            dn_alpha_f32_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 4))?, // FP32
+            dn_beta_proj_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 2))?, // FP16
+            dn_beta_f32_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 4))?, // FP32
+            dn_gate_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 4))?, // FP32
+            dn_q_norm_dev: DeviceBuffer::new(dn_min(dn_key_dim * 4))?, // FP32
+            dn_k_norm_dev: DeviceBuffer::new(dn_min(dn_key_dim * 4))?, // FP32
+            dn_q_rep_dev: DeviceBuffer::new(dn_min(dn_inner_dim * 4))?, // FP32 (after repeat)
+            dn_k_rep_dev: DeviceBuffer::new(dn_min(dn_inner_dim * 4))?, // FP32 (after repeat)
+            dn_step_out_dev: DeviceBuffer::new(dn_min(dn_inner_dim * 4))?, // FP32
+            dn_norm_out_dev: DeviceBuffer::new(dn_min(dn_inner_dim * 4))?, // FP32
+            dn_o_out_dev: DeviceBuffer::new(dn_min(hidden_dim * 4))?, // FP32
+            dn_a_f32_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 4))?, // FP32
+            dn_dt_bias_f32_dev: DeviceBuffer::new(dn_min(dn_num_v_heads * 4))?, // FP32
+            dn_norm_weight_f32_dev: DeviceBuffer::new(dn_min(dn_v_head_dim * 4))?, // FP32
+            // Pre-allocated DeltaNet weight staging buffers (BF16 storage)
+            dn_w_qkv: DeviceBuffer::new(dn_min(dn_qkv_dim * hidden_dim * 2))?,  // seg 30
+            dn_w_z: DeviceBuffer::new(dn_min(dn_inner_dim * hidden_dim * 2))?,   // seg 31
+            dn_w_beta: DeviceBuffer::new(dn_min(dn_num_v_heads * hidden_dim * 2))?, // seg 32
+            dn_w_alpha: DeviceBuffer::new(dn_min(dn_num_v_heads * hidden_dim * 2))?, // seg 33
+            dn_w_conv: DeviceBuffer::new(dn_min(dn_qkv_dim * 4 * 2))?,          // seg 34 (conv_kernel=4)
+            dn_w_dt_bias: DeviceBuffer::new(dn_min(dn_num_v_heads * 2))?,        // seg 35
+            dn_w_a_log: DeviceBuffer::new(dn_min(dn_num_v_heads * 2))?,          // seg 36
+            dn_w_norm: DeviceBuffer::new(dn_min(dn_v_head_dim * 2))?,            // seg 37
+            dn_w_out: DeviceBuffer::new(dn_min(dn_inner_dim * hidden_dim * 2))?, // seg 38
+            dn_conv_w_f32_dev: DeviceBuffer::new(dn_min(dn_qkv_dim * 4 * 4))?,  // conv FP32
+            // Pre-allocated GQA attention weight staging buffers (FP16 storage)
+            // Only allocated at full size if the model has GQA attention layers.
+            gqa_w_q: DeviceBuffer::new(q_proj_elems * hidden_dim * 2)?,     // seg 4: [q_dim, hidden_dim]
+            gqa_w_o: DeviceBuffer::new(hidden_dim * attn_out_elems * 2)?,   // seg 5: [hidden_dim, attn_dim]
+            gqa_w_k: DeviceBuffer::new(num_kv_heads * head_dim * hidden_dim * 2)?, // seg 12
+            gqa_w_v: DeviceBuffer::new(num_kv_heads * head_dim * hidden_dim * 2)?, // seg 13
+            gqa_w_qnorm: DeviceBuffer::new(head_dim * 2)?,                  // seg 27
+            gqa_w_knorm: DeviceBuffer::new(head_dim * 2)?,                  // seg 28
+            attn_norm_w: DeviceBuffer::new(hidden_dim * 2)?,               // seg 6: attn pre-norm
             kv_cache,
             mla_kv_cache,
             tiered_kv,
@@ -753,11 +1121,280 @@ impl Engine {
             mla_kv_norm_weight_dev: std::collections::HashMap::new(),
             mla_v_out_f16_dev: DeviceBuffer::new(mla_v_out_f16_bytes)?,
             shared_tensor_cache_device: std::collections::HashMap::new(),
+            pre_assembled_weights: std::collections::HashMap::new(),
             task_context: None,
             gear_profiles: std::collections::HashMap::new(),
             e_score_correction_bias: None,
             diag_enabled: std::env::var("VIB3_DIAG").map_or(false, |v| v == "1"),
-        })
+            shared_expert_nvfp4: std::collections::HashMap::new(),
+            shared_expert_swiglu_f32: DeviceBuffer::new(shared_inter.max(1) * 4)?, // FP32 SwiGLU output
+            shared_expert_down_f32: DeviceBuffer::new(hidden_dim * 4)?, // FP32 down_proj output
+            shared_expert_mid_fp4: DeviceBuffer::new((shared_inter.max(1) / 2).max(64))?, // FP4 data
+            shared_expert_mid_scales: DeviceBuffer::new((shared_inter.max(1) / 32).max(4))?, // E8M0 scales
+            moe_page_table_dev: None,
+            d_position: DeviceBuffer::new(4)?, // int32 device scalar
+            cuda_graph_exec: None,
+            cuda_graph: None,
+            capturing_graph: false,
+        };
+
+        // Pre-assemble all shared weight tensors into permanent VRAM buffers.
+        // This eliminates ~10.6 GB/token of D2D copies during inference.
+        let assembled = engine.preassemble_all_shared_weights();
+        if assembled > 0 {
+            tracing::info!("Weight preassembly complete: {} tensors ready for zero-copy inference", assembled);
+        }
+
+        // SKIPPED: sequential→split-half repack is no longer needed.
+        // The MXFP4→NVFP4 converter now copies GGML qs bytes directly,
+        // which are already in split-half format.  Tiled repack (below)
+        // still runs to convert row-major split-half → tiled layout.
+        if engine.model_config.expert_dtype == DType::NVFP4 && engine.buffer_mgr.is_fully_resident() {
+            tracing::info!("Skipping seq→split-half repack (data already split-half from GGML)");
+        }
+
+        // Repack all NVFP4 expert weight pages from split-half to TILED layout.
+        // Tiled layout: 16 rows × 32 bytes per K-tile contiguous (512 bytes per tile).
+        // This enables coalesced memory access in the K-parallel MoE GEMV kernels.
+        // Must run AFTER the split-half repack above.
+        if engine.model_config.expert_dtype == DType::NVFP4 && engine.buffer_mgr.is_fully_resident() {
+            let tile_start = Instant::now();
+            let hidden_dim = engine.model_config.hidden_dim as usize;
+            let expert_hidden_dim = engine.model_config.expert_hidden_dim as usize;
+
+            // Max FP4 data size across expert page types (up/gate and down are equal here)
+            let max_fp4_data = {
+                let upgate = (hidden_dim / 2) * expert_hidden_dim;
+                let down = (expert_hidden_dim / 2) * hidden_dim;
+                upgate.max(down)
+            };
+
+            if max_fp4_data > 0 {
+                match DeviceBuffer::new(max_fp4_data) {
+                    Ok(temp_buf) => {
+                        let mut tiled_count = 0usize;
+                        let page_catalog = engine.model_file.page_catalog();
+                        for entry in page_catalog.iter() {
+                            if entry.expert == 0xFFFF || entry.segment > 2 {
+                                continue;
+                            }
+                            let page_id = entry.page_id();
+                            if let Some(handle) = engine.buffer_mgr.get_page_resident(&page_id) {
+                                if handle.device_ptr.is_null() {
+                                    continue;
+                                }
+
+                                let (k, m_slice) = match entry.segment {
+                                    0 | 1 => (hidden_dim, entry.row_count as usize),
+                                    2 => (expert_hidden_dim, entry.row_count as usize),
+                                    _ => unreachable!(),
+                                };
+
+                                // Verify alignment requirements for tiled repack
+                                if k % 64 != 0 || m_slice % 16 != 0 {
+                                    tracing::warn!(
+                                        "Skipping tiled repack for expert page (M={}, K={}): alignment",
+                                        m_slice, k
+                                    );
+                                    continue;
+                                }
+
+                                if let Err(e) = kernels::repack_row_to_tiled(
+                                    handle.device_ptr as *mut u8,
+                                    temp_buf.as_mut_ptr(),
+                                    m_slice,
+                                    k,
+                                    &engine.stream,
+                                ) {
+                                    tracing::warn!(
+                                        "Tiled repack failed for expert page (M={}, K={}): {}",
+                                        m_slice, k, e
+                                    );
+                                } else {
+                                    tiled_count += 1;
+                                }
+                            }
+                        }
+                        engine.stream.synchronize()?;
+                        tracing::info!(
+                            "Tiled repack: {} NVFP4 expert weight pages in {:.1}ms (temp buf {:.1} MB)",
+                            tiled_count,
+                            tile_start.elapsed().as_millis(),
+                            max_fp4_data as f64 / (1024.0 * 1024.0),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to allocate tiled repack temp buffer ({:.1} MB): {}",
+                            max_fp4_data as f64 / (1024.0 * 1024.0), e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Build device-side page pointer table for GPU-only MoE dispatch.
+        // Layout: [num_moe_layers * num_experts * 3] u64 device pointers.
+        // Index: moe_layer * num_experts * 3 + expert_id * 3 + segment
+        // This eliminates per-token host sync + H2D memcpys for expert pointer arrays.
+        if engine.model_config.expert_dtype == DType::NVFP4 && engine.buffer_mgr.is_fully_resident() {
+            let table_start = Instant::now();
+            let num_moe_layers = engine.model_config.num_moe_layers as usize;
+            let num_experts = engine.model_config.num_experts as usize;
+            let dense_offset = engine.model_config.dense_layer_idx as u16;
+            let table_entries = num_moe_layers * num_experts * 3;
+            let mut table_host = vec![0u64; table_entries];
+            let mut populated = 0usize;
+
+            for moe_layer in 0..num_moe_layers {
+                let storage_layer = moe_layer as u16 + dense_offset;
+                for expert_id in 0..num_experts {
+                    let pages = engine.model_file.pages_for_expert(storage_layer, expert_id as u16);
+                    for entry in pages {
+                        if entry.segment > 2 {
+                            continue;
+                        }
+                        let page_id = entry.page_id();
+                        if let Some(handle) = engine.buffer_mgr.get_page_resident(&page_id) {
+                            if !handle.device_ptr.is_null() {
+                                let idx = moe_layer * num_experts * 3
+                                    + expert_id * 3
+                                    + entry.segment as usize;
+                                table_host[idx] = handle.device_ptr as u64;
+                                populated += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Upload to device
+            let table_bytes = table_entries * std::mem::size_of::<u64>();
+            match DeviceBuffer::new(table_bytes) {
+                Ok(table_buf) => {
+                    // SAFETY: table_host is a flat Vec<u64>, table_buf is device memory of the same size.
+                    let host_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            table_host.as_ptr() as *const u8,
+                            table_bytes,
+                        )
+                    };
+                    if let Err(e) = table_buf.copy_from_host(host_bytes) {
+                        tracing::warn!("Failed to upload MoE page table to device: {}", e);
+                    } else {
+                        engine.moe_page_table_dev = Some(table_buf);
+                        tracing::info!(
+                            "MoE page table built: {} entries ({} populated, {:.1} KB) in {:.1}ms",
+                            table_entries,
+                            populated,
+                            table_bytes as f64 / 1024.0,
+                            table_start.elapsed().as_millis(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to allocate MoE page table: {}", e);
+                }
+            }
+        }
+
+        // Pre-warm shared expert tensors into device cache for ALL MoE layers.
+        // This ensures segments 3 (router), 7 (moe_norm), 14/15/16 (shared expert up/gate/down),
+        // and 26 (shared expert sigmoid gate) are allocated and populated in
+        // shared_tensor_cache_device BEFORE inference begins. Without this, step 1 would
+        // trigger cudaMalloc via ensure_shared_tensor_device, preventing CUDA graph capture
+        // at step 1 (since cudaMalloc is illegal during graph capture).
+        #[cfg(feature = "cuda")]
+        if engine.buffer_mgr.is_fully_resident() && engine.model_config.num_experts > 0 {
+            let warm_start = Instant::now();
+            let num_layers = engine.model_config.num_layers as u16;
+            let shared_segs: &[u16] = &[3, 7, 14, 15, 16, 26];
+            let mut warmed = 0usize;
+            for layer_idx in 0..num_layers {
+                for &seg in shared_segs {
+                    if engine.ensure_shared_tensor_device(layer_idx, seg).await {
+                        warmed += 1;
+                    }
+                }
+            }
+            engine.stream.synchronize()?;
+            tracing::info!(
+                "Pre-warmed {} shared expert tensors ({} layers × {} segments) in {:.0}ms",
+                warmed, num_layers, shared_segs.len(), warm_start.elapsed().as_millis(),
+            );
+        }
+
+        // Pre-warm MoE GPU buffers (intermediate per-expert buffers + device pointer arrays).
+        // This ensures vib3_launch_moe_experts_fused_gpu() won't call cudaMalloc or
+        // synchronous cudaMemcpy during CUDA graph capture.
+        #[cfg(feature = "cuda")]
+        if engine.buffer_mgr.is_fully_resident() && engine.model_config.num_experts > 0 {
+            let m_mid = engine.model_config.expert_hidden_dim as i32; // 1024
+            let k_mid = engine.model_config.expert_hidden_dim as i32; // 1024
+            let err = unsafe { cuda_ffi::vib3_moe_prewarm_gpu_bufs(m_mid, k_mid) };
+            if err != 0 {
+                tracing::warn!("MoE GPU buffer pre-warm failed (err={})", err);
+            } else {
+                tracing::info!("Pre-warmed MoE GPU buffers (M_mid={}, K_mid={})", m_mid, k_mid);
+            }
+        }
+
+        // Eagerly convert lm_head to NVFP4 at load time (instead of lazily on first token).
+        // This saves ~17ms on step 0 by moving the FP16→NVFP4 conversion + tiled repack
+        // out of the critical decode path.
+        #[cfg(feature = "cuda")]
+        if engine.buffer_mgr.is_fully_resident() {
+            let lm_start = Instant::now();
+            let vocab_size = engine.model_config.vocab_size as usize;
+            let hidden_dim = engine.model_config.hidden_dim as usize;
+            engine.ensure_shared_tensor_device(0, 11).await;
+            if let Some((lm_head_ptr, lm_head_size)) = engine.get_device_tensor(0, 11) {
+                let expected_fp16 = vocab_size * hidden_dim * 2;
+                if lm_head_size == expected_fp16 {
+                    tracing::info!(
+                        "Converting lm_head to NVFP4 at load time: {}x{} FP16 ({:.1} MB)",
+                        vocab_size, hidden_dim, lm_head_size as f64 / (1024.0 * 1024.0)
+                    );
+                    match kernels::fp16_to_nvfp4_weight(lm_head_ptr, vocab_size, hidden_dim, &engine.stream) {
+                        Ok(nvfp4_buf) => {
+                            engine.stream.synchronize()?;
+                            // Repack to tiled layout for coalesced GEMV
+                            let fp4_data_size = vocab_size * hidden_dim.div_ceil(2);
+                            match DeviceBuffer::new(fp4_data_size) {
+                                Ok(temp_buf) => {
+                                    if let Err(e) = kernels::repack_row_to_tiled(
+                                        nvfp4_buf.as_mut_ptr(),
+                                        temp_buf.as_mut_ptr(),
+                                        vocab_size,
+                                        hidden_dim,
+                                        &engine.stream,
+                                    ) {
+                                        tracing::warn!("lm_head tiled repack failed: {}", e);
+                                    } else {
+                                        engine.stream.synchronize()?;
+                                    }
+                                    // temp_buf dropped here, frees VRAM
+                                }
+                                Err(e) => {
+                                    tracing::warn!("lm_head tiled repack temp alloc failed: {}", e);
+                                }
+                            }
+                            tracing::info!(
+                                "lm_head NVFP4 conversion complete: {:.1} MB in {:.0}ms",
+                                nvfp4_buf.size() as f64 / (1024.0 * 1024.0),
+                                lm_start.elapsed().as_millis(),
+                            );
+                            engine.lm_head_nvfp4 = Some(nvfp4_buf);
+                        }
+                        Err(e) => {
+                            tracing::warn!("lm_head NVFP4 conversion failed at load time: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(engine)
     }
 
     /// Load e_score_correction_bias from an external binary file.
@@ -1230,8 +1867,8 @@ impl Engine {
                 &self.stream,
             )?;
 
-            // Debug: log embedding output for last token in prefill
-            if self.diag_enabled && tok_idx == tokens.len() - 1 {
+            // Debug: log embedding output for every token in prefill
+            if self.diag_enabled {
                 self.stream.synchronize().ok();
                 let hidden_bytes = hidden_dim * std::mem::size_of::<f16>();
                 let mut h_buf = vec![0u8; hidden_bytes];
@@ -1249,11 +1886,34 @@ impl Engine {
                     h_f32[0], h_f32[1], h_f32[2], h_f32[3], h_f32[4], h_f32[5], h_f32[6], h_f32[7],
                     min, max, mean, l2, nans
                 );
+                // Dump embedding FP32 for every token
+                let dump_dir = "/home/brian/code/vib3/dump";
+                let _ = std::fs::create_dir_all(dump_dir);
+                let f32_bytes: Vec<u8> = h_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let dump_path = format!("{}/vib3_embed_f32_tok{}.bin", dump_dir, tok_idx);
+                let _ = std::fs::write(&dump_path, &f32_bytes);
             }
 
             // 2. Run through all transformer layers at this position
             //    Each layer: Attention sublayer → MoE/FFN sublayer (interleaved)
             self.position = tok_idx;
+
+            // Update device-side position scalar so CUDA KV-cache append and
+            // decode-attention kernels see the correct sequence position.
+            #[cfg(feature = "cuda")]
+            {
+                let stream_ptr = self.stream.raw_ptr();
+                let err = unsafe {
+                    cuda_ffi::vib3_update_device_int32(
+                        self.d_position.as_mut_ptr(),
+                        tok_idx as i32,
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    tracing::warn!("Failed to update device position during prefill (err={})", err);
+                }
+            }
 
             let is_last_token = tok_idx == tokens.len() - 1;
 
@@ -1294,9 +1954,13 @@ impl Engine {
                     self.run_dense_ffn_sublayer(layer_idx).await?;
                 }
 
-                // Diagnostic: log hidden state stats after each layer for the last prefill token
-                // NOTE: We read hidden_state_f32 (the actual accumulator), not hidden_state (stale FP16)
-                if self.diag_enabled && is_last_token && (layer_idx <= 15 || layer_idx % 5 == 0 || layer_idx >= num_layers as u16 - 2) {
+                // Diagnostic: log hidden state stats after each layer
+                // Dump for ALL tokens at layer 0, and for last token at other layers
+                let should_dump_layer = self.diag_enabled && (
+                    layer_idx == 0  // always dump layer 0 for all tokens
+                    || (is_last_token && (layer_idx <= 15 || layer_idx % 5 == 0 || layer_idx >= num_layers as u16 - 2))
+                );
+                if should_dump_layer {
                     self.stream.synchronize()?;
                     let f32_bytes = hidden_dim * 4;
                     let mut diag_buf = vec![0u8; f32_bytes];
@@ -1314,13 +1978,12 @@ impl Engine {
                         tok_idx, layer_idx, h_min, h_max, h_mean, h_l2, h_nan,
                     );
 
-                    // Dump FP32 hidden state for selected layers to compare with Python GT
-                    if matches!(layer_idx, 0 | 1 | 2 | 5 | 10 | 15 | 20 | 25 | 30 | 31) {
+                    // Dump FP32 hidden state to file
+                    {
                         let dump_dir = "/home/brian/code/vib3/dump";
                         let _ = std::fs::create_dir_all(dump_dir);
-                        let dump_path = format!("{}/vib3_mixtral_hidden_f32_L{}_lastpos.bin", dump_dir, layer_idx);
+                        let dump_path = format!("{}/vib3_postlayer_f32_L{}_tok{}.bin", dump_dir, layer_idx, tok_idx);
                         let _ = std::fs::write(&dump_path, &diag_buf);
-                        tracing::info!("DUMPED FP32 hidden state to {} ({} bytes)", dump_path, diag_buf.len());
                     }
                 }
             }
@@ -1352,6 +2015,32 @@ impl Engine {
     /// Pre-norm architecture: RMSNorm is applied to a COPY of hidden_state
     /// (the original is preserved for the residual connection).
     async fn run_attention_layer(&mut self, layer_idx: u16) -> Result<()> {
+        let profile = self.diag_enabled && self.decode_step == 1;
+
+        // Evict only attention-specific segments from other layers.
+        // Attention weights (Q/K/V/O projections, Q/K norms) are large (~156MB per layer)
+        // and only needed for the current attention layer.
+        // MoE segments (norm=7, router=3, shared expert=14/15/16, gate=26) are small
+        // (~20MB per layer) and kept permanently cached to avoid cudaMalloc/cudaFree churn.
+        // DeltaNet weights use pre-allocated buffers and don't touch this cache.
+        // SKIP during graph capture: retain() drops DeviceBuffer → cudaFree, which is
+        // illegal inside a CUDA graph capture region (causes error 901).
+        let t_evict = Instant::now();
+        if !self.capturing_graph {
+            const ATTN_SEGMENTS: [u16; 6] = [4, 5, 12, 13, 27, 28];
+            self.shared_tensor_cache_device.retain(|key, _| {
+                let cached_layer = (*key >> 16) as u16;
+                let cached_segment = (*key & 0xFFFF) as u16;
+                // Keep: current layer, layer 0 (embeddings), layer 0xFFFF (final norm),
+                //        and any non-attention segments from other layers (MoE weights).
+                cached_layer == layer_idx
+                    || cached_layer == 0
+                    || cached_layer == 0xFFFF
+                    || !ATTN_SEGMENTS.contains(&cached_segment)
+            });
+        }
+        let evict_us = t_evict.elapsed().as_micros() as u64;
+
         let hidden_dim = self.model_config.hidden_dim as usize;
         let hidden_bytes = hidden_dim * std::mem::size_of::<f16>();
         let layer = layer_idx as usize;
@@ -1363,39 +2052,132 @@ impl Engine {
         // in Kimi K2.5), casting to FP16 first destroys the relative magnitudes of
         // the hidden dimensions. Normalizing in FP32 first produces values in [-3, 3]
         // which FP16 represents with full precision.
+        //
+        // OPTIMIZATION: For GQA layers with NVFP4, the FP16 hidden_state is not read
+        // by any production code path (NVFP4 GEMV reads from FP4 quantized data).
+        // Skip the FP16 norm entirely for these layers.
+        let t_norm = Instant::now();
         let eps = self.model_config.rms_norm_eps;
-        self.ensure_shared_tensor_device(layer_idx, 6).await;
-        if let Some((norm_ptr, _)) = self.get_device_tensor(layer_idx, 6) {
-            kernels::rms_norm_f32_to_f16(
-                self.hidden_state_f32.as_ptr(),
-                self.hidden_state.as_mut_ptr(),
-                norm_ptr,
-                hidden_dim,
-                eps,
-                &self.stream,
-            )?;
+
+        // Determine if this is a GQA layer with NVFP4 active (can skip FP16 norm)
+        let is_deltanet_layer = self.model_config.deltanet.as_ref()
+            .map_or(false, |dn| !dn.layer_is_attention[layer]);
+        let is_gqa_nvfp4 = !is_deltanet_layer && {
+            // GQA layers use segment 4 for Q projection
+            self.get_preassembled_nvfp4(layer_idx, 4).is_some()
+        };
+        // DeltaNet layers check segment 30 for QKV
+        let is_dn_nvfp4 = is_deltanet_layer &&
+            self.get_preassembled_nvfp4(layer_idx, 30).is_some();
+
+        // Use pre-assembled weight (zero-copy for single-page norm tensor)
+        if let Some((norm_ptr, _)) = self.get_preassembled_weight(layer_idx, 6) {
+            if is_gqa_nvfp4 {
+                // GQA NVFP4: skip FP16 norm entirely — the fused kernel in
+                // try_gpu_decode_attention will produce FP4 directly from FP32.
+            } else if is_dn_nvfp4 {
+                // DeltaNet NVFP4: produce FP16 via the fused kernel inside
+                // run_deltanet_layer. Still need FP16 for alpha/beta, so the
+                // fused kernel there will produce it. But we can do it here
+                // instead, producing FP16 as a side-output of the fused norm+quantize.
+                // For now, keep the standard FP16 norm for DeltaNet (the fused kernel
+                // in run_deltanet_layer will skip FP16 since it's already done here).
+                kernels::rms_norm_f32_to_f16(
+                    self.hidden_state_f32.as_ptr(),
+                    self.hidden_state.as_mut_ptr(),
+                    norm_ptr,
+                    hidden_dim,
+                    eps,
+                    &self.stream,
+                )?;
+            } else {
+                // Non-NVFP4 path: always need FP16 norm
+                kernels::rms_norm_f32_to_f16(
+                    self.hidden_state_f32.as_ptr(),
+                    self.hidden_state.as_mut_ptr(),
+                    norm_ptr,
+                    hidden_dim,
+                    eps,
+                    &self.stream,
+                )?;
+            }
         } else {
-            // Fallback: cast then normalize without weight (rare path)
-            kernels::f32_to_f16(
-                self.hidden_state_f32.as_ptr(),
-                self.hidden_state.as_mut_ptr(),
-                hidden_dim,
-                &self.stream,
-            )?;
-            kernels::rms_norm_no_weight(
-                self.hidden_state.as_mut_ptr(),
-                hidden_dim,
-                eps,
+            // Fallback: fast synchronous D2D from resident snapshot
+            self.load_tensor_direct_resident(layer_idx, 6, self.attn_norm_w.as_ptr() as usize, self.attn_norm_w.size());
+            if let Some((norm_ptr, _)) = self.get_device_tensor(layer_idx, 6) {
+                kernels::rms_norm_f32_to_f16(
+                    self.hidden_state_f32.as_ptr(),
+                    self.hidden_state.as_mut_ptr(),
+                    norm_ptr,
+                    hidden_dim,
+                    eps,
+                    &self.stream,
+                )?;
+            } else {
+                // Last resort: cast then normalize without weight
+                kernels::f32_to_f16(
+                    self.hidden_state_f32.as_ptr(),
+                    self.hidden_state.as_mut_ptr(),
+                    hidden_dim,
+                    &self.stream,
+                )?;
+                kernels::rms_norm_no_weight(
+                    self.hidden_state.as_mut_ptr(),
+                    hidden_dim,
+                    eps,
+                    &self.stream,
+                )?;
+            }
+        }
+        // Dump attn_norm output for layer 0 (all tokens)
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            // Read the FP16 hidden_state (attn_norm output), convert to F32 for dumping
+            let mut h_buf = vec![0u8; hidden_dim * 2];
+            self.hidden_state.copy_to_host(&mut h_buf)?;
+            let h_f16 = unsafe { std::slice::from_raw_parts(h_buf.as_ptr() as *const f16, hidden_dim) };
+            let h_f32: Vec<f32> = h_f16.iter().map(|v| v.to_f32()).collect();
+            let f32_bytes: Vec<u8> = h_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let _ = std::fs::create_dir_all(dump_dir);
+            let dump_path = format!("{}/vib3_attn_norm_0_tok{}.bin", dump_dir, self.position);
+            let _ = std::fs::write(&dump_path, &f32_bytes);
+        }
+
+        // Residual buffer copy: only needed for CPU fallback attention and diagnostics.
+        // Skip for DeltaNet layers (they don't use it) and when diagnostics are off.
+        // Also skip for GQA NVFP4 layers (hidden_state FP16 was not produced).
+        // For GQA layers, defer to just before the CPU fallback if GPU decode fails.
+        if !is_deltanet_layer && !is_gqa_nvfp4 && (self.diag_enabled || !self.stream.is_real()) {
+            cuda_ffi::device_memcpy_d2d_async(
+                self.residual_buf.as_mut_ptr(),
+                self.hidden_state.as_ptr(),
+                hidden_bytes,
                 &self.stream,
             )?;
         }
-        // Keep residual_buf for CPU fallback attention paths
-        cuda_ffi::device_memcpy_d2d_async(
-            self.residual_buf.as_mut_ptr(),
-            self.hidden_state.as_ptr(),
-            hidden_bytes,
-            &self.stream,
-        )?;
+        if profile { self.stream.synchronize()?; }
+        let norm_us = t_norm.elapsed().as_micros() as u64;
+
+        // ── DeltaNet (Gated Delta Rule) path ────────────────────────────
+        // Dispatches to DeltaNet for non-attention layers in hybrid models.
+        if let Some(ref dn_config) = self.model_config.deltanet.clone() {
+            if !dn_config.layer_is_attention[layer] {
+                let t_dn = Instant::now();
+                let result = self.run_deltanet_layer(layer_idx, &dn_config).await;
+                if profile {
+                    self.stream.synchronize()?;
+                    let dn_us = t_dn.elapsed().as_micros() as u64;
+                    if layer_idx <= 4 || layer_idx % 12 == 0 || layer_idx >= 44 {
+                        tracing::info!(
+                            "PROFILE DN L{}: evict={:.0}us norm={:.0}us deltanet={:.0}us total={:.0}us",
+                            layer_idx, evict_us, norm_us, dn_us, evict_us + norm_us + dn_us,
+                        );
+                    }
+                }
+                return result;
+            }
+        }
 
         // ── MLA attention path ──────────────────────────────────────────
         if self.model_config.mla.is_some() && self.mla_kv_cache.is_some() {
@@ -1472,21 +2254,52 @@ impl Engine {
 
         let num_heads = self.model_config.num_heads as usize;
         let num_kv_heads = self.model_config.num_kv_heads as usize;
-        let head_dim = hidden_dim / num_heads;
-        let q_dim = hidden_dim;
+        let head_dim = self.model_config.effective_head_dim() as usize;
+        let is_gated_attn = self.model_config.deltanet.is_some();
+        let q_dim = if is_gated_attn {
+            num_heads * 2 * head_dim // Qwen3.5: Q + gate interleaved = 16384
+        } else {
+            hidden_dim
+        };
         let kv_dim = num_kv_heads * head_dim;
 
-        // Ensure Q/K/V/O weights are on device before entering sync code blocks
-        self.ensure_shared_tensor_device(layer_idx, 4).await;
-        self.ensure_shared_tensor_device(layer_idx, 12).await;
-        self.ensure_shared_tensor_device(layer_idx, 13).await;
-        self.ensure_shared_tensor_device(layer_idx, 5).await;
+        // Load Q/K/V/O weights — use pre-assembled zero-copy if available,
+        // otherwise fall back to D2D into staging buffers.
+        let t_gqa_load = Instant::now();
+        let has_fp16_preassembled = self.get_preassembled_weight(layer_idx, 4).is_some();
+        let has_nvfp4_q = self.get_preassembled_nvfp4(layer_idx, 4).is_some();
+        if !has_fp16_preassembled && !has_nvfp4_q {
+            // Fallback: fast synchronous D2D from resident snapshot into staging buffers
+            self.load_tensor_direct_resident(layer_idx, 4, self.gqa_w_q.as_ptr() as usize, self.gqa_w_q.size());
+            self.load_tensor_direct_resident(layer_idx, 12, self.gqa_w_k.as_ptr() as usize, self.gqa_w_k.size());
+            self.load_tensor_direct_resident(layer_idx, 13, self.gqa_w_v.as_ptr() as usize, self.gqa_w_v.size());
+        }
+        // O projection: load FP16 weight if not preassembled or NVFP4
+        if self.get_preassembled_weight(layer_idx, 5).is_none() && self.get_preassembled_nvfp4(layer_idx, 5).is_none() {
+            self.load_tensor_direct_resident(layer_idx, 5, self.gqa_w_o.as_ptr() as usize, self.gqa_w_o.size());
+        }
+        if is_gated_attn && !has_fp16_preassembled && !has_nvfp4_q {
+            self.load_tensor_direct_resident(layer_idx, 27, self.gqa_w_qnorm.as_ptr() as usize, self.gqa_w_qnorm.size());
+            self.load_tensor_direct_resident(layer_idx, 28, self.gqa_w_knorm.as_ptr() as usize, self.gqa_w_knorm.size());
+        }
+        if profile { self.stream.synchronize()?; }
+        let gqa_load_us = t_gqa_load.elapsed().as_micros() as u64;
 
         // Try 1: Fully-GPU decode attention (no CPU round-trip at all)
+        let t_gqa_fwd = Instant::now();
         if self.stream.is_real() {
             let gpu_decode =
                 self.try_gpu_decode_attention(layer_idx, hidden_dim, hidden_bytes, q_dim, kv_dim)?;
             if gpu_decode {
+                if profile {
+                    self.stream.synchronize()?;
+                    let gqa_fwd_us = t_gqa_fwd.elapsed().as_micros() as u64;
+                    tracing::info!(
+                        "PROFILE GQA L{}: evict={:.0}us norm={:.0}us load={:.0}us fwd={:.0}us total={:.0}us",
+                        layer_idx, evict_us, norm_us, gqa_load_us, gqa_fwd_us,
+                        evict_us + norm_us + gqa_load_us + gqa_fwd_us,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -1508,6 +2321,14 @@ impl Engine {
 
         // ── CPU fallback GQA path ──────────────────────────────────────
         // Used when GPU weights are unavailable or tiered KV is active.
+
+        // Populate residual_buf now (deferred from norm step for GPU fast path)
+        cuda_ffi::device_memcpy_d2d_async(
+            self.residual_buf.as_mut_ptr(),
+            self.hidden_state.as_ptr(),
+            hidden_bytes,
+            &self.stream,
+        )?;
 
         // D2H hidden_state and residual for CPU attention
         self.stream.synchronize()?;
@@ -1587,6 +2408,772 @@ impl Engine {
             hidden_dim,
             &self.stream,
         )?;
+
+        Ok(())
+    }
+
+    /// Run DeltaNet (Gated Delta Rule) attention for a single layer.
+    ///
+    /// This implements the full DeltaNet autoregressive step:
+    ///   1. QKV projection: hidden → [Q, K, V] via in_proj_qkv (segment 30)
+    ///   2. Conv1d + SiLU: causal depthwise conv on QKV (segment 34)
+    ///   3. Q/K/V split from convolved output
+    ///   4. L2 normalize Q and K
+    ///   5. Repeat Q/K from num_key_heads → num_value_heads (tiled)
+    ///   6. Alpha projection → gate computation (segments 33, 35, 36)
+    ///   7. Beta projection → sigmoid (segment 32)
+    ///   8. DeltaNet step: decay → retrieve → delta → update → query
+    ///   9. Z gate projection (segment 31)
+    ///  10. Gated RMSNorm: RMSNorm(step_out, norm_weight) * SiLU(z) (segment 37)
+    ///  11. Output projection: inner_dim → hidden_dim (segment 38)
+    ///  12. Residual add: hidden_state_f32 += o_proj output
+    ///
+    /// Called from `run_attention_layer` when the layer is a DeltaNet layer.
+    /// The attn_norm has already been applied: `self.hidden_state` contains
+    /// the FP16 normalized input, `self.hidden_state_f32` holds the FP32 residual.
+    async fn run_deltanet_layer(
+        &mut self,
+        layer_idx: u16,
+        dn_config: &crate::core::config::DeltaNetConfig,
+    ) -> Result<()> {
+        // No eviction or cudaMalloc needed — use pre-allocated weight staging buffers.
+        // D2D copies from T1 pages into fixed buffers (~168 MB total, reused per layer).
+
+        let hidden_dim = self.model_config.hidden_dim as usize;
+        let layer = layer_idx as usize;
+        let num_key_heads = dn_config.num_key_heads as usize;
+        let num_v_heads = dn_config.num_value_heads as usize;
+        let key_head_dim = dn_config.key_head_dim as usize;
+        let v_head_dim = dn_config.value_head_dim as usize;
+        let key_dim = num_key_heads * key_head_dim; // 2048
+        let inner_dim = dn_config.inner_dim as usize; // 8192
+        let qkv_dim = dn_config.qkv_dim() as usize; // 12288
+        let conv_kernel = dn_config.conv_kernel_size as usize; // 4
+        let eps = self.model_config.rms_norm_eps;
+
+        // Map model layer index to DeltaNet state index (skip attention layers)
+        let dn_state_idx = dn_config.layer_is_attention[..layer]
+            .iter()
+            .filter(|&&is_attn| !is_attn)
+            .count();
+
+        let profile = self.diag_enabled && self.decode_step == 1;
+
+        // ── 1. Load DeltaNet weights — use pre-assembled zero-copy if available ──
+        // For non-preassembled layers, we use paged GEMV for large multi-page tensors
+        // (segments 30=QKV, 31=Z, 38=out) to eliminate D2D staging copies.
+        // Small single-page tensors still use D2D staging.
+        let t_load = Instant::now();
+        let has_fp16_preassembled = self.get_preassembled_weight(layer_idx, 30).is_some();
+        let has_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 30).is_some();
+        if !has_fp16_preassembled && !has_nvfp4 {
+            // Non-resident fallback: D2D from whatever pages are available
+            self.load_tensor_direct_resident(layer_idx, 30, self.dn_w_qkv.as_mut_ptr() as usize, self.dn_w_qkv.size());
+            self.load_tensor_direct_resident(layer_idx, 31, self.dn_w_z.as_mut_ptr() as usize, self.dn_w_z.size());
+            self.load_tensor_direct_resident(layer_idx, 38, self.dn_w_out.as_mut_ptr() as usize, self.dn_w_out.size());
+        }
+        if !has_fp16_preassembled && !has_nvfp4 {
+            // Small segments: always D2D (single-page, fast)
+            self.load_tensor_direct_resident(layer_idx, 32, self.dn_w_beta.as_mut_ptr() as usize, self.dn_w_beta.size());
+            self.load_tensor_direct_resident(layer_idx, 33, self.dn_w_alpha.as_mut_ptr() as usize, self.dn_w_alpha.size());
+            self.load_tensor_direct_resident(layer_idx, 34, self.dn_w_conv.as_mut_ptr() as usize, self.dn_w_conv.size());
+            self.load_tensor_direct_resident(layer_idx, 35, self.dn_w_dt_bias.as_mut_ptr() as usize, self.dn_w_dt_bias.size());
+            self.load_tensor_direct_resident(layer_idx, 36, self.dn_w_a_log.as_mut_ptr() as usize, self.dn_w_a_log.size());
+            self.load_tensor_direct_resident(layer_idx, 37, self.dn_w_norm.as_mut_ptr() as usize, self.dn_w_norm.size());
+        }
+        if profile { self.stream.synchronize()?; }
+        let load_us = t_load.elapsed().as_micros() as u64;
+
+        // Get device pointers for small segments — prefer pre-assembled, fallback to staging
+        let beta_w_ptr = self.get_preassembled_weight(layer_idx, 32)
+            .map(|(p, _)| p).unwrap_or(self.dn_w_beta.as_ptr());
+        let alpha_w_ptr = self.get_preassembled_weight(layer_idx, 33)
+            .map(|(p, _)| p).unwrap_or(self.dn_w_alpha.as_ptr());
+        let conv_w_ptr = self.get_preassembled_weight(layer_idx, 34)
+            .map(|(p, _)| p).unwrap_or(self.dn_w_conv.as_ptr());
+        let dt_bias_ptr = self.get_preassembled_weight(layer_idx, 35)
+            .map(|(p, _)| p).unwrap_or(self.dn_w_dt_bias.as_ptr());
+        let a_ptr = self.get_preassembled_weight(layer_idx, 36)
+            .map(|(p, _)| p).unwrap_or(self.dn_w_a_log.as_ptr());
+        let norm_w_ptr = self.get_preassembled_weight(layer_idx, 37)
+            .map(|(p, _)| p).unwrap_or(self.dn_w_norm.as_ptr());
+
+        // ── 2. QKV + Z projections (batched when both NVFP4) ──
+        // Check if weight is NVFP4 (4x bandwidth reduction via MMA GEMV)
+        let t_qkv = Instant::now();
+        let qkv_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 30);
+        let z_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 31);
+        let batched_qkv_z = qkv_nvfp4.is_some() && z_nvfp4.is_some();
+        if let Some((nvfp4_ptr, _m, nvfp4_k)) = qkv_nvfp4 {
+            // NVFP4 path: fused RMSNorm + FP4 quantize in a single kernel
+            // Reads FP32 hidden_state, applies norm, outputs FP4 directly.
+            // FP16 hidden_state was already produced by the shared norm step for alpha/beta.
+            let eps = self.model_config.rms_norm_eps;
+            if let Some((norm_ptr, _)) = self.get_preassembled_weight(layer_idx, 6) {
+                kernels::fused_rms_norm_quantize_fp4(
+                    self.hidden_state_f32.as_ptr(),
+                    norm_ptr,
+                    self.preq_act_fp4.as_mut_ptr(),
+                    self.preq_act_scales.as_mut_ptr(),
+                    std::ptr::null_mut(), // FP16 already produced by shared norm
+                    nvfp4_k,
+                    eps,
+                    &self.stream,
+                )?;
+            }
+            if batched_qkv_z {
+                // Batched: QKV + Z in a single kernel launch (same FP4 activation, same K)
+                let (z_nvfp4_ptr, _z_m, _z_k) = z_nvfp4.unwrap();
+                let weight_pages = [nvfp4_ptr, z_nvfp4_ptr];
+                let m_slices = [qkv_dim as i32, inner_dim as i32];
+                let mut outputs = [
+                    self.dn_qkv_f32_dev.as_mut_ptr(),
+                    self.dn_z_f32_dev.as_mut_ptr(),
+                ];
+                kernels::batched_gemv_mma_nvfp4_tiled(
+                    self.preq_act_fp4.as_ptr(),
+                    self.preq_act_scales.as_ptr(),
+                    &weight_pages,
+                    &m_slices,
+                    &mut outputs,
+                    nvfp4_k,
+                    &self.stream,
+                )?;
+            } else {
+                // Single QKV GEMV (Z will be done separately later)
+                kernels::gemv_mma_nvfp4_tiled(
+                    self.preq_act_fp4.as_ptr(),
+                    self.preq_act_scales.as_ptr(),
+                    nvfp4_ptr,
+                    self.dn_qkv_f32_dev.as_mut_ptr(),
+                    nvfp4_k,
+                    qkv_dim,
+                    &self.stream,
+                )?;
+            }
+        } else {
+            let qkv_w_ptr = self.get_preassembled_weight(layer_idx, 30)
+                .map(|(p, _)| p).unwrap_or(self.dn_w_qkv.as_ptr());
+            kernels::linear_projection(
+                self.hidden_state.as_ptr(),
+                qkv_w_ptr,
+                self.dn_qkv_proj_dev.as_mut_ptr(),
+                hidden_dim,
+                qkv_dim,
+                &self.stream,
+            )?;
+            // Convert QKV from FP16 to FP32 (DeltaNet operates entirely in FP32)
+            kernels::f16_to_f32(
+                self.dn_qkv_proj_dev.as_ptr(),
+                self.dn_qkv_f32_dev.as_mut_ptr(),
+                qkv_dim,
+                &self.stream,
+            )?;
+        }
+        if profile { self.stream.synchronize()?; }
+        let qkv_us = t_qkv.elapsed().as_micros() as u64;
+
+        // Dump layer 0 intermediates for all tokens
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let _ = std::fs::create_dir_all(dump_dir);
+            let tok = self.position;
+            // QKV projection (FP32, qkv_dim=8192)
+            {
+                let mut buf = vec![0u8; qkv_dim * 4];
+                self.dn_qkv_f32_dev.copy_to_host(&mut buf)?;
+                let path = format!("{}/vib3_qkv_f32_L0_tok{}.bin", dump_dir, tok);
+                let _ = std::fs::write(&path, &buf);
+            }
+        }
+
+        // ── 3. Conv1d + SiLU on QKV ──
+        let t_mid = Instant::now();
+        // Convert conv1d weights from FP16 to FP32 into a temp buffer.
+        // conv1d weight: [qkv_dim, conv_kernel] FP16 stored on device.
+        // We need FP32 for the kernel. Reuse dn_conv_out_dev temporarily for the weight conversion.
+        // Actually, we need conv_w in FP32 AND conv_out simultaneously, so let's use a small
+        // on-stack approach: the conv weight is qkv_dim * conv_kernel * 4 = 12288 * 4 * 4 = 196608 bytes.
+        // We'll convert in-place by using dn_conv_out_dev for the FP32 conv weight, then do conv1d
+        // into a portion of dn_qkv_f32_dev (which we've already consumed).
+        //
+        // Wait — the causal_conv1d kernel takes FP32 inputs and writes FP32 output.
+        // We need: FP32 conv_state, FP32 new_input (from qkv_f32), FP32 conv_weight, FP32 output.
+        // The conv_weight is small enough to convert on the fly.
+        // Let's use a dedicated conversion: we have dn_conv_out_dev as [qkv_dim * 4] bytes = 49152 bytes.
+        // Conv weight is [qkv_dim * conv_kernel] = 12288 * 4 = 49152 FP16 values = 98304 bytes → 196608 F32 bytes.
+        // That's larger than dn_conv_out_dev. We need a different approach.
+        //
+        // Strategy: The conv weight is static per layer, so we can convert it to F32 once and cache it.
+        // For now, let's convert it to F32 into a temporary host-side buffer, upload, and cache.
+        // Actually simpler: just ensure the weight is FP32 on device by using a cache.
+        //
+        // SIMPLEST approach for now: we have dn_norm_out_dev (inner_dim * 4 = 32768 bytes) which
+        // is not used until step 10. And the conv weight is 196608 bytes. That's too large.
+        //
+        // Let's just allocate a temporary device buffer for the FP32 conv weight.
+        // This is called once per layer per token, so the cost is minimal.
+        // Convert conv1d weights FP16→FP32 into pre-allocated buffer (no cudaMalloc)
+        kernels::f16_to_f32(
+            conv_w_ptr,
+            self.dn_conv_w_f32_dev.as_mut_ptr(),
+            qkv_dim * conv_kernel,
+            &self.stream,
+        )?;
+
+        // Dump conv1d weight (FP32) for layer 0
+        if self.diag_enabled && layer_idx == 0 && self.position == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let mut buf = vec![0u8; qkv_dim * conv_kernel * 4];
+            self.dn_conv_w_f32_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_conv1d_weight_L0.bin", dump_dir);
+            let _ = std::fs::write(&path, &buf);
+            tracing::info!("Dumped conv1d weight FP32 to {} ({} bytes)", path, buf.len());
+        }
+
+        // Run causal conv1d: updates conv_state in-place, outputs convolved+SiLU result
+        kernels::causal_conv1d(
+            self.dn_conv_state[dn_state_idx].as_mut_ptr(),
+            self.dn_qkv_f32_dev.as_ptr(), // new_input: FP32 QKV
+            self.dn_conv_w_f32_dev.as_ptr(), // conv_weight: FP32 (pre-allocated)
+            self.dn_conv_out_dev.as_mut_ptr(), // output: FP32 [qkv_dim]
+            qkv_dim,
+            conv_kernel,
+            &self.stream,
+        )?;
+
+        // Dump conv1d output for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; qkv_dim * 4];
+            self.dn_conv_out_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_conv_silu_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // ── 4. Split Q/K/V from conv output ──
+        // Layout: [Q: key_dim=2048, K: key_dim=2048, V: inner_dim=8192]
+        // All in FP32, contiguous in dn_conv_out_dev.
+        let q_ptr = self.dn_conv_out_dev.as_ptr(); // offset 0
+        let k_ptr = unsafe { self.dn_conv_out_dev.as_ptr().add(key_dim * 4) }; // offset key_dim*4
+        let v_ptr = unsafe { self.dn_conv_out_dev.as_ptr().add(key_dim * 2 * 4) }; // offset 2*key_dim*4
+
+        // ── 5. L2 normalize Q and K ──
+        // Q: [num_key_heads, key_head_dim] → L2 norm per head
+        // K: [num_key_heads, key_head_dim] → L2 norm per head
+        kernels::l2_norm(
+            q_ptr,
+            self.dn_q_norm_dev.as_mut_ptr(),
+            num_key_heads,
+            key_head_dim,
+            1e-12,
+            &self.stream,
+        )?;
+        kernels::l2_norm(
+            k_ptr,
+            self.dn_k_norm_dev.as_mut_ptr(),
+            num_key_heads,
+            key_head_dim,
+            1e-12,
+            &self.stream,
+        )?;
+
+        // ── 6. Repeat Q/K from num_key_heads → num_value_heads (tiled) ──
+        let repeat_factor = num_v_heads / num_key_heads; // 64 / 16 = 4
+        kernels::repeat_tile_f32(
+            self.dn_q_norm_dev.as_ptr(),
+            self.dn_q_rep_dev.as_mut_ptr(),
+            num_key_heads,
+            key_head_dim,
+            repeat_factor,
+            &self.stream,
+        )?;
+        kernels::repeat_tile_f32(
+            self.dn_k_norm_dev.as_ptr(),
+            self.dn_k_rep_dev.as_mut_ptr(),
+            num_key_heads,
+            key_head_dim,
+            repeat_factor,
+            &self.stream,
+        )?;
+
+        // ── 6b. Scale Q by 1/sqrt(key_head_dim) ──
+        // llama.cpp: q = ggml_scale(ctx0, q, 1.0f / sqrtf(S_k))  (delta-net-base.cpp:321)
+        kernels::scale_f32(
+            self.dn_q_rep_dev.as_mut_ptr(),
+            num_v_heads * key_head_dim,
+            1.0 / (key_head_dim as f32).sqrt(),
+            &self.stream,
+        )?;
+
+        // Dump Q/K after repeat+scale for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let qk_size = num_v_heads * key_head_dim; // 32 * 128 = 4096
+            // Q (after repeat + scale)
+            let mut buf = vec![0u8; qk_size * 4];
+            self.dn_q_rep_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_q_predelta_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+            // K (after repeat)
+            self.dn_k_rep_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_k_predelta_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // ── 7. Alpha projection → gate computation ──
+        // Alpha: hidden_state (FP16) × alpha_weight → [num_v_heads] FP16 → FP32
+        kernels::linear_projection(
+            self.hidden_state.as_ptr(),
+            alpha_w_ptr,
+            self.dn_alpha_proj_dev.as_mut_ptr(),
+            hidden_dim,
+            num_v_heads,
+            &self.stream,
+        )?;
+        kernels::f16_to_f32(
+            self.dn_alpha_proj_dev.as_ptr(),
+            self.dn_alpha_f32_dev.as_mut_ptr(),
+            num_v_heads,
+            &self.stream,
+        )?;
+
+        // Convert dt_bias and A from FP16 to FP32 (small: num_v_heads each)
+        kernels::f16_to_f32(
+            dt_bias_ptr,
+            self.dn_dt_bias_f32_dev.as_mut_ptr(),
+            num_v_heads,
+            &self.stream,
+        )?;
+        kernels::f16_to_f32(
+            a_ptr,
+            self.dn_a_f32_dev.as_mut_ptr(),
+            num_v_heads,
+            &self.stream,
+        )?;
+
+        // Gate = A * softplus(alpha + dt_bias)
+        kernels::deltanet_gate(
+            self.dn_alpha_f32_dev.as_ptr(),
+            self.dn_dt_bias_f32_dev.as_ptr(),
+            self.dn_a_f32_dev.as_ptr(),
+            self.dn_gate_dev.as_mut_ptr(),
+            num_v_heads,
+            &self.stream,
+        )?;
+
+        // Dump gate for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            // Gate [num_v_heads] F32
+            let mut buf = vec![0u8; num_v_heads * 4];
+            self.dn_gate_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_gate_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+            // Alpha F32 [num_v_heads]
+            let mut buf2 = vec![0u8; num_v_heads * 4];
+            self.dn_alpha_f32_dev.copy_to_host(&mut buf2)?;
+            let path2 = format!("{}/vib3_alpha_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path2, &buf2);
+        }
+
+        // ── 8. Beta projection → sigmoid ──
+        // Beta: hidden_state (FP16) × beta_weight → [num_v_heads] FP16 → FP32 → sigmoid
+        kernels::linear_projection(
+            self.hidden_state.as_ptr(),
+            beta_w_ptr,
+            self.dn_beta_proj_dev.as_mut_ptr(),
+            hidden_dim,
+            num_v_heads,
+            &self.stream,
+        )?;
+        kernels::f16_to_f32(
+            self.dn_beta_proj_dev.as_ptr(),
+            self.dn_beta_f32_dev.as_mut_ptr(),
+            num_v_heads,
+            &self.stream,
+        )?;
+        kernels::sigmoid(
+            self.dn_beta_f32_dev.as_ptr(),
+            self.dn_beta_f32_dev.as_mut_ptr(), // in-place
+            num_v_heads,
+            &self.stream,
+        )?;
+
+        // Dump beta (post-sigmoid) for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; num_v_heads * 4];
+            self.dn_beta_f32_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_beta_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // ── 9. DeltaNet step: decay → retrieve → delta → update → query ──
+        // state: [num_v_heads, v_head_dim, v_head_dim] FP32 (persistent per layer)
+        // q: [num_v_heads, key_head_dim=128] FP32 (after repeat)
+        // k: [num_v_heads, key_head_dim=128] FP32 (after repeat)
+        // v: [num_v_heads, v_head_dim=128] FP32 (from conv split, inner_dim = num_v_heads * v_head_dim)
+        // gate: [num_v_heads] FP32
+        // beta: [num_v_heads] FP32
+        // output: [num_v_heads, v_head_dim] = [inner_dim] FP32
+
+        // Diagnostic: dump gate, beta, Q/K/V norms for L1 debugging
+        if self.diag_enabled && layer_idx <= 2 && self.position <= 3 {
+            self.stream.synchronize()?;
+            // Gate values
+            let mut gate_buf = vec![0u8; num_v_heads * 4];
+            self.dn_gate_dev.copy_to_host(&mut gate_buf)?;
+            let gate_f32 = unsafe { std::slice::from_raw_parts(gate_buf.as_ptr() as *const f32, num_v_heads) };
+            // Beta values (post-sigmoid)
+            let mut beta_buf = vec![0u8; num_v_heads * 4];
+            self.dn_beta_f32_dev.copy_to_host(&mut beta_buf)?;
+            let beta_f32 = unsafe { std::slice::from_raw_parts(beta_buf.as_ptr() as *const f32, num_v_heads) };
+            // Q L2 per head
+            let mut q_buf_bytes = vec![0u8; num_v_heads * key_head_dim * 4];
+            self.dn_q_rep_dev.copy_to_host(&mut q_buf_bytes)?;
+            let q_f32 = unsafe { std::slice::from_raw_parts(q_buf_bytes.as_ptr() as *const f32, num_v_heads * key_head_dim) };
+            let q_head_l2: Vec<f32> = (0..std::cmp::min(num_v_heads, 4))
+                .map(|h| {
+                    let start = h * key_head_dim;
+                    q_f32[start..start+key_head_dim].iter().map(|v| v*v).sum::<f32>().sqrt()
+                })
+                .collect();
+            // V L2 from conv_out_dev (v_ptr is at offset 2*key_dim*4)
+            let mut conv_out_bytes = vec![0u8; qkv_dim * 4];
+            self.dn_conv_out_dev.copy_to_host(&mut conv_out_bytes)?;
+            let conv_f32 = unsafe { std::slice::from_raw_parts(conv_out_bytes.as_ptr() as *const f32, qkv_dim) };
+            let v_start = 2 * key_dim;
+            let v_f32 = &conv_f32[v_start..v_start + inner_dim];
+            let v_l2 = v_f32.iter().map(|v| v*v).sum::<f32>().sqrt();
+            // State L2
+            let state_size = num_v_heads * v_head_dim * v_head_dim;
+            let mut state_bytes = vec![0u8; state_size * 4];
+            self.dn_recurrent_state[dn_state_idx].copy_to_host(&mut state_bytes)?;
+            let state_f32 = unsafe { std::slice::from_raw_parts(state_bytes.as_ptr() as *const f32, state_size) };
+            let state_l2 = state_f32.iter().map(|v| v*v).sum::<f32>().sqrt();
+            // Per-head state L2
+            let head_state_size = v_head_dim * v_head_dim;
+            let state_head_l2: Vec<f32> = (0..std::cmp::min(num_v_heads, 4))
+                .map(|h| {
+                    let start = h * head_state_size;
+                    state_f32[start..start+head_state_size].iter().map(|v| v*v).sum::<f32>().sqrt()
+                })
+                .collect();
+
+            tracing::info!(
+                "DELTANET_DIAG L{} pos={}: gate first4=[{:.6},{:.6},{:.6},{:.6}] gate_range=[{:.6},{:.6}] \
+                 beta first4=[{:.4},{:.4},{:.4},{:.4}] v_L2={:.4} state_L2={:.4} state_head_L2={:?} \
+                 q_head_L2 first4=[{:.4},{:.4},{:.4},{:.4}]",
+                layer_idx, self.position,
+                gate_f32[0], gate_f32[1], gate_f32[2], gate_f32[3],
+                gate_f32.iter().cloned().fold(f32::INFINITY, f32::min),
+                gate_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                beta_f32[0], beta_f32[1], beta_f32[2], beta_f32[3],
+                v_l2, state_l2, state_head_l2,
+                q_head_l2[0], q_head_l2[1], q_head_l2[2], q_head_l2[3],
+            );
+        }
+
+        kernels::deltanet_step(
+            self.dn_recurrent_state[dn_state_idx].as_mut_ptr(),
+            self.dn_q_rep_dev.as_ptr(),
+            self.dn_k_rep_dev.as_ptr(),
+            v_ptr, // V is in dn_conv_out_dev at offset 2*key_dim*4
+            self.dn_gate_dev.as_ptr(),
+            self.dn_beta_f32_dev.as_ptr(),
+            self.dn_step_out_dev.as_mut_ptr(),
+            num_v_heads,
+            v_head_dim, // vdim = key_head_dim = v_head_dim = 128
+            &self.stream,
+        )?;
+
+        // Dump deltanet_step output for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let step_size = num_v_heads * v_head_dim; // inner_dim = 4096
+            let mut buf = vec![0u8; step_size * 4];
+            self.dn_step_out_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_attn_out_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // Diagnostic: dump step output for L1 debugging
+        if self.diag_enabled && layer_idx <= 2 && self.position <= 3 {
+            self.stream.synchronize()?;
+            let mut step_bytes = vec![0u8; inner_dim * 4];
+            self.dn_step_out_dev.copy_to_host(&mut step_bytes)?;
+            let step_buf = unsafe { std::slice::from_raw_parts(step_bytes.as_ptr() as *const f32, inner_dim) };
+            let step_l2 = step_buf.iter().map(|v| v*v).sum::<f32>().sqrt();
+            let step_max = step_buf.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_min = step_buf.iter().cloned().fold(f32::INFINITY, f32::min);
+            // Per-head step L2
+            let step_head_l2: Vec<f32> = (0..std::cmp::min(num_v_heads, 4))
+                .map(|h| {
+                    let start = h * v_head_dim;
+                    step_buf[start..start+v_head_dim].iter().map(|v| v*v).sum::<f32>().sqrt()
+                })
+                .collect();
+            tracing::info!(
+                "DELTANET_STEP L{} pos={}: step_out L2={:.4}, range=[{:.4},{:.4}], head_L2={:?}",
+                layer_idx, self.position, step_l2, step_min, step_max, step_head_l2,
+            );
+        }
+
+        if profile { self.stream.synchronize()?; }
+        let mid_us = t_mid.elapsed().as_micros() as u64;
+
+        // ── 10. Z gate projection ──
+        let t_zout = Instant::now();
+        if batched_qkv_z {
+            // Z was already computed in the batched QKV+Z launch — skip
+        } else if let Some((z_nvfp4_ptr, _m, z_nvfp4_k)) = z_nvfp4 {
+            // NVFP4 path: reuse the already-quantized hidden_dim activation from QKV step
+            // (same hidden_state_f32 → attn_normed_f32 → FP4, same K=hidden_dim)
+            // If QKV was also NVFP4, the preq_act_fp4/scales are already populated.
+            // If not, we need to quantize now.
+            if qkv_nvfp4.is_none() {
+                let eps = self.model_config.rms_norm_eps;
+                if let Some((norm_ptr, _)) = self.get_preassembled_weight(layer_idx, 6) {
+                    kernels::rms_norm_f32(
+                        self.hidden_state_f32.as_ptr(),
+                        self.attn_normed_f32.as_mut_ptr(),
+                        norm_ptr,
+                        hidden_dim,
+                        eps,
+                        &self.stream,
+                    )?;
+                }
+                kernels::quantize_activation_fp4_fast(
+                    self.attn_normed_f32.as_ptr(),
+                    self.preq_act_fp4.as_mut_ptr(),
+                    self.preq_act_scales.as_mut_ptr(),
+                    z_nvfp4_k,
+                    &self.stream,
+                )?;
+            }
+            // MMA GEMV → FP32 directly into dn_z_f32_dev
+            kernels::gemv_mma_nvfp4_tiled(
+                self.preq_act_fp4.as_ptr(),
+                self.preq_act_scales.as_ptr(),
+                z_nvfp4_ptr,
+                self.dn_z_f32_dev.as_mut_ptr(),
+                z_nvfp4_k,
+                inner_dim,
+                &self.stream,
+            )?;
+        } else {
+            let z_w_ptr = self.get_preassembled_weight(layer_idx, 31)
+                .map(|(p, _)| p).unwrap_or(self.dn_w_z.as_ptr());
+            kernels::linear_projection(
+                self.hidden_state.as_ptr(),
+                z_w_ptr,
+                self.dn_z_proj_dev.as_mut_ptr(),
+                hidden_dim,
+                inner_dim,
+                &self.stream,
+            )?;
+            kernels::f16_to_f32(
+                self.dn_z_proj_dev.as_ptr(),
+                self.dn_z_f32_dev.as_mut_ptr(),
+                inner_dim,
+                &self.stream,
+            )?;
+        }
+
+        // ── 11. Gated RMSNorm: output = RMSNorm(step_out, norm_weight) * SiLU(z) ──
+        // Convert norm weight from FP16 to FP32
+        kernels::f16_to_f32(
+            norm_w_ptr,
+            self.dn_norm_weight_f32_dev.as_mut_ptr(),
+            v_head_dim, // norm_weight is [v_head_dim=128]
+            &self.stream,
+        )?;
+
+        // Dump Z gate output for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; inner_dim * 4];
+            self.dn_z_f32_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_z_gate_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // Diagnostic: Z gate and norm weight stats before gated_rmsnorm
+        if self.diag_enabled && layer_idx <= 2 && self.position <= 3 {
+            self.stream.synchronize()?;
+            let mut z_bytes = vec![0u8; inner_dim * 4];
+            self.dn_z_f32_dev.copy_to_host(&mut z_bytes)?;
+            let z_buf = unsafe { std::slice::from_raw_parts(z_bytes.as_ptr() as *const f32, inner_dim) };
+            let z_l2 = z_buf.iter().map(|v| v*v).sum::<f32>().sqrt();
+            let z_max = z_buf.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let z_min = z_buf.iter().cloned().fold(f32::INFINITY, f32::min);
+            // Per-head Z gate L2 and max SiLU
+            let z_head_info: Vec<(f32, f32)> = (0..std::cmp::min(num_v_heads, 8))
+                .map(|h| {
+                    let start = h * v_head_dim;
+                    let head_slice = &z_buf[start..start+v_head_dim];
+                    let hl2 = head_slice.iter().map(|v| v*v).sum::<f32>().sqrt();
+                    let hmax = head_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    (hl2, hmax)
+                })
+                .collect();
+            // Compute max SiLU(z) magnitude across all elements
+            let max_silu = z_buf.iter().map(|&g| {
+                let silu = g / (1.0 + (-g).exp());
+                silu.abs()
+            }).fold(0.0f32, f32::max);
+            tracing::info!(
+                "DELTANET_ZGATE L{} pos={}: z_L2={:.4}, z_range=[{:.4},{:.4}], max_silu={:.4}, head_info(L2,max)={:?}",
+                layer_idx, self.position, z_l2, z_min, z_max, max_silu, z_head_info,
+            );
+        }
+
+        kernels::gated_rmsnorm(
+            self.dn_step_out_dev.as_ptr(),
+            self.dn_z_f32_dev.as_ptr(),
+            self.dn_norm_weight_f32_dev.as_ptr(),
+            self.dn_norm_out_dev.as_mut_ptr(),
+            num_v_heads,  // 64 independent heads
+            v_head_dim,   // 128 elements per head
+            v_head_dim,   // norm_dim cycles across group_dim
+            eps,
+            &self.stream,
+        )?;
+
+        // Diagnostic: gated_rmsnorm output stats
+        if self.diag_enabled && layer_idx <= 2 && self.position <= 3 {
+            self.stream.synchronize()?;
+            let mut norm_bytes = vec![0u8; inner_dim * 4];
+            self.dn_norm_out_dev.copy_to_host(&mut norm_bytes)?;
+            let norm_buf = unsafe { std::slice::from_raw_parts(norm_bytes.as_ptr() as *const f32, inner_dim) };
+            let norm_l2 = norm_buf.iter().map(|v| v*v).sum::<f32>().sqrt();
+            let norm_max = norm_buf.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let norm_min = norm_buf.iter().cloned().fold(f32::INFINITY, f32::min);
+            let norm_head_l2: Vec<f32> = (0..std::cmp::min(num_v_heads, 8))
+                .map(|h| {
+                    let start = h * v_head_dim;
+                    norm_buf[start..start+v_head_dim].iter().map(|v| v*v).sum::<f32>().sqrt()
+                })
+                .collect();
+            tracing::info!(
+                "DELTANET_NORMOUT L{} pos={}: L2={:.4}, range=[{:.4},{:.4}], head_L2={:?}",
+                layer_idx, self.position, norm_l2, norm_min, norm_max, norm_head_l2,
+            );
+        }
+
+        // Dump gated_rmsnorm output for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; inner_dim * 4];
+            self.dn_norm_out_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_gated_rmsnorm_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // ── 12. Output projection: inner_dim → hidden_dim ──
+        let out_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 38);
+        if let Some((out_nvfp4_ptr, _m, out_nvfp4_k)) = out_nvfp4 {
+            // NVFP4 path: quantize FP32 norm_out (inner_dim) → FP4, then MMA GEMV → FP32
+            kernels::quantize_activation_fp4_fast(
+                self.dn_norm_out_dev.as_ptr(),
+                self.preq_inner_act_fp4.as_mut_ptr(),
+                self.preq_inner_act_scales.as_mut_ptr(),
+                out_nvfp4_k, // K = inner_dim
+                &self.stream,
+            )?;
+            kernels::gemv_mma_nvfp4_tiled(
+                self.preq_inner_act_fp4.as_ptr(),
+                self.preq_inner_act_scales.as_ptr(),
+                out_nvfp4_ptr,
+                self.dn_o_out_dev.as_mut_ptr(),
+                out_nvfp4_k,
+                hidden_dim,
+                &self.stream,
+            )?;
+        } else {
+            let o_w_ptr = self.get_preassembled_weight(layer_idx, 38)
+                .map(|(p, _)| p).unwrap_or(self.dn_w_out.as_ptr());
+            kernels::linear_projection_f32_to_f32(
+                self.dn_norm_out_dev.as_ptr(),
+                o_w_ptr,
+                self.dn_o_out_dev.as_mut_ptr(),
+                inner_dim,
+                hidden_dim,
+                &self.stream,
+            )?;
+        }
+
+        // Dump out_proj output for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; hidden_dim * 4];
+            self.dn_o_out_dev.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_out_proj_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+
+        // ── 13. Residual add: hidden_state_f32 += o_proj_output (FP32) ──
+        kernels::residual_add_f32_f32(
+            self.hidden_state_f32.as_mut_ptr(),
+            self.dn_o_out_dev.as_ptr(),
+            hidden_dim,
+            &self.stream,
+        )?;
+        // Dump post-residual hidden state for layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; hidden_dim * 4];
+            self.hidden_state_f32.copy_to_host(&mut buf)?;
+            let path = format!("{}/vib3_attn_residual_L0_tok{}.bin", dump_dir, tok);
+            let _ = std::fs::write(&path, &buf);
+        }
+        if profile {
+            self.stream.synchronize()?;
+            let zout_us = t_zout.elapsed().as_micros() as u64;
+            if layer_idx <= 4 || layer_idx % 12 == 0 || layer_idx >= 44 {
+                tracing::info!(
+                    "PROFILE DN_INNER L{}: load={:.0}us qkv={:.0}us mid={:.0}us zout={:.0}us total={:.0}us",
+                    layer_idx, load_us, qkv_us, mid_us, zout_us,
+                    load_us + qkv_us + mid_us + zout_us,
+                );
+            }
+        }
+
+        // Diagnostic: dump DeltaNet intermediate values for debugging
+        if self.diag_enabled && layer_idx <= 2 && self.decode_step <= 3 {
+            self.stream.synchronize()?;
+            let f32_bytes = hidden_dim * 4;
+            let mut diag_buf = vec![0u8; f32_bytes];
+            self.dn_o_out_dev.copy_to_host(&mut diag_buf)?;
+            let o_f32 = unsafe { std::slice::from_raw_parts(diag_buf.as_ptr() as *const f32, hidden_dim) };
+            let o_l2 = o_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+            tracing::info!(
+                "DELTANET L{} pos={}: o_proj L2={:.4}, first4=[{:.6},{:.6},{:.6},{:.6}]",
+                layer_idx, self.position, o_l2,
+                o_f32[0], o_f32[1], o_f32[2], o_f32[3],
+            );
+        }
 
         Ok(())
     }
@@ -1697,11 +3284,15 @@ impl Engine {
         self.attn_dev.copy_from_host(attn_host_bytes)?;
 
         // GPU GEMV: O_proj = attn_concat × O_weights^T → hidden_state
+        // O weight: [hidden_dim, num_heads*head_dim], input: [num_heads*head_dim], output: [hidden_dim]
+        let num_heads = self.model_config.num_heads as usize;
+        let head_dim = self.model_config.effective_head_dim() as usize;
+        let attn_dim = num_heads * head_dim;
         kernels::linear_projection(
             self.attn_dev.as_ptr(),
             o_ptr,
             self.hidden_state.as_mut_ptr(),
-            hidden_dim,
+            attn_dim,
             hidden_dim,
             &self.stream,
         )?;
@@ -1750,9 +3341,11 @@ impl Engine {
             let layer = layer_idx as usize;
             let num_heads = self.model_config.num_heads as usize;
             let num_kv_heads = self.model_config.num_kv_heads as usize;
-            let head_dim = hidden_dim / num_heads;
+            let head_dim = self.model_config.effective_head_dim() as usize;
             let rope_base = self.model_config.rope_theta;
             let position = self.position;
+            let is_gated_attn = self.model_config.deltanet.is_some();
+            let eps = self.model_config.rms_norm_eps;
 
             // Bounds check: GPU KV cache must be allocated for this layer
             if layer >= self.gpu_kv_k.len() || layer >= self.gpu_kv_v.len() {
@@ -1767,136 +3360,432 @@ impl Engine {
                 return Ok(false);
             }
 
-            // Get device pointers for QKV/O weights (must all be available)
-            let q_ptr = match self.get_device_tensor(layer_idx, 4) {
-                Some((ptr, _)) => ptr,
-                None => return Ok(false),
-            };
-            let k_ptr = match self.get_device_tensor(layer_idx, 12) {
-                Some((ptr, _)) => ptr,
-                None => return Ok(false),
-            };
-            let v_ptr = match self.get_device_tensor(layer_idx, 13) {
-                Some((ptr, _)) => ptr,
-                None => return Ok(false),
-            };
-            let o_ptr = match self.get_device_tensor(layer_idx, 5) {
-                Some((ptr, _)) => ptr,
-                None => return Ok(false),
-            };
+            // Check for NVFP4 weights first (4x bandwidth reduction via MMA GEMV)
+            let q_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 4);
+            let k_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 12);
+            let v_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 13);
+            let o_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 5);
+            let use_nvfp4_qkv = q_nvfp4.is_some() && k_nvfp4.is_some() && v_nvfp4.is_some();
+
+            // Get FP16 device pointers (fallback or for non-NVFP4 paths)
+            let q_ptr = if !use_nvfp4_qkv {
+                match self.get_device_tensor(layer_idx, 4) {
+                    Some((ptr, _)) => ptr,
+                    None => return Ok(false),
+                }
+            } else { std::ptr::null() };
+            let k_ptr = if !use_nvfp4_qkv {
+                match self.get_device_tensor(layer_idx, 12) {
+                    Some((ptr, _)) => ptr,
+                    None => return Ok(false),
+                }
+            } else { std::ptr::null() };
+            let v_ptr = if !use_nvfp4_qkv {
+                match self.get_device_tensor(layer_idx, 13) {
+                    Some((ptr, _)) => ptr,
+                    None => return Ok(false),
+                }
+            } else { std::ptr::null() };
+            let o_ptr = if o_nvfp4.is_none() {
+                match self.get_device_tensor(layer_idx, 5) {
+                    Some((ptr, _)) => ptr,
+                    None => return Ok(false),
+                }
+            } else { std::ptr::null() };
 
             let stream_ptr = self.stream.raw_ptr();
 
             // Step 1: GPU GEMV — Q/K/V projections into pre-allocated device buffers
-            kernels::linear_projection(
-                self.hidden_state.as_ptr(),
-                q_ptr,
-                self.q_proj_dev.as_mut_ptr(),
-                hidden_dim,
-                q_dim,
-                &self.stream,
-            )?;
-            kernels::linear_projection(
-                self.hidden_state.as_ptr(),
-                k_ptr,
-                self.k_proj_dev.as_mut_ptr(),
-                hidden_dim,
-                kv_dim,
-                &self.stream,
-            )?;
-            kernels::linear_projection(
-                self.hidden_state.as_ptr(),
-                v_ptr,
-                self.v_proj_dev.as_mut_ptr(),
-                hidden_dim,
-                kv_dim,
-                &self.stream,
-            )?;
+            if use_nvfp4_qkv {
+                // NVFP4 path: fused RMSNorm + FP4 quantize in a single kernel
+                // Reads FP32 hidden_state, applies norm, outputs FP4 directly.
+                // No FP16 output needed — GQA NVFP4 path doesn't read FP16 hidden_state.
+                kernels::fused_rms_norm_quantize_fp4(
+                    self.hidden_state_f32.as_ptr(),
+                    self.get_preassembled_weight(layer_idx, 6).map(|(p,_)| p).unwrap_or(std::ptr::null()),
+                    self.preq_act_fp4.as_mut_ptr(),
+                    self.preq_act_scales.as_mut_ptr(),
+                    std::ptr::null_mut(), // no FP16 output needed for GQA NVFP4
+                    hidden_dim,
+                    eps,
+                    &self.stream,
+                )?;
 
-            // Step 2: RoPE — apply rotary position embeddings in-place on Q and K (FP16)
-            let err = unsafe {
-                cuda_ffi::vib3_launch_rope_apply(
+                // Batched Q+K+V GEMV: single kernel launch, outputs into nvfp4_f32_scratch
+                // Layout: [Q output: q_dim floats | K output: kv_dim floats | V output: kv_dim floats]
+                let (q_nvfp4_ptr, _q_m, q_nvfp4_k) = q_nvfp4.unwrap();
+                let (k_nvfp4_ptr, _k_m, k_nvfp4_k) = k_nvfp4.unwrap();
+                let (v_nvfp4_ptr, _v_m, v_nvfp4_k) = v_nvfp4.unwrap();
+                let q_out_ptr = self.nvfp4_f32_scratch.as_mut_ptr();
+                let k_out_ptr = unsafe { self.nvfp4_f32_scratch.as_mut_ptr().add(q_dim * 4) };
+                let v_out_ptr = unsafe { self.nvfp4_f32_scratch.as_mut_ptr().add((q_dim + kv_dim) * 4) };
+
+                let weight_pages = [q_nvfp4_ptr, k_nvfp4_ptr, v_nvfp4_ptr];
+                let m_slices = [q_dim as i32, kv_dim as i32, kv_dim as i32];
+                let mut outputs = [q_out_ptr, k_out_ptr, v_out_ptr];
+                kernels::batched_gemv_mma_nvfp4_tiled(
+                    self.preq_act_fp4.as_ptr(),
+                    self.preq_act_scales.as_ptr(),
+                    &weight_pages,
+                    &m_slices,
+                    &mut outputs,
+                    hidden_dim,
+                    &self.stream,
+                )?;
+
+                // Convert FP32 → FP16 for each projection
+                kernels::f32_to_f16(
+                    self.nvfp4_f32_scratch.as_ptr(),
                     self.q_proj_dev.as_mut_ptr(),
+                    q_dim,
+                    &self.stream,
+                )?;
+                kernels::f32_to_f16(
+                    unsafe { self.nvfp4_f32_scratch.as_ptr().add(q_dim * 4) },
                     self.k_proj_dev.as_mut_ptr(),
-                    head_dim as i32,
-                    num_heads as i32,
-                    num_kv_heads as i32,
-                    position as i32,
-                    rope_base,
-                    stream_ptr,
-                )
-            };
-            if err != 0 {
-                return Err(Error::Cuda(format!(
-                    "vib3_launch_rope_apply failed (err={})",
-                    err
-                )));
+                    kv_dim,
+                    &self.stream,
+                )?;
+                kernels::f32_to_f16(
+                    unsafe { self.nvfp4_f32_scratch.as_ptr().add((q_dim + kv_dim) * 4) },
+                    self.v_proj_dev.as_mut_ptr(),
+                    kv_dim,
+                    &self.stream,
+                )?;
+            } else {
+                // FP16 path
+                kernels::linear_projection(
+                    self.hidden_state.as_ptr(),
+                    q_ptr,
+                    self.q_proj_dev.as_mut_ptr(),
+                    hidden_dim,
+                    q_dim,
+                    &self.stream,
+                )?;
+                kernels::linear_projection(
+                    self.hidden_state.as_ptr(),
+                    k_ptr,
+                    self.k_proj_dev.as_mut_ptr(),
+                    hidden_dim,
+                    kv_dim,
+                    &self.stream,
+                )?;
+                kernels::linear_projection(
+                    self.hidden_state.as_ptr(),
+                    v_ptr,
+                    self.v_proj_dev.as_mut_ptr(),
+                    hidden_dim,
+                    kv_dim,
+                    &self.stream,
+                )?;
             }
 
-            // Step 3: Append post-RoPE K/V to the GPU-resident KV cache
-            let err = unsafe {
-                cuda_ffi::vib3_launch_kv_cache_append(
-                    self.gpu_kv_k[layer].as_mut_ptr(),
-                    self.gpu_kv_v[layer].as_mut_ptr(),
-                    self.k_proj_dev.as_ptr(),
-                    self.v_proj_dev.as_ptr(),
-                    self.max_kv_len as i32,
-                    head_dim as i32,
-                    num_kv_heads as i32,
-                    position as i32,
-                    stream_ptr,
-                )
-            };
-            if err != 0 {
-                return Err(Error::Cuda(format!(
-                    "vib3_launch_kv_cache_append failed (err={})",
-                    err
-                )));
-            }
+            if is_gated_attn {
+                // ── Qwen3.5 Gated GQA Attention Pipeline ──
+                //
+                // q_proj_dev contains interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...]
+                // Each chunk is head_dim=256 elements. Total: num_heads * 2 * head_dim = 16384.
+                //
+                // Pipeline:
+                //   1. Q/K/V projections (done above)
+                //   2. Per-head RMSNorm on Q (in interleaved buffer, stride=2*head_dim)
+                //   3. Per-head RMSNorm on K (contiguous, stride=head_dim)
+                //   4. Deinterleave Q+gate → separate Q and gate buffers
+                //   5. Partial RoPE on Q (64/256 dims, stride=head_dim)
+                //   6. Partial RoPE on K (64/256 dims, stride=head_dim)
+                //   7. Append K/V to KV cache
+                //   8. Decode attention (Q × K^T / sqrt(head_dim), softmax, × V)
+                //   9. sigmoid(gate) * attention_output
+                //  10. O projection → hidden_state
 
-            // Step 4: Decode attention — single-query GQA attention on GPU
-            // Output goes to attn_dev [num_heads * head_dim] FP16
-            let seq_len = position + 1; // include the just-appended position
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let err = unsafe {
-                cuda_ffi::vib3_launch_decode_attention(
+                let attn_dim = num_heads * head_dim; // 8192
+                let rope_dim = (head_dim as f32 * 0.25) as usize; // 64 for Qwen3.5
+
+                // Step 2: Per-head RMSNorm on Q (still interleaved, stride = 2*head_dim)
+                // q_norm weight: segment 27, shape [head_dim]
+                if let Some((q_norm_ptr, _)) = self.get_device_tensor(layer_idx, 27) {
+                    kernels::per_head_rmsnorm(
+                        self.q_proj_dev.as_mut_ptr(),
+                        q_norm_ptr,
+                        head_dim,
+                        2 * head_dim, // stride: skip over gate between Q heads
+                        num_heads,
+                        eps,
+                        &self.stream,
+                    )?;
+                } else {
+                    tracing::warn!("L{}: q_norm weight not available for gated attn", layer_idx);
+                }
+
+                // Step 3: Per-head RMSNorm on K (contiguous, stride = head_dim)
+                // k_norm weight: segment 28, shape [head_dim]
+                if let Some((k_norm_ptr, _)) = self.get_device_tensor(layer_idx, 28) {
+                    kernels::per_head_rmsnorm(
+                        self.k_proj_dev.as_mut_ptr(),
+                        k_norm_ptr,
+                        head_dim,
+                        head_dim, // stride: contiguous heads
+                        num_kv_heads,
+                        eps,
+                        &self.stream,
+                    )?;
+                } else {
+                    tracing::warn!("L{}: k_norm weight not available for gated attn", layer_idx);
+                }
+
+                // Step 4: Deinterleave Q+gate → attn_dev (Q) + gated_attn_gate_dev (gate)
+                // Input: q_proj_dev [num_heads * 2 * head_dim] interleaved
+                // Output: attn_dev [num_heads * head_dim] = Q, gated_attn_gate_dev [same] = gate
+                kernels::deinterleave_f16(
                     self.q_proj_dev.as_ptr(),
-                    self.gpu_kv_k[layer].as_ptr(),
-                    self.gpu_kv_v[layer].as_ptr(),
+                    self.attn_dev.as_mut_ptr(),       // Q output
+                    self.gated_attn_gate_dev.as_mut_ptr(), // gate output
+                    head_dim,    // chunk_size
+                    num_heads,   // num_chunks
+                    &self.stream,
+                )?;
+
+                // Step 5: Partial RoPE on Q (now in attn_dev, contiguous, stride=head_dim)
+                kernels::partial_rope(
                     self.attn_dev.as_mut_ptr(),
-                    head_dim as i32,
-                    num_heads as i32,
-                    num_kv_heads as i32,
-                    seq_len as i32,
-                    self.max_kv_len as i32,
-                    scale,
-                    stream_ptr,
-                )
-            };
-            if err != 0 {
-                return Err(Error::Cuda(format!(
-                    "vib3_launch_decode_attention failed (err={})",
-                    err
-                )));
+                    head_dim,
+                    rope_dim,
+                    head_dim, // stride
+                    num_heads,
+                    self.d_position.as_ptr(), // device-side position for CUDA graph compat
+                    rope_base,
+                    &self.stream,
+                )?;
+
+                // Step 6: Partial RoPE on K
+                kernels::partial_rope(
+                    self.k_proj_dev.as_mut_ptr(),
+                    head_dim,
+                    rope_dim,
+                    head_dim, // stride
+                    num_kv_heads,
+                    self.d_position.as_ptr(), // device-side position for CUDA graph compat
+                    rope_base,
+                    &self.stream,
+                )?;
+
+                // Step 7: Append post-RoPE K/V to the GPU-resident KV cache
+                let err = unsafe {
+                    cuda_ffi::vib3_launch_kv_cache_append(
+                        self.gpu_kv_k[layer].as_mut_ptr(),
+                        self.gpu_kv_v[layer].as_mut_ptr(),
+                        self.k_proj_dev.as_ptr(),
+                        self.v_proj_dev.as_ptr(),
+                        self.max_kv_len as i32,
+                        head_dim as i32,
+                        num_kv_heads as i32,
+                        self.d_position.as_ptr(), // device-side position
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    return Err(Error::Cuda(format!(
+                        "vib3_launch_kv_cache_append failed (err={})",
+                        err
+                    )));
+                }
+
+                // Step 8: Decode attention — Q is in attn_dev (post-RoPE, [num_heads * head_dim])
+                // We need a separate buffer for attention output since attn_dev has Q.
+                // Use q_proj_dev as scratch for attention output (it's large enough: 16384 >= 8192).
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let err = unsafe {
+                    cuda_ffi::vib3_launch_decode_attention(
+                        self.attn_dev.as_ptr(),           // Q: [num_heads * head_dim]
+                        self.gpu_kv_k[layer].as_ptr(),
+                        self.gpu_kv_v[layer].as_ptr(),
+                        self.q_proj_dev.as_mut_ptr(),     // output: [num_heads * head_dim] (reuse q_proj_dev as scratch)
+                        head_dim as i32,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        self.d_position.as_ptr(), // device-side position (kernel computes seq_len=pos+1)
+                        self.max_kv_len as i32,
+                        scale,
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    return Err(Error::Cuda(format!(
+                        "vib3_launch_decode_attention failed (err={})",
+                        err
+                    )));
+                }
+
+                // Step 9: Apply gating: attn_dev = attention_output * sigmoid(gate)
+                // attention_output is in q_proj_dev, gate is in gated_attn_gate_dev
+                // Write result to attn_dev for O projection input
+                kernels::sigmoid_mul_f16(
+                    self.attn_dev.as_mut_ptr(),          // output
+                    self.q_proj_dev.as_ptr(),             // attention output
+                    self.gated_attn_gate_dev.as_ptr(),    // gate
+                    attn_dim,                             // num_heads * head_dim
+                    &self.stream,
+                )?;
+
+                // Step 10: O projection — attn_dev [attn_dim] → hidden_state [hidden_dim]
+                if let Some((o_nvfp4_ptr, _o_m, o_nvfp4_k)) = o_nvfp4 {
+                    // NVFP4 path: attn_dev (FP16) → FP32 → FP4 → MMA GEMV → FP32
+                    kernels::f16_to_f32(
+                        self.attn_dev.as_ptr(),
+                        self.dn_qkv_f32_dev.as_mut_ptr(), // reuse as FP32 temp
+                        attn_dim,
+                        &self.stream,
+                    )?;
+                    kernels::quantize_activation_fp4_fast(
+                        self.dn_qkv_f32_dev.as_ptr(),
+                        self.preq_inner_act_fp4.as_mut_ptr(),
+                        self.preq_inner_act_scales.as_mut_ptr(),
+                        o_nvfp4_k,
+                        &self.stream,
+                    )?;
+                    kernels::gemv_mma_nvfp4_tiled(
+                        self.preq_inner_act_fp4.as_ptr(),
+                        self.preq_inner_act_scales.as_ptr(),
+                        o_nvfp4_ptr,
+                        self.layer_output_buf.as_mut_ptr(), // FP32 output (hidden_dim*4)
+                        o_nvfp4_k,
+                        hidden_dim,
+                        &self.stream,
+                    )?;
+                } else {
+                    kernels::linear_projection(
+                        self.attn_dev.as_ptr(),
+                        o_ptr,
+                        self.hidden_state.as_mut_ptr(),
+                        attn_dim,
+                        hidden_dim,
+                        &self.stream,
+                    )?;
+                }
+            } else {
+                // ── Standard (non-gated) GQA Attention Pipeline ──
+                // Step 2: RoPE — apply rotary position embeddings in-place on Q and K (FP16)
+                let err = unsafe {
+                    cuda_ffi::vib3_launch_rope_apply(
+                        self.q_proj_dev.as_mut_ptr(),
+                        self.k_proj_dev.as_mut_ptr(),
+                        head_dim as i32,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        self.d_position.as_ptr(), // device-side position
+                        rope_base,
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    return Err(Error::Cuda(format!(
+                        "vib3_launch_rope_apply failed (err={})",
+                        err
+                    )));
+                }
+
+                // Step 3: Append post-RoPE K/V to the GPU-resident KV cache
+                let err = unsafe {
+                    cuda_ffi::vib3_launch_kv_cache_append(
+                        self.gpu_kv_k[layer].as_mut_ptr(),
+                        self.gpu_kv_v[layer].as_mut_ptr(),
+                        self.k_proj_dev.as_ptr(),
+                        self.v_proj_dev.as_ptr(),
+                        self.max_kv_len as i32,
+                        head_dim as i32,
+                        num_kv_heads as i32,
+                        self.d_position.as_ptr(), // device-side position
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    return Err(Error::Cuda(format!(
+                        "vib3_launch_kv_cache_append failed (err={})",
+                        err
+                    )));
+                }
+
+                // Step 4: Decode attention — single-query GQA attention on GPU
+                // Output goes to attn_dev [num_heads * head_dim] FP16
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let err = unsafe {
+                    cuda_ffi::vib3_launch_decode_attention(
+                        self.q_proj_dev.as_ptr(),
+                        self.gpu_kv_k[layer].as_ptr(),
+                        self.gpu_kv_v[layer].as_ptr(),
+                        self.attn_dev.as_mut_ptr(),
+                        head_dim as i32,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        self.d_position.as_ptr(), // device-side position (kernel computes seq_len=pos+1)
+                        self.max_kv_len as i32,
+                        scale,
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    return Err(Error::Cuda(format!(
+                        "vib3_launch_decode_attention failed (err={})",
+                        err
+                    )));
+                }
+
+                // Step 5: O projection — GPU GEMV: attn_output × O_weights^T → hidden_state
+                let attn_dim = num_heads * head_dim;
+                if let Some((o_nvfp4_ptr, _o_m, o_nvfp4_k)) = o_nvfp4 {
+                    // NVFP4 path
+                    kernels::f16_to_f32(
+                        self.attn_dev.as_ptr(),
+                        self.dn_qkv_f32_dev.as_mut_ptr(),
+                        attn_dim,
+                        &self.stream,
+                    )?;
+                    kernels::quantize_activation_fp4_fast(
+                        self.dn_qkv_f32_dev.as_ptr(),
+                        self.preq_inner_act_fp4.as_mut_ptr(),
+                        self.preq_inner_act_scales.as_mut_ptr(),
+                        o_nvfp4_k,
+                        &self.stream,
+                    )?;
+                    kernels::gemv_mma_nvfp4_tiled(
+                        self.preq_inner_act_fp4.as_ptr(),
+                        self.preq_inner_act_scales.as_ptr(),
+                        o_nvfp4_ptr,
+                        self.layer_output_buf.as_mut_ptr(),
+                        o_nvfp4_k,
+                        hidden_dim,
+                        &self.stream,
+                    )?;
+                } else {
+                    kernels::linear_projection(
+                        self.attn_dev.as_ptr(),
+                        o_ptr,
+                        self.hidden_state.as_mut_ptr(),
+                        attn_dim,
+                        hidden_dim,
+                        &self.stream,
+                    )?;
+                }
             }
 
-            // Step 5: O projection — GPU GEMV: attn_output × O_weights^T → hidden_state
-            kernels::linear_projection(
-                self.attn_dev.as_ptr(),
-                o_ptr,
-                self.hidden_state.as_mut_ptr(),
-                hidden_dim,
-                hidden_dim,
-                &self.stream,
-            )?;
-
-            // Step 6: FP32 residual accumulation: hidden_state_f32 += f32(O_proj output)
-            kernels::residual_add_fp32(
-                self.hidden_state_f32.as_mut_ptr(),
-                self.hidden_state.as_ptr(),
-                hidden_dim,
-                &self.stream,
-            )?;
+            // FP32 residual accumulation
+            if o_nvfp4.is_some() {
+                // NVFP4 O proj output is already FP32 in layer_output_buf
+                kernels::residual_add_f32_f32(
+                    self.hidden_state_f32.as_mut_ptr(),
+                    self.layer_output_buf.as_ptr(),
+                    hidden_dim,
+                    &self.stream,
+                )?;
+            } else {
+                // FP16 O proj output: hidden_state_f32 += f32(hidden_state)
+                kernels::residual_add_fp32(
+                    self.hidden_state_f32.as_mut_ptr(),
+                    self.hidden_state.as_ptr(),
+                    hidden_dim,
+                    &self.stream,
+                )?;
+            }
 
             tracing::debug!("GPU decode attn ok: layer={}, pos={}", layer_idx, position);
             Ok(true)
@@ -2676,15 +4565,17 @@ impl Engine {
                 eps,
                 &self.stream,
             )?;
-            // FP32→FP16 RMSNorm: normalize in FP32, output FP16 for diagnostics
-            kernels::rms_norm_f32_to_f16(
-                self.hidden_state_f32.as_ptr(),
-                self.hidden_state.as_mut_ptr(),
-                norm_ptr,
-                hidden_dim,
-                eps,
-                &self.stream,
-            )?;
+            // FP32→FP16 RMSNorm: only needed for diagnostics, skip in fast path
+            if self.diag_enabled {
+                kernels::rms_norm_f32_to_f16(
+                    self.hidden_state_f32.as_ptr(),
+                    self.hidden_state.as_mut_ptr(),
+                    norm_ptr,
+                    hidden_dim,
+                    eps,
+                    &self.stream,
+                )?;
+            }
         } else {
             kernels::rms_norm_no_weight(
                 self.hidden_state.as_mut_ptr(),
@@ -2768,17 +4659,37 @@ impl Engine {
         // Route and execute experts
         let activation = self.run_router_for_layer(layer_idx).await?;
 
+        // Dump MoE intermediates for ALL tokens at layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; hidden_dim * 4];
+            // MoE normed input
+            self.moe_normed_f32.copy_to_host(&mut buf)?;
+            let _ = std::fs::write(format!("{}/vib3_moe_normed_L0_tok{}.bin", dump_dir, tok), &buf);
+            // Router expert IDs and weights
+            let expert_ids: Vec<u16> = activation.experts.iter().map(|(id, _)| *id).collect();
+            let expert_wts: Vec<f32> = activation.experts.iter().map(|(_, w)| *w).collect();
+            let id_bytes: Vec<u8> = expert_ids.iter().flat_map(|id| (*id as i32).to_le_bytes()).collect();
+            let wt_bytes: Vec<u8> = expert_wts.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{}/vib3_router_ids_L0_tok{}.bin", dump_dir, tok), &id_bytes);
+            let _ = std::fs::write(format!("{}/vib3_router_wts_L0_tok{}.bin", dump_dir, tok), &wt_bytes);
+        }
+
         let plan = self.planner.plan_layer(layer_idx, &activation).await?;
 
         // Diagnostic: log expert plan details for first decode step, first MoE layer
         // Also log for layers 1-10 at pos=0 to investigate explosion
+        // Also log L0-L2 at last prefill token (pos=4) for debugging
         if self.diag_enabled && ((self.decode_step == 1 && layer_idx == 1)
             || (self.position == 0 && layer_idx <= 10)
+            || (layer_idx <= 2 && self.position == 4)
             || (layer_idx == 5 || layer_idx == 6)) {
             tracing::info!(
                 "EXPERT PLAN DIAG L{} pos={}: {} experts activated, router=({:?})",
                 layer_idx, self.position, plan.experts.len(),
-                activation.experts.iter().map(|(id, w)| format!("e{}={:.4}", id, w)).collect::<Vec<_>>().join(", "),
+                activation.experts.iter().map(|(id, w)| format!("e{}={:.6}", id, w)).collect::<Vec<_>>().join(", "),
             );
             for (i, ep) in plan.experts.iter().enumerate() {
                 let up_pages = ep.pages.iter().filter(|p| p.id.segment == 0).count();
@@ -2794,11 +4705,37 @@ impl Engine {
         // Zero the layer output accumulator on device
         self.layer_output_buf.zero();
 
+        // Pre-quantize the MoE normalized hidden state for MMA: done once,
+        // reused by all 8 expert SwiGLU kernels (eliminates ~2304 warp amax
+        // reductions per layer from the MMA inner loop).
+        if self.model_config.expert_dtype == DType::NVFP4 {
+            kernels::quantize_activation_fp4_fast(
+                self.moe_normed_f32.as_ptr(),
+                self.preq_act_fp4.as_mut_ptr(),
+                self.preq_act_scales.as_mut_ptr(),
+                hidden_dim,
+                &self.stream,
+            )?;
+        }
+
         // Execute routed experts
         for (_i, expert_plan) in plan.experts.iter().enumerate() {
             self.execute_expert(expert_plan, hidden_dim).await?;
 
-            // Diagnostic: after each expert at layer 6, check accumulated output (now FP32)
+            // Diagnostic: after each expert at L0 or L6 for last prefill token, track per-expert accumulation
+            if self.diag_enabled && (layer_idx <= 2 && self.position == 4) {
+                self.stream.synchronize()?;
+                let mut out_buf = vec![0u8; hidden_dim * 4]; // FP32
+                self.layer_output_buf.copy_to_host(&mut out_buf)?;
+                let out_f32 = unsafe { std::slice::from_raw_parts(out_buf.as_ptr() as *const f32, hidden_dim) };
+                let l2 = out_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let max_abs = out_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                tracing::info!(
+                    "L{} EXPERT[{}] ACCUM pos={}: e{}*{:.6} -> accum L2={:.6}, max_abs={:.6}, first4=[{:.6},{:.6},{:.6},{:.6}]",
+                    layer_idx, _i, self.position, expert_plan.expert_id, expert_plan.weight, l2, max_abs,
+                    out_f32[0], out_f32[1], out_f32[2], out_f32[3],
+                );
+            }
             if self.diag_enabled && layer_idx == 6 && self.position == 26 {
                 self.stream.synchronize()?;
                 let mut out_buf = vec![0u8; hidden_dim * 4]; // FP32
@@ -2813,9 +4750,47 @@ impl Engine {
             }
         }
 
+        // ═══ DIAGNOSTIC: dump MoE output BEFORE shared expert ═══
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut out_buf = vec![0u8; hidden_dim * 4];
+            self.layer_output_buf.copy_to_host(&mut out_buf)?;
+            let _ = std::fs::write(
+                format!("{}/vib3_moe_routed_L0_tok{}.bin", dump_dir, tok),
+                &out_buf,
+            );
+        }
+
         // Run shared expert (unconditional, every token) if model has one
         if self.model_config.num_shared_experts > 0 {
             self.execute_shared_expert(layer_idx, hidden_dim).await?;
+        }
+
+        // ═══ DIAGNOSTIC: dump MoE output AFTER shared expert (full MoE output before residual) ═══
+        if self.diag_enabled && layer_idx <= 2 && self.position == 4 {
+            self.stream.synchronize()?;
+            let mut out_buf = vec![0u8; hidden_dim * 4];
+            self.layer_output_buf.copy_to_host(&mut out_buf)?;
+            let out_f32 = unsafe { std::slice::from_raw_parts(out_buf.as_ptr() as *const f32, hidden_dim) };
+            let l2 = out_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+            tracing::warn!(
+                "MOE_FULL L{} pos={}: L2={:.6}, first4=[{:.6},{:.6},{:.6},{:.6}]",
+                layer_idx, self.position, l2, out_f32[0], out_f32[1], out_f32[2], out_f32[3],
+            );
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let _ = std::fs::write(
+                format!("{}/vib3_moe_full_f32_L{}_pos4.bin", dump_dir, layer_idx),
+                &out_buf,
+            );
+            // Also dump the moe_normed_f32 (input to experts)
+            let mut normed_buf = vec![0u8; hidden_dim * 4];
+            self.moe_normed_f32.copy_to_host(&mut normed_buf)?;
+            let _ = std::fs::write(
+                format!("{}/vib3_moe_normed_f32_L{}_pos4.bin", dump_dir, layer_idx),
+                &normed_buf,
+            );
         }
 
         // Diagnostic: log layer output magnitude for decode step 1 or prefill layers 1-10 (now FP32)
@@ -2834,6 +4809,16 @@ impl Engine {
                 "MOE OUTPUT DIAG decode L{}: L2={:.4}, max_abs={:.4}, nan={}, zero={}/{}",
                 layer_idx, l2, max_abs, nans, zeros, hidden_dim,
             );
+        }
+
+        // Dump full MoE output for ALL tokens at layer 0
+        if self.diag_enabled && layer_idx == 0 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            let mut buf = vec![0u8; hidden_dim * 4];
+            self.layer_output_buf.copy_to_host(&mut buf)?;
+            let _ = std::fs::write(format!("{}/vib3_moe_out_L0_tok{}.bin", dump_dir, tok), &buf);
         }
 
         // FP32 residual accumulation: hidden_state_f32 += layer_output_f32
@@ -2982,6 +4967,71 @@ impl Engine {
         // For step 1+, the hidden_state contains the embedding of the previously
         // sampled token, which needs to go through all layers.
         if step > 0 {
+            // Update device-side position scalar (for CUDA graph compatibility).
+            // All position-dependent kernels (RoPE, KV append, decode attention)
+            // read position from this device pointer instead of kernel arguments.
+            #[cfg(feature = "cuda")]
+            {
+                let stream_ptr = self.stream.raw_ptr();
+                let err = unsafe {
+                    cuda_ffi::vib3_update_device_int32(
+                        self.d_position.as_mut_ptr(),
+                        self.position as i32,
+                        stream_ptr,
+                    )
+                };
+                if err != 0 {
+                    tracing::warn!("Failed to update device position (err={})", err);
+                }
+            }
+
+            // ── CUDA Graph fast path: replay cached graph for layer loop ──
+            #[cfg(feature = "cuda")]
+            let use_graph = self.cuda_graph_exec.is_some();
+            #[cfg(not(feature = "cuda"))]
+            let use_graph = false;
+
+            if use_graph {
+                // Replay the cached CUDA graph (all 48 layers in one launch)
+                #[cfg(feature = "cuda")]
+                {
+                    let exec = self.cuda_graph_exec.unwrap();
+                    let stream_ptr = self.stream.raw_ptr();
+                    let err = unsafe {
+                        cuda_ffi::vib3_cuda_graph_launch(exec, stream_ptr)
+                    };
+                    if err != 0 {
+                        tracing::warn!("CUDA graph launch failed (err={}), falling back to normal execution", err);
+                        // Fall through to normal execution below
+                    } else {
+                        // Graph launched successfully — skip the normal layer loop
+                        tracing::info!(
+                            "Token step={}: CUDA graph replay, total_layers=<graph>",
+                            step,
+                        );
+                    }
+                }
+            }
+
+            if !use_graph {
+            // ── Normal layer loop (also used for graph capture) ──
+            let capturing = step == 1 && !self.diag_enabled
+                && self.cuda_graph_exec.is_none()
+                && self.moe_page_table_dev.is_some();
+
+            #[cfg(feature = "cuda")]
+            if capturing {
+                let stream_ptr = self.stream.raw_ptr();
+                let err = unsafe {
+                    cuda_ffi::vib3_cuda_graph_begin_capture(stream_ptr)
+                };
+                if err != 0 {
+                    tracing::warn!("CUDA graph capture begin failed (err={}), running without graph", err);
+                } else {
+                    self.capturing_graph = true;
+                }
+            }
+
             // Run through all layers: attention + MoE interleaved per layer
             let mut attn_us: u64 = 0;
             let mut moe_us: u64 = 0;
@@ -3027,15 +5077,19 @@ impl Engine {
                             eps,
                             &self.stream,
                         )?;
-                        // FP32→FP16 RMSNorm: normalize in FP32, output FP16
-                        kernels::rms_norm_f32_to_f16(
-                            self.hidden_state_f32.as_ptr(),
-                            self.hidden_state.as_mut_ptr(),
-                            norm_ptr,
-                            hidden_dim,
-                            eps,
-                            &self.stream,
-                        )?;
+                        // FP16 norm only needed for diagnostics — the MoE path reads
+                        // moe_normed_f32 (FP32), and the next attention layer will
+                        // recompute hidden_state (FP16) from hidden_state_f32.
+                        if self.diag_enabled {
+                            kernels::rms_norm_f32_to_f16(
+                                self.hidden_state_f32.as_ptr(),
+                                self.hidden_state.as_mut_ptr(),
+                                norm_ptr,
+                                hidden_dim,
+                                eps,
+                                &self.stream,
+                            )?;
+                        }
                     } else {
                         // Fallback: FP32→FP16 then in-place FP16 norm (no gamma weights)
                         kernels::f32_to_f16(
@@ -3053,38 +5107,166 @@ impl Engine {
                     }
                     let norm_us = t_norm.elapsed().as_micros() as u64;
 
-                    // Get active expert activations for this layer
-                    let tr = Instant::now();
-                    let activation = self.run_router_for_layer(layer_idx).await?;
-                    let router_us = tr.elapsed().as_micros() as u64;
+                    // ── GPU-only MoE fast path: zero host sync ──
+                    // When the device-side page table is available, run router + experts
+                    // entirely on the GPU compute stream with no host synchronization.
+                    let (router_us, routed_us) = if self.moe_page_table_dev.is_some() {
+                        let tr = Instant::now();
+                        let top_k = self.model_config.num_active_experts as usize;
+                        let num_experts = self.model_config.num_experts as usize;
 
-                    // Collect expert IDs for mode detection
-                    for &(expert_id, _weight) in &activation.experts {
-                        self.token_expert_ids.push(expert_id);
-                    }
+                        // Determine scoring function
+                        let scoring_func = if self.model_config.scoring_func == "sigmoid" {
+                            kernels::RouterScoringFunc::Sigmoid {
+                                scaling_factor: self.model_config.routed_scaling_factor,
+                                normalize: self.model_config.norm_topk_prob,
+                            }
+                        } else {
+                            kernels::RouterScoringFunc::Softmax
+                        };
 
-                    // Submit lookahead for next MoE layer (mode-aware via planner)
-                    let t_look = Instant::now();
-                    let moe_offset = layer_idx - dense_layer_idx as u16;
-                    if moe_offset + 1 < num_moe_layers as u16 {
-                        self.planner.submit_lookahead(layer_idx + 1, &activation);
-                        self.planner.submit_cross_layer_prefetch(layer_idx);
-                    }
-                    let lookahead_us = t_look.elapsed().as_micros() as u64;
+                        // Load router weights
+                        self.ensure_shared_tensor_device(layer_idx, 3).await;
+                        if let Some((router_ptr, _)) = self.get_device_tensor(layer_idx, 3) {
+                            // Launch router on compute stream — no sync, no D2H
+                            kernels::run_router_gpu_topk_nosync(
+                                self.moe_normed_f32.as_ptr(),
+                                router_ptr,
+                                num_experts,
+                                hidden_dim,
+                                top_k,
+                                scoring_func,
+                                self.router_scores_dev.as_mut_ptr() as *mut f32,
+                                self.router_topk_ids_dev.as_mut_ptr(),
+                                self.router_topk_weights_dev.as_mut_ptr(),
+                                &self.stream,
+                            )?;
+                        }
+                        let router_t = tr.elapsed().as_micros() as u64;
 
-                    // Plan and execute expert computation
-                    let tp = Instant::now();
-                    let plan = self.planner.plan_layer(layer_idx, &activation).await?;
-                    let plan_us = tp.elapsed().as_micros() as u64;
+                        // Zero layer output + pre-quantize activation (same as old path)
+                        self.layer_output_buf.zero_async(&self.stream);
+                        kernels::quantize_activation_fp4_fast(
+                            self.moe_normed_f32.as_ptr(),
+                            self.preq_act_fp4.as_mut_ptr(),
+                            self.preq_act_scales.as_mut_ptr(),
+                            hidden_dim,
+                            &self.stream,
+                        )?;
 
-                    // Zero the layer output on device (async — no pipeline stall)
-                    self.layer_output_buf.zero_async(&self.stream);
+                        // Launch fused MoE: resolve + up + gate + swiglu + down
+                        let te = Instant::now();
+                        let expert_hidden_dim = self.model_config.expert_hidden_dim as usize;
+                        let moe_layer = (layer_idx - dense_layer_idx as u16) as usize;
+                        let page_table_ptr = self.moe_page_table_dev.as_ref().unwrap().as_ptr();
+                        kernels::moe_experts_fused_gpu(
+                            self.preq_act_fp4.as_ptr(),
+                            self.preq_act_scales.as_ptr(),
+                            page_table_ptr,
+                            self.router_topk_ids_dev.as_ptr(),
+                            self.router_topk_weights_dev.as_ptr(),
+                            moe_layer,
+                            num_experts,
+                            top_k,
+                            hidden_dim,
+                            expert_hidden_dim,
+                            hidden_dim,
+                            self.layer_output_buf.as_mut_ptr() as *mut f32,
+                            &self.stream,
+                        )?;
+                        let routed_t = te.elapsed().as_micros() as u64;
+                        (router_t, routed_t)
+                    } else {
+                        // ── Original host-sync MoE path (fallback) ──
+                        let tr = Instant::now();
+                        let activation = self.run_router_for_layer(layer_idx).await?;
+                        let router_t = tr.elapsed().as_micros() as u64;
 
-                    let te = Instant::now();
-                    for expert_plan in &plan.experts {
-                        self.execute_expert(expert_plan, hidden_dim).await?;
-                    }
-                    let routed_us = te.elapsed().as_micros() as u64;
+                        // Collect expert IDs for mode detection
+                        for &(expert_id, _weight) in &activation.experts {
+                            self.token_expert_ids.push(expert_id);
+                        }
+
+                        // Submit lookahead for next MoE layer
+                        let moe_offset = layer_idx - dense_layer_idx as u16;
+                        if moe_offset + 1 < num_moe_layers as u16 {
+                            self.planner.submit_lookahead(layer_idx + 1, &activation);
+                            self.planner.submit_cross_layer_prefetch(layer_idx);
+                        }
+
+                        // Plan and execute expert computation
+        let plan = self.planner.plan_layer(layer_idx, &activation).await?;
+
+                        self.layer_output_buf.zero_async(&self.stream);
+
+                        if self.model_config.expert_dtype == DType::NVFP4 {
+                            kernels::quantize_activation_fp4_fast(
+                                self.moe_normed_f32.as_ptr(),
+                                self.preq_act_fp4.as_mut_ptr(),
+                                self.preq_act_scales.as_mut_ptr(),
+                                hidden_dim,
+                                &self.stream,
+                            )?;
+                        }
+
+                        let te = Instant::now();
+                        let used_fused = if self.model_config.expert_dtype == DType::NVFP4
+                            && self.stream.is_real()
+                        {
+                            let expert_hidden_dim = self.model_config.expert_hidden_dim as usize;
+                            let mut fused_experts: Vec<(*const u8, *const u8, *const u8, f32)> = Vec::new();
+                            let mut all_single_page = true;
+                            for ep in &plan.experts {
+                                let mut up_ptr: *const u8 = std::ptr::null();
+                                let mut gate_ptr: *const u8 = std::ptr::null();
+                                let mut down_ptr: *const u8 = std::ptr::null();
+                                let mut up_count = 0;
+                                let mut gate_count = 0;
+                                let mut down_count = 0;
+                                for rp in &ep.pages {
+                                    match rp.id.segment {
+                                        0 => { up_ptr = rp.device_ptr as *const u8; up_count += 1; }
+                                        1 => { gate_ptr = rp.device_ptr as *const u8; gate_count += 1; }
+                                        2 => { down_ptr = rp.device_ptr as *const u8; down_count += 1; }
+                                        _ => {}
+                                    }
+                                }
+                                if up_count != 1 || gate_count != 1 || down_count != 1
+                                    || up_ptr.is_null() || gate_ptr.is_null() || down_ptr.is_null()
+                                {
+                                    all_single_page = false;
+                                    break;
+                                }
+                                fused_experts.push((up_ptr, gate_ptr, down_ptr, ep.weight));
+                            }
+                            if all_single_page && !fused_experts.is_empty() {
+                                kernels::moe_experts_fused(
+                                    self.preq_act_fp4.as_ptr(),
+                                    self.preq_act_scales.as_ptr(),
+                                    &fused_experts,
+                                    hidden_dim,
+                                    expert_hidden_dim,
+                                    hidden_dim,
+                                    self.layer_output_buf.as_mut_ptr() as *mut f32,
+                                    &self.stream,
+                                )?;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !used_fused {
+                            for expert_plan in &plan.experts {
+                                self.execute_expert(expert_plan, hidden_dim).await?;
+                            }
+                        }
+                        let routed_t = te.elapsed().as_micros() as u64;
+                        (router_t, routed_t)
+                    };
+                    let lookahead_us: u64 = 0;
+                    let plan_us: u64 = 0;
 
                     // Run shared expert (unconditional, every token)
                     let ts = Instant::now();
@@ -3092,6 +5274,28 @@ impl Engine {
                         self.execute_shared_expert(layer_idx, hidden_dim).await?;
                     }
                     let shared_us = ts.elapsed().as_micros() as u64;
+
+                    // Dump MoE intermediates for layer 0
+                    if self.diag_enabled && layer_idx == 0 {
+                        self.stream.synchronize()?;
+                        let dump_dir = "/home/brian/code/vib3/dump";
+                        let tok = self.position;
+                        // MoE normed input
+                        let mut buf = vec![0u8; hidden_dim * 4];
+                        self.moe_normed_f32.copy_to_host(&mut buf)?;
+                        let _ = std::fs::write(format!("{}/vib3_moe_normed_L0_tok{}.bin", dump_dir, tok), &buf);
+                        // MoE output (layer_output_buf, before residual add)
+                        self.layer_output_buf.copy_to_host(&mut buf)?;
+                        let _ = std::fs::write(format!("{}/vib3_moe_out_L0_tok{}.bin", dump_dir, tok), &buf);
+                        // Router top-k ids and weights
+                        let top_k = self.model_config.num_active_experts as usize;
+                        let mut id_buf = vec![0u8; top_k * 4]; // i32
+                        self.router_topk_ids_dev.copy_to_host(&mut id_buf)?;
+                        let _ = std::fs::write(format!("{}/vib3_router_ids_L0_tok{}.bin", dump_dir, tok), &id_buf);
+                        let mut wt_buf = vec![0u8; top_k * 4]; // f32
+                        self.router_topk_weights_dev.copy_to_host(&mut wt_buf)?;
+                        let _ = std::fs::write(format!("{}/vib3_router_wts_L0_tok{}.bin", dump_dir, tok), &wt_buf);
+                    }
 
                     // FP32 residual accumulation: hidden_state_f32 += layer_output_f32
                     let t_res = Instant::now();
@@ -3162,6 +5366,48 @@ impl Engine {
                 moe_us as f64 / 1000.0,
                 (attn_us + moe_us) as f64 / 1000.0,
             );
+
+            // ── End CUDA graph capture and instantiate ──
+            #[cfg(feature = "cuda")]
+            if capturing {
+                self.capturing_graph = false;
+                let stream_ptr = self.stream.raw_ptr();
+                let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
+                let err = unsafe {
+                    cuda_ffi::vib3_cuda_graph_end_capture(stream_ptr, &mut graph)
+                };
+                if err != 0 || graph.is_null() {
+                    tracing::warn!("CUDA graph capture end failed (err={}), running without graph", err);
+                } else {
+                    let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
+                    let err2 = unsafe {
+                        cuda_ffi::vib3_cuda_graph_instantiate(&mut exec, graph)
+                    };
+                    if err2 != 0 || exec.is_null() {
+                        tracing::warn!("CUDA graph instantiate failed (err={})", err2);
+                        unsafe { cuda_ffi::vib3_cuda_graph_destroy(graph); }
+                    } else {
+                        tracing::info!("CUDA graph captured and instantiated successfully");
+                        // Launch the graph to actually execute this step's work
+                        // (capture didn't execute the kernels, it only recorded them)
+                        let err3 = unsafe {
+                            cuda_ffi::vib3_cuda_graph_launch(exec, stream_ptr)
+                        };
+                        if err3 != 0 {
+                            tracing::warn!("Initial CUDA graph launch failed (err={})", err3);
+                            unsafe {
+                                cuda_ffi::vib3_cuda_graph_exec_destroy(exec);
+                                cuda_ffi::vib3_cuda_graph_destroy(graph);
+                            }
+                        } else {
+                            self.cuda_graph_exec = Some(exec);
+                            self.cuda_graph = Some(graph);
+                        }
+                    }
+                }
+            }
+
+            } // end if !use_graph
         } // end if step > 0
 
         // ── Mode detection: record activations and check for transitions ──
@@ -3211,65 +5457,53 @@ impl Engine {
             .fetch_add(compute_ns, Ordering::Relaxed);
 
         // Diagnostic: check hidden state after all layers (first few tokens)
+        // Gated behind diag_enabled to avoid pipeline stall from stream.synchronize()
         let hidden_dim = self.model_config.hidden_dim as usize;
         let hidden_bytes = hidden_dim * std::mem::size_of::<f16>();
-        if step < 5 {
+        if self.diag_enabled && step < 5 {
             self.stream.synchronize()?;
-            let mut diag_buf = vec![0u8; hidden_bytes];
-            self.hidden_state.copy_to_host(&mut diag_buf)?;
-            let h_f16 = unsafe {
-                std::slice::from_raw_parts(diag_buf.as_ptr() as *const f16, hidden_dim)
+            let f32_bytes = hidden_dim * 4;
+            let mut diag_buf_f32 = vec![0u8; f32_bytes];
+            self.hidden_state_f32.copy_to_host(&mut diag_buf_f32)?;
+            let h_f32 = unsafe {
+                std::slice::from_raw_parts(diag_buf_f32.as_ptr() as *const f32, hidden_dim)
             };
-            let h_max = h_f16.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
-            let h_min = h_f16.iter().map(|v| v.to_f32()).fold(f32::INFINITY, f32::min);
-            let h_mean = h_f16.iter().map(|v| v.to_f32()).sum::<f32>() / hidden_dim as f32;
-            let h_nan = h_f16.iter().filter(|v| v.to_f32().is_nan()).count();
-            let h_zero = h_f16.iter().filter(|v| v.to_f32() == 0.0).count();
+            let h_max = h_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let h_min = h_f32.iter().cloned().fold(f32::INFINITY, f32::min);
+            let h_mean = h_f32.iter().sum::<f32>() / hidden_dim as f32;
+            let h_l2 = h_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let h_nan = h_f32.iter().filter(|v| v.is_nan()).count();
             tracing::info!(
-                "Hidden state step={} (after all layers, before final norm): min={:.4}, max={:.4}, mean={:.6}, nan={}, zero={}/{}",
-                step, h_min, h_max, h_mean, h_nan, h_zero, hidden_dim
+                "Hidden state step={} (after all layers, before final norm): min={:.4}, max={:.4}, mean={:.6}, L2={:.4}, nan={}, first4=[{:.6},{:.6},{:.6},{:.6}]",
+                step, h_min, h_max, h_mean, h_l2, h_nan,
+                h_f32[0], h_f32[1], h_f32[2], h_f32[3],
             );
+            if step == 0 {
+                let dump_path = "/home/brian/code/vib3/dump/vib3_final_hidden_f32_step0.bin";
+                let _ = std::fs::write(dump_path, &diag_buf_f32);
+                tracing::info!("DUMPED final FP32 hidden state to {} ({} bytes)", dump_path, f32_bytes);
+            }
         }
 
+        let _t_norm_start = std::time::Instant::now();
+
         // Apply final RMSNorm: FP32 → normalize in FP32 → FP16 for logit projection
-        // The final norm is stored at layer=0xFFFF, segment=8
+        // The final norm is stored at layer=0xFFFF, segment=8 (new convention)
+        // or layer=0, segment=8 (legacy GGUF conversion). Try both.
         let eps = self.model_config.rms_norm_eps;
 
+        // Load final norm weight: try layer=0xFFFF (new convention) then layer=0 (legacy).
+        // NOTE: We must NOT hold raw pointers across .await boundaries (Send requirement).
         self.ensure_shared_tensor_device(0xFFFF, 8).await;
-        if let Some((norm_ptr, _norm_size)) = self.get_device_tensor(0xFFFF, 8) {
-            // Override final norm weights from external file if available.
-            // The .vib3 page for the final norm is corrupted due to vision tensor
-            // pages being co-stored in segment 8. Load correct weights from a
-            // standalone FP16 binary file generated from the safetensors source.
+        if self.get_device_tensor(0xFFFF, 8).is_none() {
+            // Fallback: old GGUF conversions stored final norm at layer=0
+            self.ensure_shared_tensor_device(0, 8).await;
+        }
+        let norm_tensor = self.get_device_tensor(0xFFFF, 8)
+            .or_else(|| self.get_device_tensor(0, 8));
+        if let Some((norm_ptr, _norm_size)) = norm_tensor {
             if step == 0 {
-                let norm_file = std::path::Path::new("/final_norm_weight.fp16.bin");
-                if norm_file.exists() {
-                    match std::fs::read(norm_file) {
-                        Ok(data) if data.len() == hidden_dim * 2 => {
-                            if let Err(e) = cuda_ffi::memcpy_h2d_sync(
-                                norm_ptr as *mut u8,
-                                data.as_ptr(),
-                                data.len(),
-                            ) {
-                                tracing::warn!("Failed to upload final norm override: {}", e);
-                            } else {
-                                tracing::info!(
-                                    "Final norm: loaded correct weights from {} ({} bytes)",
-                                    norm_file.display(), data.len(),
-                                );
-                            }
-                        }
-                        Ok(data) => {
-                            tracing::warn!(
-                                "Final norm override file has wrong size: {} (expected {})",
-                                data.len(), hidden_dim * 2,
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to read final norm override: {}", e);
-                        }
-                    }
-                }
+                tracing::info!("Final norm: loaded from .vib3 ({} bytes)", _norm_size);
             }
             kernels::rms_norm_f32_to_f16(
                 self.hidden_state_f32.as_ptr(),
@@ -3295,19 +5529,143 @@ impl Engine {
             )?;
         }
 
+        // Dump post-norm FP16 hidden state for step 0
+        if step == 0 && self.diag_enabled {
+            self.stream.synchronize()?;
+            let mut norm_buf = vec![0u8; hidden_bytes];
+            self.hidden_state.copy_to_host(&mut norm_buf)?;
+            let norm_f16 = unsafe {
+                std::slice::from_raw_parts(norm_buf.as_ptr() as *const f16, hidden_dim)
+            };
+            let norm_l2 = norm_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+            tracing::info!(
+                "Post-norm FP16 hidden state step=0: L2={:.4}, first4=[{:.6},{:.6},{:.6},{:.6}]",
+                norm_l2, norm_f16[0].to_f32(), norm_f16[1].to_f32(), norm_f16[2].to_f32(), norm_f16[3].to_f32(),
+            );
+            let dump_path = "/home/brian/code/vib3/dump/vib3_post_norm_f16_step0.bin";
+            let _ = std::fs::write(dump_path, &norm_buf);
+            tracing::info!("DUMPED post-norm FP16 hidden state to {}", dump_path);
+        }
+
+        let t_norm_done = std::time::Instant::now();
+
+        // Sync before logits to separate layer GPU time from lm_head time
+        self.stream.synchronize()?;
+        let t_sync_done = std::time::Instant::now();
+
         // Compute logits from hidden state (both in VRAM for GPU dispatch)
         let vocab_size = self.model_config.vocab_size as usize;
+        let logits_bytes = vocab_size * std::mem::size_of::<f32>();
 
-        // Load lm_head weights to device
+        // Load lm_head weights to device and convert to NVFP4 on first use
         self.ensure_shared_tensor_device(0, 11).await;
-        let logits = if let Some((lm_head_ptr, _)) = self.get_device_tensor(0, 11) {
-            // Real lm_head projection — both hidden_state and lm_head on device
-            kernels::compute_logits(
+
+        // Lazily convert lm_head to NVFP4 on first token
+        if self.lm_head_nvfp4.is_none() {
+            if let Some((lm_head_ptr, lm_head_size)) = self.get_device_tensor(0, 11) {
+                let expected_fp16 = vocab_size * hidden_dim * 2;
+                if lm_head_size == expected_fp16 {
+                    tracing::info!(
+                        "Converting lm_head to NVFP4: {}x{} FP16 ({:.1} MB) → NVFP4",
+                        vocab_size, hidden_dim, lm_head_size as f64 / (1024.0 * 1024.0)
+                    );
+                    match kernels::fp16_to_nvfp4_weight(lm_head_ptr, vocab_size, hidden_dim, &self.stream) {
+                        Ok(nvfp4_buf) => {
+                            self.stream.synchronize()?;
+                            tracing::info!(
+                                "lm_head NVFP4 conversion complete: {:.1} MB",
+                                nvfp4_buf.size() as f64 / (1024.0 * 1024.0)
+                            );
+                            // Repack lm_head FP4 data to tiled layout for coalesced GEMV
+                            let fp4_data_size = vocab_size * hidden_dim.div_ceil(2);
+                            match DeviceBuffer::new(fp4_data_size) {
+                                Ok(temp_buf) => {
+                                    if let Err(e) = kernels::repack_row_to_tiled(
+                                        nvfp4_buf.as_mut_ptr(),
+                                        temp_buf.as_mut_ptr(),
+                                        vocab_size,
+                                        hidden_dim,
+                                        &self.stream,
+                                    ) {
+                                        tracing::warn!("lm_head tiled repack failed: {}", e);
+                                    } else {
+                                        self.stream.synchronize()?;
+                                        tracing::info!("lm_head tiled repack complete");
+                                    }
+                                    // temp_buf dropped here, frees VRAM
+                                }
+                                Err(e) => {
+                                    tracing::warn!("lm_head tiled repack temp alloc failed: {}", e);
+                                }
+                            }
+                            self.lm_head_nvfp4 = Some(nvfp4_buf);
+                        }
+                        Err(e) => {
+                            tracing::warn!("lm_head NVFP4 conversion failed: {}, using FP16 fallback", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let logits = if let Some(ref nvfp4_buf) = self.lm_head_nvfp4 {
+            // NVFP4 path: hidden_state FP16 → FP32 → quantize FP4 → MMA GEMV → FP32 logits
+            // Step 1: Convert hidden_state from FP16 to FP32
+            kernels::f16_to_f32(
                 self.hidden_state.as_ptr(),
-                lm_head_ptr,
-                vocab_size,
+                self.attn_normed_f32.as_mut_ptr(),
                 hidden_dim,
-            )
+                &self.stream,
+            )?;
+            // Step 2: Quantize FP32 → FP4 split-half + E8M0 scales
+            kernels::quantize_activation_fp4_fast(
+                self.attn_normed_f32.as_ptr(),
+                self.preq_act_fp4.as_mut_ptr(),
+                self.preq_act_scales.as_mut_ptr(),
+                hidden_dim,
+                &self.stream,
+            )?;
+            // Step 3: MMA GEMV — NVFP4 lm_head × FP4 activation → FP32 logits
+            kernels::gemv_mma_nvfp4_tiled(
+                self.preq_act_fp4.as_ptr(),
+                self.preq_act_scales.as_ptr(),
+                nvfp4_buf.as_ptr(),
+                self.logits_dev.as_mut_ptr(),
+                hidden_dim,
+                vocab_size,
+                &self.stream,
+            )?;
+            self.stream.synchronize()?;
+            let mut logits = vec![0.0f32; vocab_size];
+            cuda_ffi::memcpy_d2h(
+                logits.as_mut_ptr() as *mut u8,
+                self.logits_dev.as_ptr(),
+                logits_bytes,
+            )?;
+            logits
+        } else if let Some((lm_head_ptr, _lm_head_size)) = self.get_device_tensor(0, 11) {
+            // FP16 fallback: scalar router GEMV
+            let err = unsafe {
+                cuda_ffi::vib3_launch_router_gemv(
+                    self.hidden_state.as_ptr(),
+                    lm_head_ptr,
+                    self.logits_dev.as_mut_ptr() as *mut f32,
+                    hidden_dim as i32,
+                    vocab_size as i32,
+                    self.stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!("lm_head GEMV failed (err={})", err)));
+            }
+            self.stream.synchronize()?;
+            let mut logits = vec![0.0f32; vocab_size];
+            cuda_ffi::memcpy_d2h(
+                logits.as_mut_ptr() as *mut u8,
+                self.logits_dev.as_ptr(),
+                logits_bytes,
+            )?;
+            logits
         } else {
             // Fallback: D2H hidden_state, compute logits on CPU
             self.stream.synchronize()?;
@@ -3336,8 +5694,8 @@ impl Engine {
             step,
         );
 
-        // Debug: log logit distribution stats for first few tokens
-        if step < 5 || step % 10 == 0 {
+        // Debug: log logit distribution stats (gated — sorting 248K elements is expensive)
+        if self.diag_enabled && (step < 5 || step % 10 == 0) {
             let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let min_logit = logits.iter().cloned().fold(f32::INFINITY, f32::min);
             let mean_logit = logits.iter().sum::<f32>() / logits.len() as f32;
@@ -3349,16 +5707,28 @@ impl Engine {
                 indexed.into_iter().take(5).collect()
             };
             tracing::info!(
-                "Logits step={}: min={:.4}, max={:.4}, mean={:.4}, nan={}, inf={}, top5={:?}",
-                step, min_logit, max_logit, mean_logit, nan_count, inf_count, top5
+                "Logits step={}: min={:.4}, max={:.4}, mean={:.4}, nan={}, inf={}, total_logits={}, top5={:?}",
+                step, min_logit, max_logit, mean_logit, nan_count, inf_count, logits.len(), top5
             );
+            let think_tok = 248068usize;
+            if think_tok < logits.len() {
+                tracing::info!("Logits step={}: <think>(248068) logit={:.4}", step, logits[think_tok]);
+            } else {
+                tracing::warn!("Logits step={}: <think>(248068) OUT OF RANGE (vocab_size={})", step, logits.len());
+            }
         }
 
+        let t_logits_done = std::time::Instant::now();
+
         let token_id = self.sampler.sample(&logits, params);
+        let t_sample_done = std::time::Instant::now();
         tracing::info!(
-            "Token step={}: id={}, total={:.1}ms",
+            "Token step={}: id={}, total={:.1}ms (layers_gpu_sync={:.1}ms, lm_head+logits={:.1}ms, sample={:.1}ms)",
             step, token_id,
             compute_start.elapsed().as_secs_f64() * 1000.0,
+            (t_sync_done - t_norm_done).as_secs_f64() * 1000.0,
+            (t_logits_done - t_sync_done).as_secs_f64() * 1000.0,
+            (t_sample_done - t_logits_done).as_secs_f64() * 1000.0,
         );
         self.stats.tokens_generated.fetch_add(1, Ordering::Relaxed);
 
@@ -3542,6 +5912,93 @@ impl Engine {
         }
         // ═══ END VRAM vs DISK COMPARISON ═══
 
+        // ═══ FAST PATH: Batched expert (single C call) for NVFP4 ═══
+        // Requires pre-repacked split-half weights (done at load time).
+        // Each expert has exactly 1 up, 1 gate, 1 down page (all single-page).
+        if self.model_config.expert_dtype == DType::NVFP4
+            && up_pages.len() == 1
+            && gate_pages.len() == 1
+            && down_pages.len() == 1
+        {
+            let up_ptr = up_pages[0].device_ptr;
+            let gate_ptr = gate_pages[0].device_ptr;
+            let down_ptr = down_pages[0].device_ptr;
+
+            if !up_ptr.is_null() && !gate_ptr.is_null() && !down_ptr.is_null() {
+                let expert_hidden_dim = self.model_config.expert_hidden_dim as usize;
+
+                // ═══ SCALE OFFSET DIAGNOSTIC ═══
+                if self.diag_enabled && self.position == 0 && engine_layer == 0 {
+                    self.stream.synchronize()?;
+                    let packed_k_in = hidden_dim / 2;    // 1024
+                    let fp4_data_size = packed_k_in * expert_hidden_dim; // 1024 * 512 = 524288
+                    let num_groups = hidden_dim / 32;     // 64
+                    let scale_data_size = expert_hidden_dim * num_groups * 2; // 512 * 64 * 2 = 65536
+                    let total_expected = fp4_data_size + scale_data_size; // 589824
+
+                    // Read bytes at the computed scale offset
+                    let scale_offset = fp4_data_size;
+                    let check_bytes = 32usize;
+                    let mut scale_buf = vec![0u8; check_bytes];
+                    // SAFETY: reading from device pointer at known offset
+                    let _ = crate::compute::cuda_ffi::memcpy_d2h(
+                        scale_buf.as_mut_ptr(),
+                        unsafe { (up_ptr as *const u8).add(scale_offset) },
+                        check_bytes,
+                    );
+                    // Also read 32 bytes from 16 bytes BEFORE scale offset (should be FP4 data)
+                    let mut pre_scale_buf = vec![0u8; check_bytes];
+                    if scale_offset >= 16 {
+                        let _ = crate::compute::cuda_ffi::memcpy_d2h(
+                            pre_scale_buf.as_mut_ptr(),
+                            unsafe { (up_ptr as *const u8).add(scale_offset - 16) },
+                            check_bytes,
+                        );
+                    }
+                    // Read page catalog entry raw_size
+                    let up_pid = &up_pages[0].id;
+                    let catalog = self.model_file.page_catalog();
+                    let raw_sz = catalog.iter()
+                        .find(|e| e.layer == up_pid.layer && e.expert == up_pid.expert && e.segment == up_pid.segment && e.page_idx == up_pid.page_idx)
+                        .map(|e| e.raw_size)
+                        .unwrap_or(0);
+
+                    tracing::error!(
+                        "SCALE_OFFSET_DIAG L{} e{}: fp4_data={}, scale_data={}, total_expected={}, page_raw_size={}, \
+                         at_scale_offset={:02x?}, pre_scale={:02x?}, expert_hidden_dim={}, hidden_dim={}, row_count={}",
+                        engine_layer, expert_plan.expert_id,
+                        fp4_data_size, scale_data_size, total_expected, raw_sz,
+                        &scale_buf[..16], &pre_scale_buf[..16],
+                        expert_hidden_dim, hidden_dim, up_pages[0].row_count,
+                    );
+                }
+                // ═══ END SCALE OFFSET DIAGNOSTIC ═══
+
+                kernels::expert_batched(
+                    self.preq_act_fp4.as_ptr(),
+                    self.preq_act_scales.as_ptr(),
+                    up_ptr as *const u8,
+                    gate_ptr as *const u8,
+                    down_ptr as *const u8,
+                    self.layer_output_buf.as_mut_ptr() as *mut f32,
+                    expert_plan.weight,
+                    hidden_dim,          // k_in
+                    expert_hidden_dim,   // m_mid (up/gate output rows)
+                    hidden_dim,          // m_out (down output rows)
+                    &self.stream,
+                )?;
+
+                // Update prediction for pages used by this expert
+                for rp in &expert_plan.pages {
+                    self.buffer_mgr
+                        .update_prediction(&rp.id, expert_plan.weight);
+                }
+
+                return Ok(());
+            }
+        }
+        // ═══ END FAST PATH ═══
+
         // Zero the expert output buffer on device (async — no pipeline stall)
         self.expert_output_buf.zero_async(&self.stream);
 
@@ -3604,25 +6061,51 @@ impl Engine {
             // ═══ END WEIGHT PAGE DATA DIAGNOSTIC ═══
 
             if !up_page.device_ptr.is_null() && !gate_page.device_ptr.is_null() {
-                // FP32-input SwiGLU: reads FP32 moe_normed_f32, writes FP16 expert intermediate
-                // NOTE: segment 0 = w1 = gate_proj (SiLU input), segment 1 = w3 = up_proj
-                // The kernel signature is (input, up_weight, gate_weight) where SiLU is applied to gate.
-                // So we pass: gate_page (w3=up_proj) as up_weight, up_page (w1=gate_proj) as gate_weight.
-                kernels::partial_swiglu_f32(
-                    self.moe_normed_f32.as_ptr(),
-                    gate_page.device_ptr as *const u8,  // w3 = up_proj (multiplied directly)
-                    up_page.device_ptr as *const u8,    // w1 = gate_proj (SiLU applied)
-                    // SAFETY: byte_offset is within expert_output_buf bounds
-                    unsafe { self.expert_output_buf.as_mut_ptr().add(byte_offset) },
-                    hidden_dim,
-                    m_slice,
-                    self.model_config.expert_dtype,
-                    &self.stream,
-                    Some((
-                        self.swiglu_up_tmp.as_mut_ptr(),
-                        self.swiglu_gate_tmp.as_mut_ptr(),
-                    )),
-                )?;
+                // Segment 0 = ffn_up_exps = up_proj = w3 (linear multiply)
+                // Segment 1 = ffn_gate_exps = gate_proj = w1 (SiLU applied)
+                if self.model_config.expert_dtype == DType::NVFP4 {
+                    // Blackwell MMA path with pre-quantized activations.
+                    // The activation was pre-quantized once before the expert loop.
+                    let f32_byte_offset = up_page.row_start as usize * std::mem::size_of::<f32>();
+                    let mma_result = kernels::fused_swiglu_mma_nvfp4_preq(
+                        self.preq_act_fp4.as_ptr(),
+                        self.preq_act_scales.as_ptr(),
+                        up_page.device_ptr as *const u8,
+                        gate_page.device_ptr as *const u8,
+                        unsafe { self.expert_output_f32_buf.as_mut_ptr().add(f32_byte_offset) },
+                        hidden_dim,
+                        m_slice,
+                        &self.stream,
+                    );
+                    if mma_result.is_err() {
+                        // Fallback: software FP4 dequant path
+                        kernels::partial_swiglu_f32_f32out(
+                            self.moe_normed_f32.as_ptr(),
+                            up_page.device_ptr as *const u8,
+                            gate_page.device_ptr as *const u8,
+                            unsafe { self.expert_output_f32_buf.as_mut_ptr().add(f32_byte_offset) },
+                            hidden_dim,
+                            m_slice,
+                            &self.stream,
+                        )?;
+                    }
+                } else {
+                    // FP16 output path for non-NVFP4 weights (FP16, INT4, etc.)
+                    kernels::partial_swiglu_f32(
+                        self.moe_normed_f32.as_ptr(),
+                        up_page.device_ptr as *const u8,
+                        gate_page.device_ptr as *const u8,
+                        unsafe { self.expert_output_buf.as_mut_ptr().add(byte_offset) },
+                        hidden_dim,
+                        m_slice,
+                        self.model_config.expert_dtype,
+                        &self.stream,
+                        Some((
+                            self.swiglu_up_tmp.as_mut_ptr(),
+                            self.swiglu_gate_tmp.as_mut_ptr(),
+                        )),
+                    )?;
+                }
             }
         }
 
@@ -3631,95 +6114,187 @@ impl Engine {
         if self.diag_enabled && self.position <= 1 && (engine_layer <= 2 || engine_layer == 31) {
             self.stream.synchronize()?;
             let expert_hidden_dim_diag = self.model_config.expert_hidden_dim as usize;
-            let mut inter_buf = vec![0u8; expert_hidden_dim_diag * 2]; // FP16
-            self.expert_output_buf.copy_to_host(&mut inter_buf)?;
-            let inter_f16 = unsafe { std::slice::from_raw_parts(inter_buf.as_ptr() as *const f16, expert_hidden_dim_diag) };
-            let l2 = inter_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
-            let max_abs = inter_f16.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
-            let zeros = inter_f16.iter().filter(|v| v.to_f32() == 0.0).count();
-            let first4: Vec<f32> = inter_f16[..4.min(expert_hidden_dim_diag)].iter().map(|v| v.to_f32()).collect();
-            tracing::warn!(
-                "SWIGLU_INTER DIAG L{} pos={} e{}: L2={:.6}, max_abs={:.6}, zeros={}/{}, up_pages={}, gate_pages={}, first4={:?}",
-                engine_layer, self.position, expert_plan.expert_id, l2, max_abs, zeros, expert_hidden_dim_diag,
-                up_pages.len(), gate_pages.len(), first4,
-            );
-            // Also check the swiglu temp buffers (up_result, gate_result for INT4 decomposed path)
-            let tmp_check_size = (expert_hidden_dim_diag * 2).min(self.swiglu_up_tmp.size());
-            if tmp_check_size > 0 {
-                let mut up_tmp_buf = vec![0u8; tmp_check_size];
-                self.swiglu_up_tmp.copy_to_host(&mut up_tmp_buf)?;
-                let up_tmp_f16 = unsafe { std::slice::from_raw_parts(up_tmp_buf.as_ptr() as *const f16, tmp_check_size / 2) };
-                let up_l2 = up_tmp_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
-                let mut gate_tmp_buf = vec![0u8; tmp_check_size];
-                self.swiglu_gate_tmp.copy_to_host(&mut gate_tmp_buf)?;
-                let gate_tmp_f16 = unsafe { std::slice::from_raw_parts(gate_tmp_buf.as_ptr() as *const f16, tmp_check_size / 2) };
-                let gate_l2 = gate_tmp_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+            if self.model_config.expert_dtype == DType::NVFP4 {
+                // FP32 path diagnostic
+                let mut inter_buf = vec![0u8; expert_hidden_dim_diag * 4]; // FP32
+                self.expert_output_f32_buf.copy_to_host(&mut inter_buf)?;
+                let inter_f32 = unsafe { std::slice::from_raw_parts(inter_buf.as_ptr() as *const f32, expert_hidden_dim_diag) };
+                let l2 = inter_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let max_abs = inter_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let zeros = inter_f32.iter().filter(|v| **v == 0.0).count();
+                let first4: Vec<f32> = inter_f32[..4.min(expert_hidden_dim_diag)].to_vec();
                 tracing::warn!(
-                    "  SWIGLU TEMPS: up_tmp L2={:.6}, gate_tmp L2={:.6} (check_size={})",
-                    up_l2, gate_l2, tmp_check_size,
+                    "SWIGLU_INTER DIAG L{} pos={} e{}: L2={:.6}, max_abs={:.6}, zeros={}/{}, up_pages={}, gate_pages={}, first4={:?} (FP32 path)",
+                    engine_layer, self.position, expert_plan.expert_id, l2, max_abs, zeros, expert_hidden_dim_diag,
+                    up_pages.len(), gate_pages.len(), first4,
                 );
+            } else {
+                // FP16 path diagnostic
+                let mut inter_buf = vec![0u8; expert_hidden_dim_diag * 2]; // FP16
+                self.expert_output_buf.copy_to_host(&mut inter_buf)?;
+                let inter_f16 = unsafe { std::slice::from_raw_parts(inter_buf.as_ptr() as *const f16, expert_hidden_dim_diag) };
+                let l2 = inter_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+                let max_abs = inter_f16.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                let zeros = inter_f16.iter().filter(|v| v.to_f32() == 0.0).count();
+                let first4: Vec<f32> = inter_f16[..4.min(expert_hidden_dim_diag)].iter().map(|v| v.to_f32()).collect();
+                tracing::warn!(
+                    "SWIGLU_INTER DIAG L{} pos={} e{}: L2={:.6}, max_abs={:.6}, zeros={}/{}, up_pages={}, gate_pages={}, first4={:?}",
+                    engine_layer, self.position, expert_plan.expert_id, l2, max_abs, zeros, expert_hidden_dim_diag,
+                    up_pages.len(), gate_pages.len(), first4,
+                );
+                // Also check the swiglu temp buffers (up_result, gate_result for INT4 decomposed path)
+                let tmp_check_size = (expert_hidden_dim_diag * 2).min(self.swiglu_up_tmp.size());
+                if tmp_check_size > 0 {
+                    let mut up_tmp_buf = vec![0u8; tmp_check_size];
+                    self.swiglu_up_tmp.copy_to_host(&mut up_tmp_buf)?;
+                    let up_tmp_f16 = unsafe { std::slice::from_raw_parts(up_tmp_buf.as_ptr() as *const f16, tmp_check_size / 2) };
+                    let up_l2 = up_tmp_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+                    let mut gate_tmp_buf = vec![0u8; tmp_check_size];
+                    self.swiglu_gate_tmp.copy_to_host(&mut gate_tmp_buf)?;
+                    let gate_tmp_f16 = unsafe { std::slice::from_raw_parts(gate_tmp_buf.as_ptr() as *const f16, tmp_check_size / 2) };
+                    let gate_l2 = gate_tmp_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+                    tracing::warn!(
+                        "  SWIGLU TEMPS: up_tmp L2={:.6}, gate_tmp L2={:.6} (check_size={})",
+                        up_l2, gate_l2, tmp_check_size,
+                    );
+                }
             }
         }
 
         // Apply down_proj: project expert_hidden_dim back to hidden_dim.
         // Uses pre-allocated down_proj_buf (DeviceBuffer in VRAM).
         let expert_hidden_dim = self.model_config.expert_hidden_dim as usize;
-        self.down_proj_buf.zero_async(&self.stream);
+        if self.model_config.expert_dtype == DType::NVFP4 {
+            // FP32 path: zero FP32 buffer, accumulate FP32→FP32
+            self.down_proj_f32_buf.zero_async(&self.stream);
+
+            // Pre-quantize the SwiGLU output for down_proj MMA
+            // (same activation across all down_proj pages of this expert)
+            kernels::quantize_activation_fp4(
+                self.expert_output_f32_buf.as_ptr(),
+                self.preq_down_act_fp4.as_mut_ptr(),
+                self.preq_down_act_scales.as_mut_ptr(),
+                expert_hidden_dim,
+                &self.stream,
+            )?;
+        } else {
+            self.down_proj_buf.zero_async(&self.stream);
+        }
 
         for down_page in &down_pages {
             let m_slice = down_page.row_count as usize;
             let row_start = down_page.row_start as usize;
-            let byte_offset = row_start * std::mem::size_of::<f16>();
 
             if !down_page.device_ptr.is_null() {
-                kernels::partial_matmul(
-                    self.expert_output_buf.as_ptr(),
-                    down_page.device_ptr as *const u8,
-                    // SAFETY: byte_offset is within down_proj_buf bounds
-                    unsafe { self.down_proj_buf.as_mut_ptr().add(byte_offset) },
-                    expert_hidden_dim,
-                    m_slice,
-                    self.model_config.expert_dtype,
-                    &self.stream,
-                )?;
+                if self.model_config.expert_dtype == DType::NVFP4 {
+                    // Pre-quantized MMA path for down_proj
+                    let f32_byte_offset = row_start * std::mem::size_of::<f32>();
+                    let mma_result = kernels::gemv_mma_nvfp4_preq(
+                        self.preq_down_act_fp4.as_ptr(),
+                        self.preq_down_act_scales.as_ptr(),
+                        down_page.device_ptr as *const u8,
+                        unsafe { self.down_proj_f32_buf.as_mut_ptr().add(f32_byte_offset) },
+                        expert_hidden_dim,
+                        m_slice,
+                        &self.stream,
+                    );
+                    if mma_result.is_err() {
+                        // Fallback: software FP4 dequant path
+                        kernels::partial_matmul_nvfp4_f32(
+                            self.expert_output_f32_buf.as_ptr(),
+                            down_page.device_ptr as *const u8,
+                            unsafe { self.down_proj_f32_buf.as_mut_ptr().add(f32_byte_offset) },
+                            expert_hidden_dim,
+                            m_slice,
+                            &self.stream,
+                        )?;
+                    }
+                } else {
+                    // FP16 path for non-NVFP4 weights
+                    let byte_offset = row_start * std::mem::size_of::<f16>();
+                    kernels::partial_matmul(
+                        self.expert_output_buf.as_ptr(),
+                        down_page.device_ptr as *const u8,
+                        unsafe { self.down_proj_buf.as_mut_ptr().add(byte_offset) },
+                        expert_hidden_dim,
+                        m_slice,
+                        self.model_config.expert_dtype,
+                        &self.stream,
+                    )?;
+                }
             }
         }
 
         // Diagnostic: per-expert down_proj output at L6, pos=0
         if self.diag_enabled && engine_layer == 6 && self.position == 0 {
             self.stream.synchronize()?;
-            let mut down_buf = vec![0u8; hidden_dim * 2];
-            self.down_proj_buf.copy_to_host(&mut down_buf)?;
-            let down_f16 = unsafe { std::slice::from_raw_parts(down_buf.as_ptr() as *const f16, hidden_dim) };
-            let l2 = down_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
-            let max_abs = down_f16.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
-            let first4: Vec<f32> = down_f16[..4].iter().map(|v| v.to_f32()).collect();
-            tracing::info!(
-                "L6 EXPERT e{} DOWN_PROJ: L2={:.4}, max_abs={:.4}, first4={:?}, pages={}",
-                expert_plan.expert_id, l2, max_abs, first4, down_pages.len(),
-            );
-            // Dump e243's down_proj and intermediate for Python comparison
-            if expert_plan.expert_id == 243 {
-                let dump_dir = "/model/dump";
-                let _ = std::fs::create_dir_all(dump_dir);
-                let _ = std::fs::write(format!("{}/e243_downproj_L6_pos0.bin", dump_dir), &down_buf);
-                // Also dump the SwiGLU intermediate
-                let ehd = self.model_config.expert_hidden_dim as usize;
-                let mut inter_buf = vec![0u8; ehd * 2];
-                self.expert_output_buf.copy_to_host(&mut inter_buf)?;
-                let _ = std::fs::write(format!("{}/e243_swiglu_L6_pos0.bin", dump_dir), &inter_buf);
-                tracing::info!("DUMPED e243 down_proj and intermediate to {}", dump_dir);
+            if self.model_config.expert_dtype == DType::NVFP4 {
+                // FP32 path diagnostic
+                let mut down_buf = vec![0u8; hidden_dim * 4];
+                self.down_proj_f32_buf.copy_to_host(&mut down_buf)?;
+                let down_f32 = unsafe { std::slice::from_raw_parts(down_buf.as_ptr() as *const f32, hidden_dim) };
+                let l2 = down_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let max_abs = down_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let first4: Vec<f32> = down_f32[..4].to_vec();
+                tracing::info!(
+                    "L6 EXPERT e{} DOWN_PROJ: L2={:.4}, max_abs={:.4}, first4={:?}, pages={} (FP32 path)",
+                    expert_plan.expert_id, l2, max_abs, first4, down_pages.len(),
+                );
+                if expert_plan.expert_id == 243 {
+                    let dump_dir = "/model/dump";
+                    let _ = std::fs::create_dir_all(dump_dir);
+                    let _ = std::fs::write(format!("{}/e243_downproj_L6_pos0.bin", dump_dir), &down_buf);
+                    let ehd = self.model_config.expert_hidden_dim as usize;
+                    let mut inter_buf = vec![0u8; ehd * 4]; // FP32
+                    self.expert_output_f32_buf.copy_to_host(&mut inter_buf)?;
+                    let _ = std::fs::write(format!("{}/e243_swiglu_L6_pos0.bin", dump_dir), &inter_buf);
+                    tracing::info!("DUMPED e243 down_proj (FP32) and intermediate (FP32) to {}", dump_dir);
+                }
+            } else {
+                // FP16 path diagnostic
+                let mut down_buf = vec![0u8; hidden_dim * 2];
+                self.down_proj_buf.copy_to_host(&mut down_buf)?;
+                let down_f16 = unsafe { std::slice::from_raw_parts(down_buf.as_ptr() as *const f16, hidden_dim) };
+                let l2 = down_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+                let max_abs = down_f16.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                let first4: Vec<f32> = down_f16[..4].iter().map(|v| v.to_f32()).collect();
+                tracing::info!(
+                    "L6 EXPERT e{} DOWN_PROJ: L2={:.4}, max_abs={:.4}, first4={:?}, pages={}",
+                    expert_plan.expert_id, l2, max_abs, first4, down_pages.len(),
+                );
+                if expert_plan.expert_id == 243 {
+                    let dump_dir = "/model/dump";
+                    let _ = std::fs::create_dir_all(dump_dir);
+                    let _ = std::fs::write(format!("{}/e243_downproj_L6_pos0.bin", dump_dir), &down_buf);
+                    let ehd = self.model_config.expert_hidden_dim as usize;
+                    let mut inter_buf = vec![0u8; ehd * 2];
+                    self.expert_output_buf.copy_to_host(&mut inter_buf)?;
+                    let _ = std::fs::write(format!("{}/e243_swiglu_L6_pos0.bin", dump_dir), &inter_buf);
+                    tracing::info!("DUMPED e243 down_proj and intermediate to {}", dump_dir);
+                }
             }
         }
 
-        // Accumulate expert contribution into FP32 buffer (no FP16 truncation)
-        kernels::weighted_accumulate_f32(
-            self.layer_output_buf.as_mut_ptr(),
-            self.down_proj_buf.as_ptr(),
-            expert_plan.weight,
-            hidden_dim,
-            &self.stream,
-        )?;
+        // Accumulate expert contribution into FP32 buffer
+        if self.model_config.expert_dtype == DType::NVFP4 {
+            // Full FP32 path: down_proj output is FP32, no FP16 truncation anywhere
+            kernels::weighted_accumulate_f32_f32(
+                self.layer_output_buf.as_mut_ptr(),
+                self.down_proj_f32_buf.as_ptr(),
+                expert_plan.weight,
+                hidden_dim,
+                &self.stream,
+            )?;
+        } else {
+            // FP16→FP32 path for non-NVFP4 weights
+            kernels::weighted_accumulate_f32(
+                self.layer_output_buf.as_mut_ptr(),
+                self.down_proj_buf.as_ptr(),
+                expert_plan.weight,
+                hidden_dim,
+                &self.stream,
+            )?;
+        }
 
         // Update prediction for pages used by this expert
         for rp in &expert_plan.pages {
@@ -3753,7 +6328,13 @@ impl Engine {
         // If we have the shared expert weights, compute SwiGLU on device
         let up_device = self.get_device_tensor(layer, 14);
         let gate_device = self.get_device_tensor(layer, 15);
-        if let (Some((up_ptr, _)), Some((gate_ptr, _))) = (up_device, gate_device) {
+        let up_gate_ptrs = match (up_device, gate_device) {
+            (Some((up_ptr, _)), Some((gate_ptr, _))) => Some((up_ptr as usize, gate_ptr as usize)),
+            _ => None,
+        };
+        if let Some((up_addr, gate_addr)) = up_gate_ptrs {
+            let up_ptr = up_addr as *const u8;
+            let gate_ptr = gate_addr as *const u8;
             // FP32-input SwiGLU for shared expert: reads FP32 moe_normed_f32, FP16 weights
             kernels::partial_swiglu_f32(
                 self.moe_normed_f32.as_ptr(),
@@ -3766,6 +6347,32 @@ impl Engine {
                 &self.stream,
                 None, // shared expert weights are FP16, fused kernel
             )?;
+
+            // Dump shared expert SwiGLU intermediate at L0
+            if self.diag_enabled && layer == 0 {
+                self.stream.synchronize()?;
+                let dump_dir = "/home/brian/code/vib3/dump";
+                let tok = self.position;
+                // SwiGLU intermediate is FP16, size = shared_hidden * 2 bytes
+                let inter_bytes = shared_hidden * 2;
+                let mut buf = vec![0u8; inter_bytes];
+                self.shared_expert_inter_dev.copy_to_host(&mut buf)?;
+                let _ = std::fs::write(
+                    format!("{}/vib3_shexp_inter_L0_tok{}.bin", dump_dir, tok),
+                    &buf,
+                );
+                // Convert to f32 for stats
+                let f16_slice = unsafe {
+                    std::slice::from_raw_parts(buf.as_ptr() as *const f16, shared_hidden)
+                };
+                let l2: f32 = f16_slice.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+                let max_abs = f16_slice.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                let zeros = f16_slice.iter().filter(|v| v.to_f32() == 0.0).count();
+                tracing::info!(
+                    "SHEXP_SWIGLU L{} pos={}: inter L2={:.6}, max_abs={:.6}, zeros={}/{}",
+                    layer, self.position, l2, max_abs, zeros, shared_hidden,
+                );
+            }
 
             // Apply down_proj using pre-allocated shared_expert_down_dev
             if let Some((down_ptr, _)) = self.get_device_tensor(layer, 16) {
@@ -3782,42 +6389,68 @@ impl Engine {
                     &self.stream,
                 )?;
 
-                // Diagnostic: shared expert output at L6, pos=0
-                if self.diag_enabled && layer == 6 && self.position == 0 {
-                    self.stream.synchronize()?;
-                    let mut se_buf = vec![0u8; hidden_dim * 2];
-                    self.shared_expert_down_dev.copy_to_host(&mut se_buf)?;
-                    let se_f16 = unsafe { std::slice::from_raw_parts(se_buf.as_ptr() as *const f16, hidden_dim) };
-                    let se_l2 = se_f16.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
-                    let se_max = se_f16.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
-                    tracing::info!(
-                        "L6 SHARED_EXPERT DOWN_PROJ: L2={:.4}, max_abs={:.4}",
-                        se_l2, se_max,
-                    );
-                    // Also dump for Python comparison
-                    let dump_dir = "/model/dump";
-                    let _ = std::fs::create_dir_all(dump_dir);
-                    let _ = std::fs::write(format!("{}/shared_expert_L6_pos0.bin", dump_dir), &se_buf);
+                // Apply sigmoid gate to shared expert output before accumulating.
+                self.ensure_shared_tensor_device(layer, 26).await;
+                if let Some((gate_w_ptr, _)) = self.get_device_tensor(layer, 26) {
+                    // Compute dot product: moe_normed_f32 (FP32) × gate_weight (FP16) → 1 FP32 scalar
+                    kernels::linear_projection_f32_to_f32(
+                        self.moe_normed_f32.as_ptr(),
+                        gate_w_ptr,
+                        self.shared_expert_inter_dev.as_mut_ptr(),
+                        hidden_dim,
+                        1,
+                        &self.stream,
+                    )?;
 
-                    // Dump moe_normed_f32 for Python comparison (FP32)
-                    let mut normed_buf = vec![0u8; hidden_dim * 4];
-                    self.moe_normed_f32.copy_to_host(&mut normed_buf)?;
-                    let _ = std::fs::write(format!("{}/moe_normed_f32_L6_pos0.bin", dump_dir), &normed_buf);
-                    tracing::info!("DUMPED moe_normed_f32 and shared_expert to {}", dump_dir);
+                    // Dump shared expert down_proj output BEFORE sigmoid gating at L0
+                    if self.diag_enabled && layer == 0 {
+                        self.stream.synchronize()?;
+                        let dump_dir = "/home/brian/code/vib3/dump";
+                        let tok = self.position;
+                        let mut buf = vec![0u8; hidden_dim * 4];
+                        self.shared_expert_down_dev.copy_to_host(&mut buf)?;
+                        let _ = std::fs::write(
+                            format!("{}/vib3_shexp_down_L0_tok{}.bin", dump_dir, tok),
+                            &buf,
+                        );
+                    }
+
+                    // Fused sigmoid + gated accumulate on GPU
+                    kernels::sigmoid_gated_accumulate_f32(
+                        self.layer_output_buf.as_mut_ptr(),
+                        self.shared_expert_down_dev.as_ptr(),
+                        self.shared_expert_inter_dev.as_ptr(),
+                        hidden_dim,
+                        &self.stream,
+                    )?;
+
+                    if self.diag_enabled && layer <= 6 && self.position <= 4 {
+                        self.stream.synchronize()?;
+                        let mut gate_bytes = [0u8; 4];
+                        cuda_ffi::memcpy_d2h(
+                            gate_bytes.as_mut_ptr(),
+                            self.shared_expert_inter_dev.as_ptr(),
+                            4,
+                        )?;
+                        let gate_raw = f32::from_le_bytes(gate_bytes);
+                        let gate_sigmoid = 1.0 / (1.0 + (-gate_raw).exp());
+                        tracing::info!(
+                            "SHARED_EXPERT_GATE L{} pos={}: raw={:.4}, sigmoid={:.4}",
+                            layer, self.position, gate_raw, gate_sigmoid,
+                        );
+                    }
+                } else {
+                    // Fallback: no gating, accumulate with weight 1.0
+                    kernels::weighted_accumulate_f32(
+                        self.layer_output_buf.as_mut_ptr(),
+                        self.shared_expert_down_dev.as_ptr(),
+                        1.0,
+                        hidden_dim,
+                        &self.stream,
+                    )?;
                 }
-
-                // Accumulate shared expert output into FP32 buffer with weight 1.0
-                kernels::weighted_accumulate_f32(
-                    self.layer_output_buf.as_mut_ptr(),
-                    self.shared_expert_down_dev.as_ptr(),
-                    1.0, // Shared expert always has weight 1.0
-                    hidden_dim,
-                    &self.stream,
-                )?;
             }
         }
-        // If weights aren't loaded, silently skip — the shared expert
-        // only runs when its weights are available in the buffer pool.
 
         Ok(())
     }
@@ -3858,23 +6491,22 @@ impl Engine {
                     layer, router_size, expected_size,
                 );
             }
-            // Get per-layer e_score_correction_bias (if loaded)
-            let layer_bias = self.e_score_correction_bias.as_ref()
-                .and_then(|biases| biases.get(layer as usize))
-                .map(|v| v.as_slice());
-
-            // Use FP32-input router for better precision (avoids FP16 truncation
-            // of the normalized hidden state that causes catastrophic expert misrouting)
-            let experts = kernels::run_router_f32(
+            // GPU-fused router: GEMV + softmax/sigmoid + top-k + renormalize.
+            // All work stays on GPU; only the final top-k (8×6 bytes) is D2H'd.
+            // Uses router_stream to avoid synchronizing the main compute pipeline.
+            self.router_event.record(&self.stream)?;
+            self.router_event.wait_on_stream(&self.router_stream)?;
+            let experts = kernels::run_router_gpu_topk(
                 self.moe_normed_f32.as_ptr(),
                 router_ptr,
                 num_experts,
                 hidden_dim,
                 top_k,
                 scoring_func,
-                layer_bias,
                 self.router_scores_dev.as_mut_ptr() as *mut f32,
-                &self.stream,
+                self.router_topk_ids_dev.as_mut_ptr(),
+                self.router_topk_weights_dev.as_mut_ptr(),
+                &self.router_stream,
             )?;
             activation.experts = experts;
         } else {
@@ -4248,6 +6880,555 @@ impl Engine {
         Some(tensor_buf)
     }
 
+    /// Pre-assemble all shared weight tensors into permanent VRAM buffers.
+    ///
+    /// Called once after model preload when all pages are resident in T1.
+    /// For single-page tensors (norms, biases), stores the T1 page pointer
+    /// directly (zero-copy). For multi-page tensors (projections), allocates
+    /// a contiguous DeviceBuffer and does a one-time D2D assembly.
+    ///
+    /// After this, `get_preassembled_weight()` provides O(1) pointer lookup
+    /// with zero D2D copies per token — eliminating ~10.6 GB/token of bandwidth waste.
+    pub fn preassemble_all_shared_weights(&mut self) -> usize {
+        if !self.buffer_mgr.is_fully_resident() {
+            tracing::warn!("Cannot preassemble: model not fully resident in T1");
+            return 0;
+        }
+
+        let num_layers = self.model_config.num_layers;
+        let has_deltanet = self.model_config.deltanet.is_some();
+
+        // Query current free VRAM and set a budget with a safety reserve for:
+        //  - Dynamic cache for non-preassembled segments (~1 GB: router, moe_norm, shared expert)
+        //  - Global tensors (embeddings + lm_head ≈ 3 GB, allocated on first token)
+        //  - Runtime temp buffers, KV cache growth (~0.5 GB)
+        // NOTE: If dynamic cache OOMs, it falls back to host path — functional but slow.
+        // Prioritize preassembly (eliminates per-token D2D) over dynamic cache headroom.
+        let free_vram = cuda_ffi::query_free_vram();
+        let vram_reserve = 4400 * 1024 * 1024; // 4.3 GB for dynamic cache + runtime
+        let mut vram_budget = if free_vram > vram_reserve {
+            free_vram - vram_reserve
+        } else {
+            0
+        };
+        tracing::info!(
+            "Preassembly VRAM budget: {:.1} MB (free={:.1} MB, reserve={:.1} MB)",
+            vram_budget as f64 / (1024.0 * 1024.0),
+            free_vram as f64 / (1024.0 * 1024.0),
+            vram_reserve as f64 / (1024.0 * 1024.0),
+        );
+
+        // Only preassemble segments that are loaded per-token via load_tensor_direct_resident
+        // (the source of ~31K D2D copies per run). Segments handled by the dynamic cache
+        // (3=router, 7=moe_norm, 14/15/16=shared expert, 26=gate) are left to
+        // ensure_shared_tensor_device which allocates once and caches permanently.
+        //
+        // Segment 6 (attn_norm) is single-page zero-copy on every layer.
+        let all_layer_segments: &[u16] = &[6];
+        // GQA attention projections: loaded per-token into staging buffers
+        let gqa_segments: &[u16] = &[4, 5, 12, 13, 27, 28];
+        // DeltaNet projections: loaded per-token into staging buffers
+        let dn_segments: &[u16] = &[30, 31, 32, 33, 34, 35, 36, 37, 38];
+
+        let mut assembled_count = 0usize;
+        let mut total_bytes = 0usize;
+        let mut single_page_count = 0usize;
+        let mut multi_page_count = 0usize;
+        let mut skipped_budget = 0usize;
+
+        // Helper: try to preassemble a (layer, segment) pair.
+        // Returns (assembled: bool, bytes_used: usize).
+        // Single-page = zero-copy (no VRAM), multi-page = allocate + D2D.
+        let try_preassemble = |pre_assembled: &mut std::collections::HashMap<u32, PreAssembledWeight>,
+                                    model_file: &crate::storage::format::Vib3File,
+                                    buffer_mgr: &crate::storage::buffer_manager::PageBufferManager,
+                                    layer_key: u16, segment: u16,
+                                    budget: &mut usize|
+         -> (bool, usize) {
+            let cache_key = (layer_key as u32) << 16 | segment as u32;
+            if pre_assembled.contains_key(&cache_key) {
+                return (false, 0);
+            }
+
+            let pages = model_file.pages_for_shared_segment(layer_key, segment);
+            if pages.is_empty() {
+                return (false, 0);
+            }
+
+            let total_raw_bytes: usize = pages.iter().map(|(_, e)| e.raw_size as usize).sum();
+            if total_raw_bytes == 0 {
+                return (false, 0);
+            }
+
+            if pages.len() == 1 {
+                // Single-page tensor: store T1 page pointer directly (zero-copy)
+                let (_catalog_idx, entry) = &pages[0];
+                let page_id = entry.page_id();
+                if let Some(handle) = buffer_mgr.get_page_resident(&page_id) {
+                    if !handle.device_ptr.is_null() {
+                        pre_assembled.insert(
+                            cache_key,
+                            PreAssembledWeight::SinglePage {
+                                ptr: handle.device_ptr as *const u8,
+                                size: entry.raw_size as usize,
+                            },
+                        );
+                        return (true, 0); // No extra VRAM
+                    }
+                }
+                (false, 0)
+            } else {
+                // Multi-page tensor: check VRAM budget before allocating
+                if total_raw_bytes > *budget {
+                    return (false, 0); // Not enough budget
+                }
+
+                match DeviceBuffer::new(total_raw_bytes) {
+                    Ok(dbuf) => {
+                        let mut byte_offset = 0usize;
+                        let mut ok = true;
+                        for (_catalog_idx, entry) in &pages {
+                            let page_id = entry.page_id();
+                            let raw_size = entry.raw_size as usize;
+                            if let Some(handle) = buffer_mgr.get_page_resident(&page_id) {
+                                if !handle.device_ptr.is_null() {
+                                    let copy_size = raw_size.min(total_raw_bytes - byte_offset);
+                                    if cuda_ffi::device_memcpy_d2d(
+                                        unsafe { dbuf.as_mut_ptr().add(byte_offset) },
+                                        handle.device_ptr as *const u8,
+                                        copy_size,
+                                    ).is_err() {
+                                        ok = false;
+                                        break;
+                                    }
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                            byte_offset += raw_size;
+                        }
+                        if ok {
+                            *budget -= total_raw_bytes;
+                            pre_assembled.insert(
+                                cache_key,
+                                PreAssembledWeight::Assembled(dbuf),
+                            );
+                            (true, total_raw_bytes)
+                        } else {
+                            (false, 0)
+                        }
+                    }
+                    Err(_) => (false, 0),
+                }
+            }
+        };
+
+        for layer in 0..num_layers {
+            let is_attention = if has_deltanet {
+                let dn_config = self.model_config.deltanet.as_ref().unwrap();
+                dn_config.layer_is_attention[layer as usize]
+            } else {
+                true
+            };
+
+            // Always preassemble single-page norm tensors (zero-copy, no VRAM)
+            for &segment in all_layer_segments {
+                let (ok, bytes) = try_preassemble(
+                    &mut self.pre_assembled_weights,
+                    &self.model_file,
+                    &self.buffer_mgr,
+                    layer as u16, segment,
+                    &mut vram_budget,
+                );
+                if ok {
+                    assembled_count += 1;
+                    if bytes > 0 {
+                        multi_page_count += 1;
+                        total_bytes += bytes;
+                    } else {
+                        single_page_count += 1;
+                    }
+                }
+            }
+
+            // For GQA/DeltaNet projection segments, preassembly must be atomic:
+            // either ALL multi-page segments for this layer fit in budget, or NONE.
+            // This prevents the has_preassembled guard from skipping staging loads
+            // when only some segments were preassembled.
+            let projection_segments: &[u16] = if is_attention {
+                gqa_segments
+            } else if has_deltanet {
+                dn_segments
+            } else {
+                &[]
+            };
+
+            if !projection_segments.is_empty() {
+                // Compute total multi-page VRAM needed for this layer
+                let mut layer_multi_page_bytes = 0usize;
+                for &segment in projection_segments {
+                    let cache_key = (layer as u32) << 16 | segment as u32;
+                    if self.pre_assembled_weights.contains_key(&cache_key) {
+                        continue;
+                    }
+                    let pages = self.model_file.pages_for_shared_segment(layer as u16, segment);
+                    if pages.len() > 1 {
+                        let raw_bytes: usize = pages.iter().map(|(_, e)| e.raw_size as usize).sum();
+                        layer_multi_page_bytes += raw_bytes;
+                    }
+                }
+
+                if layer_multi_page_bytes <= vram_budget {
+                    // Budget allows: preassemble all segments for this layer
+                    for &segment in projection_segments {
+                        let (ok, bytes) = try_preassemble(
+                            &mut self.pre_assembled_weights,
+                            &self.model_file,
+                            &self.buffer_mgr,
+                            layer as u16, segment,
+                            &mut vram_budget,
+                        );
+                        if ok {
+                            assembled_count += 1;
+                            if bytes > 0 {
+                                multi_page_count += 1;
+                                total_bytes += bytes;
+                            } else {
+                                single_page_count += 1;
+                            }
+                        }
+                    }
+                } else {
+                    // Not enough budget for this layer — skip all projection segments
+                    for &segment in projection_segments {
+                        let pages = self.model_file.pages_for_shared_segment(layer as u16, segment);
+                        if pages.len() > 1 {
+                            skipped_budget += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Global tensors (final norm, embeddings, lm_head) are handled by the
+        // dynamic cache via ensure_shared_tensor_device — low frequency, not worth
+        // the VRAM budget.
+
+        tracing::info!(
+            "Pre-assembled {} shared weight tensors ({} single-page zero-copy, {} multi-page = {:.1} MB extra VRAM, {} skipped for budget, {:.1} MB budget remaining)",
+            assembled_count,
+            single_page_count,
+            multi_page_count,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            skipped_budget,
+            vram_budget as f64 / (1024.0 * 1024.0),
+        );
+
+        // ── NVFP4 conversion pass ──
+        // Convert multi-page FP16 preassembled weights to NVFP4 format for ~4x bandwidth savings.
+        // Single-page weights are left as FP16 (small tensors, negligible bandwidth).
+        // Conversion: FP16 → split-half FP4 + E8M0 BF16 scales (MMA-ready).
+        let hidden_dim = self.model_config.hidden_dim as usize;
+        let dn_inner = self.model_config.deltanet.as_ref().map_or(0, |d| d.inner_dim as usize);
+        let dn_qkv = self.model_config.deltanet.as_ref().map_or(0, |d| d.qkv_dim() as usize);
+        let num_heads = self.model_config.num_heads as usize;
+        let head_dim = self.model_config.effective_head_dim() as usize;
+        let num_kv_heads = self.model_config.num_kv_heads as usize;
+        let is_gated_attn = self.model_config.deltanet.is_some();
+        let q_out_dim = if is_gated_attn { num_heads * 2 * head_dim } else { hidden_dim };
+        let kv_dim = num_kv_heads * head_dim;
+        let attn_out_dim = num_heads * head_dim;
+
+        // Map segment → (M, K) for weight tensor [M, K] FP16
+        let segment_dims = |layer: u16, segment: u16| -> Option<(usize, usize)> {
+            let is_attn = if has_deltanet {
+                self.model_config.deltanet.as_ref().unwrap().layer_is_attention[layer as usize]
+            } else {
+                true
+            };
+            match segment {
+                // DeltaNet segments
+                30 if !is_attn => Some((dn_qkv, hidden_dim)),    // QKV: [12288, 3072]
+                31 if !is_attn => Some((dn_inner, hidden_dim)),   // Z: [8192, 3072]
+                38 if !is_attn => Some((hidden_dim, dn_inner)),   // Out: [3072, 8192]
+                // GQA segments
+                4 if is_attn => Some((q_out_dim, hidden_dim)),    // Q: [16384, 3072]
+                5 if is_attn => Some((hidden_dim, attn_out_dim)), // O: [3072, 8192]
+                12 if is_attn => Some((kv_dim, hidden_dim)),      // K: [1024, 3072]
+                13 if is_attn => Some((kv_dim, hidden_dim)),      // V: [1024, 3072]
+                // GQA segments 27, 28 are norm weights [head_dim] — NOT projection matrices
+                // They are single-page and should not be NVFP4-converted.
+                _ => None,
+            }
+        };
+
+        let mut nvfp4_count = 0usize;
+        let mut nvfp4_freed = 0usize;
+        let mut nvfp4_allocated = 0usize;
+
+        // Collect keys that need conversion (can't mutate while iterating)
+        let keys_to_convert: Vec<u32> = self.pre_assembled_weights.keys()
+            .filter(|&&key| {
+                matches!(self.pre_assembled_weights.get(&key), Some(PreAssembledWeight::Assembled(_)))
+            })
+            .copied()
+            .collect();
+
+        for key in keys_to_convert {
+            let layer = (key >> 16) as u16;
+            let segment = (key & 0xFFFF) as u16;
+
+            if let Some((m, k)) = segment_dims(layer, segment) {
+                // Verify K is divisible by 64 (MMA tile requirement)
+                if k % 64 != 0 || m == 0 {
+                    continue;
+                }
+                // Verify the FP16 buffer size matches expected dimensions
+                let expected_fp16_bytes = m * k * 2;
+                let current_size = self.pre_assembled_weights.get(&key).map(|w| w.size()).unwrap_or(0);
+                if current_size != expected_fp16_bytes {
+                    tracing::warn!(
+                        "NVFP4 skip: layer={} seg={} size={} expected={} (M={} K={})",
+                        layer, segment, current_size, expected_fp16_bytes, m, k
+                    );
+                    continue;
+                }
+
+                // Convert: take the Assembled buffer, convert to NVFP4, replace
+                if let Some(PreAssembledWeight::Assembled(fp16_buf)) = self.pre_assembled_weights.remove(&key) {
+                    let fp16_size = fp16_buf.size();
+                    match kernels::fp16_to_nvfp4_weight(fp16_buf.as_ptr(), m, k, &self.stream) {
+                        Ok(nvfp4_buf) => {
+                            let nvfp4_size = nvfp4_buf.size();
+                            // Sync before dropping FP16 buffer (conversion runs on stream)
+                            let _ = self.stream.synchronize();
+                            nvfp4_freed += fp16_size;
+                            nvfp4_allocated += nvfp4_size;
+                            // Drop FP16 buffer (frees VRAM)
+                            drop(fp16_buf);
+                            self.pre_assembled_weights.insert(key, PreAssembledWeight::Nvfp4 {
+                                buf: nvfp4_buf,
+                                m,
+                                k,
+                            });
+                            nvfp4_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!("NVFP4 conversion failed for layer={} seg={}: {}", layer, segment, e);
+                            // Put the FP16 buffer back
+                            self.pre_assembled_weights.insert(key, PreAssembledWeight::Assembled(fp16_buf));
+                        }
+                    }
+                }
+            }
+        }
+
+        if nvfp4_count > 0 {
+            tracing::info!(
+                "NVFP4 converted {} weight tensors (freed {:.1} MB FP16, allocated {:.1} MB NVFP4, net savings {:.1} MB)",
+                nvfp4_count,
+                nvfp4_freed as f64 / (1024.0 * 1024.0),
+                nvfp4_allocated as f64 / (1024.0 * 1024.0),
+                (nvfp4_freed as f64 - nvfp4_allocated as f64) / (1024.0 * 1024.0),
+            );
+
+            // With freed VRAM, iteratively preassemble+convert until no more progress
+            if skipped_budget > 0 {
+                let mut pass = 1u32;
+                loop {
+                    let new_free = cuda_ffi::query_free_vram();
+                    let mut new_budget = if new_free > vram_reserve { new_free - vram_reserve } else { 0 };
+                    let mut extra_assembled = 0usize;
+                    let mut extra_bytes = 0usize;
+
+                    for layer in 0..num_layers {
+                        let is_attention = if has_deltanet {
+                            self.model_config.deltanet.as_ref().unwrap().layer_is_attention[layer as usize]
+                        } else {
+                            true
+                        };
+                        let projection_segments: &[u16] = if is_attention {
+                            gqa_segments
+                        } else if has_deltanet {
+                            dn_segments
+                        } else {
+                            &[]
+                        };
+
+                        // Check if first projection segment for this layer is already assembled
+                        let first_proj = projection_segments.iter()
+                            .find(|&&s| s != 6)
+                            .copied()
+                            .unwrap_or(0);
+                        let key_check = (layer as u32) << 16 | first_proj as u32;
+                        if self.pre_assembled_weights.contains_key(&key_check) {
+                            continue;
+                        }
+
+                        let mut layer_bytes = 0usize;
+                        for &segment in projection_segments {
+                            let pages = self.model_file.pages_for_shared_segment(layer as u16, segment);
+                            if pages.len() > 1 {
+                                let raw_bytes: usize = pages.iter().map(|(_, e)| e.raw_size as usize).sum();
+                                layer_bytes += raw_bytes;
+                            }
+                        }
+
+                        if layer_bytes <= new_budget {
+                            for &segment in projection_segments {
+                                let (ok, bytes) = try_preassemble(
+                                    &mut self.pre_assembled_weights,
+                                    &self.model_file,
+                                    &self.buffer_mgr,
+                                    layer as u16, segment,
+                                    &mut new_budget,
+                                );
+                                if ok && bytes > 0 {
+                                    extra_assembled += 1;
+                                    extra_bytes += bytes;
+                                }
+                            }
+                        }
+                    }
+
+                    if extra_assembled == 0 {
+                        break; // No more progress possible
+                    }
+
+                    // Convert newly assembled FP16 weights to NVFP4
+                    let new_keys: Vec<u32> = self.pre_assembled_weights.keys()
+                        .filter(|&&key| {
+                            matches!(self.pre_assembled_weights.get(&key), Some(PreAssembledWeight::Assembled(_)))
+                        })
+                        .copied()
+                        .collect();
+
+                    for key in new_keys {
+                        let layer = (key >> 16) as u16;
+                        let segment = (key & 0xFFFF) as u16;
+                        if let Some((m, k)) = segment_dims(layer, segment) {
+                            if k % 64 != 0 || m == 0 { continue; }
+                            let expected = m * k * 2;
+                            let current = self.pre_assembled_weights.get(&key).map(|w| w.size()).unwrap_or(0);
+                            if current != expected { continue; }
+
+                            if let Some(PreAssembledWeight::Assembled(fp16_buf)) = self.pre_assembled_weights.remove(&key) {
+                                let fp16_size = fp16_buf.size();
+                                match kernels::fp16_to_nvfp4_weight(fp16_buf.as_ptr(), m, k, &self.stream) {
+                                    Ok(nvfp4_buf) => {
+                                        let _ = self.stream.synchronize();
+                                        nvfp4_freed += fp16_size;
+                                        nvfp4_allocated += nvfp4_buf.size();
+                                        drop(fp16_buf);
+                                        self.pre_assembled_weights.insert(key, PreAssembledWeight::Nvfp4 {
+                                            buf: nvfp4_buf, m, k,
+                                        });
+                                        nvfp4_count += 1;
+                                    }
+                                    Err(_) => {
+                                        self.pre_assembled_weights.insert(key, PreAssembledWeight::Assembled(fp16_buf));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    tracing::info!(
+                        "Pass {}: assembled {} more tensors ({:.1} MB), total NVFP4: {}, net savings {:.1} MB",
+                        pass, extra_assembled,
+                        extra_bytes as f64 / (1024.0 * 1024.0),
+                        nvfp4_count,
+                        (nvfp4_freed as f64 - nvfp4_allocated as f64) / (1024.0 * 1024.0),
+                    );
+                    pass += 1;
+                    if pass > 20 { break; } // Safety limit
+                }
+            }
+        }
+
+        // ── Tiled repack pass for NVFP4 shared weights ──
+        // Repack FP4 data from row-major split-half to tiled layout for coalesced GEMV access.
+        // Tiled layout: 16 rows × 32 bytes per K-tile contiguous (512 bytes per tile).
+        // This eliminates scattered row-major access that wastes ~75% of cache line bandwidth.
+        if nvfp4_count > 0 {
+            let tile_start = Instant::now();
+            // Find max FP4 data size across all NVFP4 weights for temp buffer
+            let max_fp4_data: usize = self.pre_assembled_weights.values()
+                .filter_map(|w| w.nvfp4_dims().map(|(m, k)| m * k.div_ceil(2)))
+                .max()
+                .unwrap_or(0);
+
+            if max_fp4_data > 0 {
+                match DeviceBuffer::new(max_fp4_data) {
+                    Ok(temp_buf) => {
+                        let mut tiled_count = 0usize;
+                        for w in self.pre_assembled_weights.values_mut() {
+                            if let PreAssembledWeight::Nvfp4 { buf, m, k } = w {
+                                if *k % 64 == 0 && *m % 16 == 0 {
+                                    if let Err(e) = kernels::repack_row_to_tiled(
+                                        buf.as_mut_ptr(),
+                                        temp_buf.as_mut_ptr(),
+                                        *m,
+                                        *k,
+                                        &self.stream,
+                                    ) {
+                                        tracing::warn!("Tiled repack failed for M={} K={}: {}", m, k, e);
+                                    } else {
+                                        tiled_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = self.stream.synchronize();
+                        tracing::info!(
+                            "Tiled repack: {} NVFP4 shared weights repacked in {:.1}ms (temp buf {:.1} MB)",
+                            tiled_count,
+                            tile_start.elapsed().as_millis(),
+                            max_fp4_data as f64 / (1024.0 * 1024.0),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to allocate tiled repack temp buffer ({:.1} MB): {}", max_fp4_data as f64 / (1024.0*1024.0), e);
+                    }
+                }
+            }
+        }
+
+        assembled_count
+    }
+
+    /// Look up a pre-assembled weight tensor by (layer, segment).
+    ///
+    /// Returns `(device_ptr, size_bytes)` or None if not pre-assembled.
+    /// This is O(1) with zero D2D copies — the hot path replacement for
+    /// `load_tensor_direct()` + `get_device_tensor()`.
+    #[inline]
+    fn get_preassembled_weight(&self, layer: u16, segment: u16) -> Option<(*const u8, usize)> {
+        let cache_key = (layer as u32) << 16 | segment as u32;
+        self.pre_assembled_weights
+            .get(&cache_key)
+            .and_then(|w| {
+                // Don't return NVFP4 weights via this path — callers expect FP16.
+                // Use get_preassembled_nvfp4() for NVFP4 weights.
+                if w.is_nvfp4() { None } else { Some((w.ptr(), w.size())) }
+            })
+    }
+
+    /// Look up a pre-assembled NVFP4 weight tensor by (layer, segment).
+    /// Returns (device_ptr, M, K) if the weight was converted to NVFP4 format.
+    /// The buffer layout is [FP4 data (M*K/2 bytes) | BF16 scales (M*(K/32)*2 bytes)].
+    #[inline]
+    fn get_preassembled_nvfp4(&self, layer: u16, segment: u16) -> Option<(*const u8, usize, usize)> {
+        let cache_key = (layer as u32) << 16 | segment as u32;
+        self.pre_assembled_weights.get(&cache_key).and_then(|w| {
+            w.nvfp4_dims().map(|(m, k)| (w.ptr(), m, k))
+        })
+    }
+
     /// Ensure a shared tensor is loaded into device memory (VRAM) and cached.
     ///
     /// After calling this, use `get_device_tensor(layer, segment)` to get the
@@ -4262,7 +7443,12 @@ impl Engine {
     async fn ensure_shared_tensor_device(&mut self, layer: u16, segment: u16) -> bool {
         let cache_key = (layer as u32) << 16 | segment as u32;
 
-        // Check device cache first
+        // Check pre-assembled weights first (zero-copy, populated at init)
+        if self.pre_assembled_weights.contains_key(&cache_key) {
+            return true;
+        }
+
+        // Check device cache
         if self.shared_tensor_cache_device.contains_key(&cache_key) {
             return true;
         }
@@ -4360,13 +7546,233 @@ impl Engine {
 
     /// Get a device tensor's pointer and size (synchronous, no await).
     ///
-    /// Must call `ensure_shared_tensor_device` first. Returns None if the
-    /// tensor is not in the device cache.
-    fn get_device_tensor(&self, layer: u16, segment: u16) -> Option<(*const u8, usize)> {
-        let cache_key = (layer as u32) << 16 | segment as u32;
+    /// Priority: pre-assembled weights → GQA staging buffers → dynamic cache.
+    fn get_device_tensor(&self, _layer: u16, segment: u16) -> Option<(*const u8, usize)> {
+        // Highest priority: pre-assembled weights (zero-copy, populated at init)
+        if let Some(result) = self.get_preassembled_weight(_layer, segment) {
+            return Some(result);
+        }
+        // GQA attention weight segments use pre-allocated buffers
+        // (only for non-MLA models to avoid dimension conflicts)
+        if self.model_config.mla.is_none() {
+            match segment {
+                4 if self.gqa_w_q.size() > 0 => return Some((self.gqa_w_q.as_ptr(), self.gqa_w_q.size())),
+                5 if self.gqa_w_o.size() > 0 => return Some((self.gqa_w_o.as_ptr(), self.gqa_w_o.size())),
+                6 if self.attn_norm_w.size() > 0 => return Some((self.attn_norm_w.as_ptr(), self.attn_norm_w.size())),
+                12 if self.gqa_w_k.size() > 0 => return Some((self.gqa_w_k.as_ptr(), self.gqa_w_k.size())),
+                13 if self.gqa_w_v.size() > 0 => return Some((self.gqa_w_v.as_ptr(), self.gqa_w_v.size())),
+                27 if self.gqa_w_qnorm.size() > 0 => return Some((self.gqa_w_qnorm.as_ptr(), self.gqa_w_qnorm.size())),
+                28 if self.gqa_w_knorm.size() > 0 => return Some((self.gqa_w_knorm.as_ptr(), self.gqa_w_knorm.size())),
+                _ => {}
+            }
+        }
+        // Fallback: check the dynamic cache
+        let cache_key = (_layer as u32) << 16 | segment as u32;
         self.shared_tensor_cache_device
             .get(&cache_key)
             .map(|dbuf| (dbuf.as_ptr(), dbuf.size()))
+    }
+
+    /// Load a shared tensor directly into a pre-allocated device pointer via D2D copies.
+    ///
+    /// Uses async D2D copies on the compute stream to avoid blocking the CPU.
+    /// The copies are ordered on the stream, so subsequent kernel launches on the
+    /// same stream see the data. This bypasses the shared_tensor_cache_device entirely, eliminating
+    /// cudaMalloc/cudaFree overhead. The destination must be a valid VRAM pointer
+    /// with at least `dst_capacity` bytes. Returns the number of bytes copied, or 0 on failure.
+    #[allow(dead_code)]
+    async fn load_tensor_direct(&mut self, layer: u16, segment: u16, dst_ptr: usize, dst_capacity: usize) -> usize {
+        let pages = self.model_file.pages_for_shared_segment(layer, segment);
+        if pages.is_empty() {
+            return 0;
+        }
+
+        let total_raw_bytes: usize = pages.iter().map(|(_, e)| e.raw_size as usize).sum();
+        if total_raw_bytes == 0 || total_raw_bytes > dst_capacity {
+            return 0;
+        }
+
+        let mut byte_offset = 0usize;
+        for (_catalog_idx, entry) in &pages {
+            let page_id = entry.page_id();
+            let raw_size = entry.raw_size as usize;
+
+            match self.buffer_mgr.get_page(&page_id).await {
+                Ok(handle) if !handle.device_ptr.is_null() => {
+                    let copy_size = raw_size.min(total_raw_bytes - byte_offset);
+                    // Async D2D on the compute stream — CPU doesn't block.
+                    // Stream ordering guarantees subsequent kernels see the data.
+                    if cuda_ffi::device_memcpy_d2d_async(
+                        (dst_ptr + byte_offset) as *mut u8,
+                        handle.device_ptr as *const u8,
+                        copy_size,
+                        &self.stream,
+                    )
+                    .is_err()
+                    {
+                        return 0;
+                    }
+                }
+                _ => return 0,
+            }
+            byte_offset += raw_size;
+        }
+
+        total_raw_bytes
+    }
+
+    /// Fast synchronous D2D weight staging using the frozen resident snapshot.
+    ///
+    /// Like `load_tensor_direct` but uses `get_page_resident()` (zero-lock HashMap
+    /// lookup) instead of `get_page().await` (DashMap + Mutex + stats overhead).
+    /// Only works when model is fully resident (after preload). Returns 0 on failure.
+    ///
+    /// This eliminates ALL async overhead from the D2D weight staging hot path.
+    fn load_tensor_direct_resident(
+        &self,
+        layer: u16,
+        segment: u16,
+        dst_ptr: usize,
+        dst_capacity: usize,
+    ) -> usize {
+        let pages = self.model_file.pages_for_shared_segment(layer, segment);
+        if pages.is_empty() {
+            return 0;
+        }
+
+        let total_raw_bytes: usize = pages.iter().map(|(_, e)| e.raw_size as usize).sum();
+        if total_raw_bytes == 0 || total_raw_bytes > dst_capacity {
+            return 0;
+        }
+
+        let mut byte_offset = 0usize;
+        for (_catalog_idx, entry) in &pages {
+            let page_id = entry.page_id();
+            let raw_size = entry.raw_size as usize;
+
+            if let Some(handle) = self.buffer_mgr.get_page_resident(&page_id) {
+                if !handle.device_ptr.is_null() {
+                    let copy_size = raw_size.min(total_raw_bytes - byte_offset);
+                    if cuda_ffi::device_memcpy_d2d_async(
+                        (dst_ptr + byte_offset) as *mut u8,
+                        handle.device_ptr as *const u8,
+                        copy_size,
+                        &self.stream,
+                    )
+                    .is_err()
+                    {
+                        return 0;
+                    }
+                } else {
+                    return 0;
+                }
+            } else {
+                return 0;
+            }
+            byte_offset += raw_size;
+        }
+
+        total_raw_bytes
+    }
+}
+
+impl Engine {
+    /// Paged FP16 GEMV: reads weight pages directly from T1 VRAM, no D2D staging.
+    /// Launches one GEMV kernel per page, writing to the correct output offset.
+    /// For [M, K] weight matrices split across pages by rows (M dimension):
+    ///   output[row_start..row_start+row_count] = input × W_page^T
+    #[allow(dead_code)]
+    fn linear_projection_paged(
+        &self,
+        input: *const u8,
+        output: *mut u8,
+        layer: u16,
+        segment: u16,
+        k: usize,
+        total_rows: usize,
+    ) -> Result<()> {
+        let pages = self.model_file.pages_for_shared_segment(layer, segment);
+        let bytes_per_row = k * 2; // FP16
+        let page_size = 2 * 1024 * 1024usize; // 2MB
+        let rows_per_page = page_size / bytes_per_row;
+        for (page_seq, (_idx, entry)) in pages.iter().enumerate() {
+            let page_id = entry.page_id();
+            if let Some(handle) = self.buffer_mgr.get_page_resident(&page_id) {
+                if !handle.device_ptr.is_null() {
+                    let row_start = page_seq * rows_per_page;
+                    let row_count = rows_per_page.min(total_rows - row_start);
+                    if row_count == 0 {
+                        continue;
+                    }
+                    // FP16 output: 2 bytes per element
+                    let output_offset = row_start * 2;
+                    kernels::linear_projection(
+                        input,
+                        handle.device_ptr as *const u8,
+                        // SAFETY: output + offset is within the pre-allocated output buffer
+                        unsafe { output.add(output_offset) },
+                        k,
+                        row_count,
+                        &self.stream,
+                    ).map_err(|e| {
+                        tracing::error!(
+                            "linear_projection_paged FAILED: layer={} seg={} k={} row_start={} row_count={} dev_ptr={:?} err={}",
+                            layer, segment, k, row_start, row_count, handle.device_ptr, e
+                        );
+                        e
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Paged FP32-input, FP32-output GEMV: reads weight pages directly from T1 VRAM.
+    /// Like `linear_projection_paged` but uses the f32in_f32out kernel variant.
+    #[allow(dead_code)]
+    fn linear_projection_f32_paged(
+        &self,
+        input: *const u8,
+        output: *mut u8,
+        layer: u16,
+        segment: u16,
+        k: usize,
+        total_rows: usize,
+    ) -> Result<()> {
+        let pages = self.model_file.pages_for_shared_segment(layer, segment);
+        let bytes_per_row = k * 2; // FP16 weights
+        let page_size = 2 * 1024 * 1024usize; // 2MB
+        let rows_per_page = page_size / bytes_per_row;
+        for (page_seq, (_idx, entry)) in pages.iter().enumerate() {
+            let page_id = entry.page_id();
+            if let Some(handle) = self.buffer_mgr.get_page_resident(&page_id) {
+                if !handle.device_ptr.is_null() {
+                    let row_start = page_seq * rows_per_page;
+                    let row_count = rows_per_page.min(total_rows - row_start);
+                    if row_count == 0 {
+                        continue;
+                    }
+                    // FP32 output: 4 bytes per element
+                    let output_offset = row_start * 4;
+                    kernels::linear_projection_f32_to_f32(
+                        input,
+                        handle.device_ptr as *const u8,
+                        // SAFETY: output + offset is within the pre-allocated output buffer
+                        unsafe { output.add(output_offset) },
+                        k,
+                        row_count,
+                        &self.stream,
+                    ).map_err(|e| {
+                        tracing::error!(
+                            "linear_projection_f32_paged FAILED: layer={} seg={} k={} row_start={} row_count={} dev_ptr={:?} err={}",
+                            layer, segment, k, row_start, row_count, handle.device_ptr, e
+                        );
+                        e
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

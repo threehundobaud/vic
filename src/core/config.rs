@@ -28,9 +28,13 @@ pub struct ModelConfig {
     pub expert_dtype: DType,
     pub shared_dtype: DType,
 
-    // MLA configuration (optional)
+    // MLA configuration (optional — DeepSeek-V2/V3, Kimi K2.5)
     #[serde(default)]
     pub mla: Option<MlaConfig>,
+
+    // DeltaNet configuration (optional — Qwen3.5 hybrid models)
+    #[serde(default)]
+    pub deltanet: Option<DeltaNetConfig>,
 
     // RoPE configuration
     /// Base frequency for Rotary Position Embeddings.
@@ -81,6 +85,12 @@ pub struct ModelConfig {
     /// For Kimi K2.5: 18432. Only used when dense_layer_idx > 0.
     #[serde(default)]
     pub dense_intermediate_size: u32,
+
+    /// Explicit attention head dimension (when head_dim != hidden_dim / num_heads).
+    /// Qwen3.5: head_dim=256 while hidden_dim/num_heads=3072/32=96.
+    /// Default 0 means infer as hidden_dim / num_heads (standard transformers).
+    #[serde(default)]
+    pub attn_head_dim: u32,
 }
 
 impl ModelConfig {
@@ -161,12 +171,14 @@ impl Default for ModelConfig {
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             mla: None,
+            deltanet: None,
             scoring_func: "softmax".to_string(),
             routed_scaling_factor: 1.0,
             norm_topk_prob: true,
             num_shared_experts: 0,
             shared_intermediate_size: 0,
             dense_intermediate_size: 0,
+            attn_head_dim: 0,
         }
     }
 }
@@ -247,6 +259,18 @@ impl ModelConfig {
         self.expert_size_bytes() * self.num_experts as usize * self.num_moe_layers as usize
     }
 
+    /// Effective attention head dimension.
+    /// Returns attn_head_dim if explicitly set, otherwise hidden_dim / num_heads.
+    pub fn effective_head_dim(&self) -> u32 {
+        if self.attn_head_dim > 0 {
+            self.attn_head_dim
+        } else if self.num_heads > 0 {
+            self.hidden_dim / self.num_heads
+        } else {
+            128 // fallback
+        }
+    }
+
     /// Number of 2MB pages per expert segment.
     pub fn pages_per_segment(&self) -> usize {
         let segment_params = self.expert_hidden_dim as usize * self.hidden_dim as usize;
@@ -272,18 +296,83 @@ impl ModelConfig {
         expert_bytes + shared_estimate
     }
 
-    /// Estimated shared layer size (attention, embeddings, norms).
+    /// Estimated shared layer size (attention, embeddings, norms, DeltaNet projections).
+    ///
+    /// This estimates the **device-side FP16** size of all shared tensors that
+    /// get cached via `ensure_shared_tensor_device`.  It must be accurate enough
+    /// that the VRAM budget calculation leaves room for the device cache.
     pub fn estimated_shared_bytes(&self) -> usize {
-        let embedding = self.vocab_size as usize * self.hidden_dim as usize;
-        let lm_head = embedding; // Usually tied or same size
-        let per_layer_attn = self.hidden_dim as usize * self.hidden_dim as usize * 4; // Q,K,V,O
-        let norms = self.hidden_dim as usize * 2 * self.num_layers as usize;
-        let router =
-            self.num_experts as usize * self.hidden_dim as usize * self.num_moe_layers as usize;
+        let h = self.hidden_dim as usize;
+        let head_dim = self.effective_head_dim() as usize;
 
-        let total_params =
-            embedding + lm_head + per_layer_attn * self.num_layers as usize + norms + router;
-        self.shared_dtype.bytes_for(total_params)
+        // Global: embeddings + lm_head + final_norm
+        let embedding = self.vocab_size as usize * h;
+        let lm_head = embedding;
+        let global = (embedding + lm_head + h) * 2; // FP16
+
+        // Per-layer common: norms + router + shared expert
+        let norms_per_layer = h * 2; // attn_norm + ffn_norm
+        let router_per_layer = self.num_experts as usize * h;
+        let shared_expert_per_layer = if self.num_shared_experts > 0 {
+            h * self.shared_intermediate_size as usize * 3 + h // up+gate+down + gate_scalar
+        } else {
+            0
+        };
+        let common_per_layer = (norms_per_layer + router_per_layer + shared_expert_per_layer) * 2;
+
+        // Attention layers: Q(doubled for gating) + K + V + O + q_norm + k_norm
+        let num_attn_layers;
+        let attn_per_layer;
+        let num_dn_layers;
+        let dn_per_layer;
+
+        if let Some(ref dn) = self.deltanet {
+            let interval = dn.full_attention_interval as usize;
+            num_attn_layers = if interval > 0 {
+                self.num_layers as usize / interval
+            } else {
+                self.num_layers as usize
+            };
+            num_dn_layers = self.num_layers as usize - num_attn_layers;
+
+            // Gated attention: Q proj outputs 2x (Q + gate), interleaved
+            let q_size = h * (self.num_heads as usize * head_dim * 2);
+            let k_size = h * (self.num_kv_heads as usize * head_dim);
+            let v_size = k_size;
+            let o_size = (self.num_heads as usize * head_dim) * h;
+            let q_norm = self.num_heads as usize * head_dim;
+            let k_norm = self.num_kv_heads as usize * head_dim;
+            attn_per_layer = (q_size + k_size + v_size + o_size + q_norm + k_norm) * 2;
+
+            // DeltaNet: in_proj_qkv + z + beta + alpha + conv1d + dt_bias + A_log + norm + out_proj
+            let inner = dn.inner_dim as usize;
+            let nkh = dn.num_key_heads as usize;
+            let nvh = dn.num_value_heads as usize;
+            let khd = dn.key_head_dim as usize;
+            let vhd = dn.value_head_dim as usize;
+            let qkv = h * (inner + nkh * khd + nvh * vhd);
+            let z = h * inner;
+            let beta = h * inner;
+            let alpha = h * inner;
+            let conv = nvh * vhd * dn.conv_kernel_size as usize;
+            let dt = nvh;
+            let a_log = nvh * khd;
+            let norm = inner;
+            let out = inner * h;
+            dn_per_layer = (qkv + z + beta + alpha + conv + dt + a_log + norm + out) * 2;
+        } else {
+            num_attn_layers = self.num_layers as usize;
+            num_dn_layers = 0;
+            // Standard attention: Q + K + V + O
+            let per_layer = h * h * 4;
+            attn_per_layer = per_layer * 2;
+            dn_per_layer = 0;
+        }
+
+        global
+            + common_per_layer * self.num_layers as usize
+            + attn_per_layer * num_attn_layers
+            + dn_per_layer * num_dn_layers
     }
 
     /// Create config for Kimi K2.5.
@@ -322,12 +411,115 @@ impl ModelConfig {
                     MSCALE_ALL_DIM,
                 ),
             }),
+            deltanet: None,
             scoring_func: SCORING_FUNC.to_string(),
             routed_scaling_factor: ROUTED_SCALING_FACTOR as f32,
             norm_topk_prob: true,
             num_shared_experts: NUM_SHARED_EXPERTS,
             shared_intermediate_size: SHARED_INTERMEDIATE_SIZE,
             dense_intermediate_size: 18432, // Kimi K2.5 dense layer intermediate_size
+            attn_head_dim: 0,               // Standard: head_dim = hidden_dim / num_heads
+        }
+    }
+
+    /// Create config for Qwen3.5-122B-A10B.
+    ///
+    /// Hybrid architecture: 75% DeltaNet (linear attention) + 25% full attention,
+    /// with MoE on every layer. Values from `Qwen/Qwen3.5-122B-A10B/config.json`.
+    pub fn qwen35_122b() -> Self {
+        use crate::core::types::qwen35_122b::*;
+
+        // Build per-layer attention/deltanet map
+        let layer_is_attention: Vec<bool> =
+            (0..NUM_LAYERS).map(|i| is_attention_layer(i)).collect();
+
+        Self {
+            name: "Qwen3.5-122B-A10B".into(),
+            architecture: "qwen3_5_moe".into(),
+            hidden_dim: HIDDEN_DIM,
+            expert_hidden_dim: EXPERT_INTERMEDIATE_SIZE,
+            num_layers: NUM_LAYERS,
+            num_moe_layers: NUM_LAYERS, // MoE on every layer
+            dense_layer_idx: 0,         // no dense-only layers
+            num_experts: NUM_EXPERTS,
+            num_active_experts: NUM_ACTIVE_EXPERTS,
+            num_heads: NUM_ATTN_HEADS,
+            num_kv_heads: NUM_KV_HEADS,
+            max_seq_len: MAX_SEQ_LEN,
+            vocab_size: VOCAB_SIZE,
+            rope_theta: ROPE_THETA as f32,
+            rms_norm_eps: RMS_NORM_EPS as f32,
+            expert_dtype: DType::INT4,
+            shared_dtype: DType::BF16,
+            mla: None,
+            deltanet: Some(DeltaNetConfig {
+                num_key_heads: DELTANET_NUM_KEY_HEADS,
+                num_value_heads: DELTANET_NUM_VALUE_HEADS,
+                key_head_dim: DELTANET_KEY_HEAD_DIM,
+                value_head_dim: DELTANET_VALUE_HEAD_DIM,
+                conv_kernel_size: DELTANET_CONV_KERNEL,
+                inner_dim: DELTANET_INNER_DIM,
+                full_attention_interval: FULL_ATTN_INTERVAL,
+                layer_is_attention,
+            }),
+            scoring_func: SCORING_FUNC.to_string(),
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: true, // softmax routing with normalized weights
+            num_shared_experts: NUM_SHARED_EXPERTS,
+            shared_intermediate_size: SHARED_EXPERT_INTERMEDIATE_SIZE,
+            dense_intermediate_size: 0, // no dense layers
+            attn_head_dim: HEAD_DIM,    // 256 (differs from hidden_dim/num_heads = 96)
+        }
+    }
+
+    /// Create config for Qwen3.5-35B-A3B.
+    ///
+    /// Hybrid architecture: 75% DeltaNet (linear attention) + 25% full attention,
+    /// with MoE on every layer. Same family as 122B but smaller dimensions.
+    /// Values from `Qwen/Qwen3.5-35B-A3B/config.json` and GGUF metadata.
+    pub fn qwen35_35b() -> Self {
+        use crate::core::types::qwen35_35b::*;
+
+        // Build per-layer attention/deltanet map
+        let layer_is_attention: Vec<bool> =
+            (0..NUM_LAYERS).map(|i| is_attention_layer(i)).collect();
+
+        Self {
+            name: "Qwen3.5-35B-A3B".into(),
+            architecture: "qwen3_5_moe".into(),
+            hidden_dim: HIDDEN_DIM,
+            expert_hidden_dim: EXPERT_INTERMEDIATE_SIZE,
+            num_layers: NUM_LAYERS,
+            num_moe_layers: NUM_LAYERS, // MoE on every layer
+            dense_layer_idx: 0,         // no dense-only layers
+            num_experts: NUM_EXPERTS,
+            num_active_experts: NUM_ACTIVE_EXPERTS,
+            num_heads: NUM_ATTN_HEADS,
+            num_kv_heads: NUM_KV_HEADS,
+            max_seq_len: MAX_SEQ_LEN,
+            vocab_size: VOCAB_SIZE,
+            rope_theta: ROPE_THETA as f32,
+            rms_norm_eps: RMS_NORM_EPS as f32,
+            expert_dtype: DType::INT4,
+            shared_dtype: DType::BF16,
+            mla: None,
+            deltanet: Some(DeltaNetConfig {
+                num_key_heads: DELTANET_NUM_KEY_HEADS,
+                num_value_heads: DELTANET_NUM_VALUE_HEADS,
+                key_head_dim: DELTANET_KEY_HEAD_DIM,
+                value_head_dim: DELTANET_VALUE_HEAD_DIM,
+                conv_kernel_size: DELTANET_CONV_KERNEL,
+                inner_dim: DELTANET_INNER_DIM,
+                full_attention_interval: FULL_ATTN_INTERVAL,
+                layer_is_attention,
+            }),
+            scoring_func: SCORING_FUNC.to_string(),
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: true, // softmax routing with normalized weights
+            num_shared_experts: NUM_SHARED_EXPERTS,
+            shared_intermediate_size: SHARED_EXPERT_INTERMEDIATE_SIZE,
+            dense_intermediate_size: 0, // no dense layers
+            attn_head_dim: HEAD_DIM,    // 256 (differs from hidden_dim/num_heads = 128)
         }
     }
 }
@@ -486,6 +678,7 @@ impl ModelConfig {
             "mixtral" => "mixtral",
             "deepseek_v2" | "deepseek_v3" => "deepseek-v2",
             "qwen2_moe" => "qwen2-moe",
+            "qwen3_5_moe" | "qwen3_5_moe_text" => "qwen3_5_moe",
             _ => model_type,
         };
 
@@ -544,6 +737,84 @@ impl ModelConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
 
+        // DeltaNet / hybrid attention config (Qwen3.5 series)
+        let deltanet = {
+            let linear_num_key_heads = json.get("linear_num_key_heads").and_then(|v| v.as_u64());
+            let linear_num_value_heads =
+                json.get("linear_num_value_heads").and_then(|v| v.as_u64());
+            let linear_key_head_dim = json.get("linear_key_head_dim").and_then(|v| v.as_u64());
+            let linear_value_head_dim = json.get("linear_value_head_dim").and_then(|v| v.as_u64());
+            let linear_conv_kernel_dim =
+                json.get("linear_conv_kernel_dim").and_then(|v| v.as_u64());
+
+            if let (Some(nk), Some(nv), Some(dk), Some(dv), Some(ck)) = (
+                linear_num_key_heads,
+                linear_num_value_heads,
+                linear_key_head_dim,
+                linear_value_head_dim,
+                linear_conv_kernel_dim,
+            ) {
+                let full_attn_interval = json
+                    .get("full_attention_interval")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4) as u32;
+
+                let inner_dim = nv * dv;
+
+                // Build layer_is_attention from layer_types array or interval
+                let layer_is_attention: Vec<bool> =
+                    if let Some(layer_types) = json.get("layer_types").and_then(|v| v.as_array()) {
+                        layer_types
+                            .iter()
+                            .map(|v| v.as_str().unwrap_or("linear_attention") == "full_attention")
+                            .collect()
+                    } else {
+                        (0..num_layers)
+                            .map(|i| (i + 1) % full_attn_interval == 0)
+                            .collect()
+                    };
+
+                Some(DeltaNetConfig {
+                    num_key_heads: nk as u32,
+                    num_value_heads: nv as u32,
+                    key_head_dim: dk as u32,
+                    value_head_dim: dv as u32,
+                    conv_kernel_size: ck as u32,
+                    inner_dim: inner_dim as u32,
+                    full_attention_interval: full_attn_interval,
+                    layer_is_attention,
+                })
+            } else {
+                None
+            }
+        };
+
+        // Qwen3.5 has shared_expert_intermediate_size as a dedicated field
+        let shared_intermediate_size = json
+            .get("shared_expert_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(shared_intermediate_size);
+
+        // Qwen3.5 also puts num_shared_experts = 1 implicitly via shared_expert_intermediate_size
+        let num_shared_experts =
+            if num_shared_experts == 0 && json.get("shared_expert_intermediate_size").is_some() {
+                1
+            } else {
+                num_shared_experts
+            };
+
+        // Override RoPE theta from rope_parameters if present
+        let rope_theta = json
+            .get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(rope_theta as f64) as f32;
+
+        // Explicit head_dim (when it differs from hidden_dim / num_heads).
+        // Qwen3.5: head_dim=256 while hidden_dim=3072/32_heads=96.
+        let attn_head_dim = json.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
         Ok(ModelConfig {
             name: name.to_string(),
             architecture: architecture.to_string(),
@@ -563,12 +834,14 @@ impl ModelConfig {
             expert_dtype: DType::INT4, // target: always quantize experts to INT4
             shared_dtype: DType::BF16, // shared layers stay at source precision
             mla,
+            deltanet,
             scoring_func,
             routed_scaling_factor,
             norm_topk_prob,
             num_shared_experts,
             shared_intermediate_size,
             dense_intermediate_size,
+            attn_head_dim,
         })
     }
 
@@ -607,6 +880,60 @@ impl ModelConfig {
             });
 
         Self::from_hf_config(effective_json, &name)
+    }
+}
+
+/// DeltaNet (Gated Delta Rule) configuration for hybrid attention models.
+///
+/// Used by Qwen3.5 MoE series where 75% of layers use DeltaNet linear attention
+/// instead of standard softmax attention. The DeltaNet layers maintain a recurrent
+/// state S ∈ R^{head_v_dim × head_v_dim} per head, updated via the delta rule.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeltaNetConfig {
+    /// Number of key/query heads (groups). Qwen3.5-122B: 16.
+    pub num_key_heads: u32,
+    /// Number of value heads (determines state parallelism). Qwen3.5-122B: 64.
+    pub num_value_heads: u32,
+    /// Dimension per key head. Qwen3.5-122B: 128.
+    pub key_head_dim: u32,
+    /// Dimension per value head. Qwen3.5-122B: 128.
+    pub value_head_dim: u32,
+    /// Causal 1D depthwise convolution kernel size. Qwen3.5-122B: 4.
+    pub conv_kernel_size: u32,
+    /// Total inner dimension = num_value_heads × value_head_dim. Qwen3.5-122B: 8192.
+    pub inner_dim: u32,
+    /// Interval at which full attention layers appear (e.g., every 4th layer).
+    pub full_attention_interval: u32,
+    /// Per-layer type: true = full attention, false = DeltaNet.
+    /// Length = num_layers. Derived from `layer_types` in HF config.
+    pub layer_is_attention: Vec<bool>,
+}
+
+impl DeltaNetConfig {
+    /// Recurrent state size per layer: head_v_dim × head_v_dim × num_value_heads.
+    /// For Qwen3.5-122B: 128 × 128 × 64 = 1,048,576 floats = 4 MB (FP32).
+    pub fn state_size_floats(&self) -> usize {
+        self.value_head_dim as usize * self.value_head_dim as usize * self.num_value_heads as usize
+    }
+
+    /// Conv state size per layer: (conv_kernel_size - 1) × conv_channels.
+    /// conv_channels = key_dim × 2 + value_dim (Q + K + V concatenated).
+    /// For Qwen3.5-122B: 3 × (2048 + 2048 + 8192) = 3 × 12288 = 36864 floats.
+    pub fn conv_state_size_floats(&self) -> usize {
+        let key_dim = self.num_key_heads as usize * self.key_head_dim as usize;
+        let conv_channels = key_dim * 2 + self.inner_dim as usize;
+        (self.conv_kernel_size as usize - 1) * conv_channels
+    }
+
+    /// Total key dimension = num_key_heads × key_head_dim.
+    pub fn key_dim(&self) -> u32 {
+        self.num_key_heads * self.key_head_dim
+    }
+
+    /// Total QKV projection output dimension (for the joint projection).
+    /// = key_dim * 2 + inner_dim (Q + K + V).
+    pub fn qkv_dim(&self) -> u32 {
+        self.key_dim() * 2 + self.inner_dim
     }
 }
 

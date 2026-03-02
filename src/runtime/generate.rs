@@ -406,6 +406,7 @@ impl Vib3Tokenizer {
 
         let eos_token_id = inner
             .token_to_id("<|end_of_text|>")
+            .or_else(|| inner.token_to_id("<|endoftext|>")) // Qwen3.5
             .or_else(|| inner.token_to_id("</s>"))
             .unwrap_or(163585); // Kimi K2.5 default
 
@@ -521,5 +522,39 @@ impl Vib3Tokenizer {
     /// Get the ID for a specific token string, if it exists.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
+    }
+
+    /// Encode with the Qwen3.5 chat template (thinking mode).
+    ///
+    /// Wraps the user message in the standard Qwen3.5 format:
+    /// ```text
+    /// <|im_start|>system
+    /// You are a helpful assistant.<|im_end|>
+    /// <|im_start|>user
+    /// {user_message}<|im_end|>
+    /// <|im_start|>assistant
+    /// <think>
+    /// ```
+    pub fn encode_chat_qwen35(&self, user_message: &str, system_prompt: Option<&str>) -> Vec<u32> {
+        let sys = system_prompt.unwrap_or("You are a helpful assistant.");
+        let template = format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            sys, user_message
+        );
+        self.encode(&template)
+    }
+
+    /// Return stop token IDs for chat mode (model-specific).
+    ///
+    /// For Qwen3.5: <|im_end|> (248046) and <|endoftext|> (248044).
+    pub fn chat_stop_tokens(&self) -> Vec<u32> {
+        let mut stops = Vec::new();
+        if let Some(id) = self.inner.token_to_id("<|im_end|>") {
+            stops.push(id);
+        }
+        if let Some(id) = self.inner.token_to_id("<|endoftext|>") {
+            stops.push(id);
+        }
+        stops
     }
 }

@@ -15,7 +15,7 @@ use vib3::compute::kernels;
 use vib3::core::config::ModelConfig;
 use vib3::core::types::DType;
 use vib3::storage::convert::{
-    convert_random, convert_safetensors_dir, ConvertOptions, QuantFormat,
+    convert_gguf_dir, convert_random, convert_safetensors_dir, ConvertOptions, QuantFormat,
 };
 use vib3::storage::format::CompressionMethod;
 
@@ -111,16 +111,34 @@ fn main() -> anyhow::Result<()> {
         }
         path => {
             let p = std::path::Path::new(path);
-            let (config, dir) = if p.is_dir() {
-                let config = resolve_config_from_dir(p, &args)?;
-                (config, p.to_path_buf())
+            let (config, dir, is_gguf) = if p.is_dir() {
+                // Check if directory contains .gguf files
+                let has_gguf = std::fs::read_dir(p)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .any(|e| e.path().extension().is_some_and(|ext| ext == "gguf"))
+                    })
+                    .unwrap_or(false);
+
+                if has_gguf {
+                    let config = resolve_config_for_gguf(p, &args)?;
+                    (config, p.to_path_buf(), true)
+                } else {
+                    let config = resolve_config_from_dir(p, &args)?;
+                    (config, p.to_path_buf(), false)
+                }
+            } else if path.ends_with(".gguf") {
+                let dir = p.parent().unwrap_or(std::path::Path::new("."));
+                let config = resolve_config_for_gguf(dir, &args)?;
+                (config, dir.to_path_buf(), true)
             } else if path.ends_with(".safetensors") {
                 let dir = p.parent().unwrap_or(std::path::Path::new("."));
                 let config = resolve_config_from_dir(dir, &args)?;
-                (config, dir.to_path_buf())
+                (config, dir.to_path_buf(), false)
             } else {
                 anyhow::bail!(
-                    "Unsupported input format. Provide a .safetensors file, HF directory, or 'random'"
+                    "Unsupported input format. Provide a .safetensors file, .gguf file, HF directory, or 'random'"
                 );
             };
 
@@ -133,12 +151,21 @@ fn main() -> anyhow::Result<()> {
                 config.hidden_dim,
                 config.expert_hidden_dim
             );
+            if is_gguf {
+                println!("Format: GGUF");
+            }
 
             let quantize = match args.quantize.as_str() {
                 "int4" => QuantFormat::Int4,
                 "nvfp4" => QuantFormat::Nvfp4,
                 "none" => QuantFormat::None,
-                _ => QuantFormat::Int4, // auto for real models = quantize to INT4
+                _ => {
+                    if is_gguf {
+                        QuantFormat::None // GGUF MXFP4 → NVFP4 is already handled internally
+                    } else {
+                        QuantFormat::Int4 // auto for safetensors = quantize to INT4
+                    }
+                }
             };
             let options = ConvertOptions {
                 quantize_experts: quantize,
@@ -152,12 +179,17 @@ fn main() -> anyhow::Result<()> {
                     QuantFormat::Int4 => format!("INT4 (group-{})", kernels::INT4_GROUP_SIZE),
                     QuantFormat::Nvfp4 =>
                         format!("NVFP4/E2M1 (block-{})", kernels::NVFP4_BLOCK_SIZE),
-                    QuantFormat::None => "none (passthrough)".to_string(),
+                    QuantFormat::None => "none (passthrough/native)".to_string(),
                 }
             );
             println!("Compression:      {:?}", options.compress);
 
-            convert_safetensors_dir(&dir, &config, &output, &options)?;
+            if is_gguf {
+                convert_gguf_dir(&dir, &config, &output, &options)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            } else {
+                convert_safetensors_dir(&dir, &config, &output, &options)?;
+            }
         }
     }
 
@@ -229,4 +261,104 @@ fn resolve_config_from_dir(dir: &std::path::Path, args: &Args) -> anyhow::Result
             _ => Ok(resolve_config_manual(args)),
         }
     }
+}
+
+/// Resolve model config for GGUF input.
+///
+/// Tries to read architecture from GGUF metadata (`general.architecture`),
+/// then falls back to `--arch` flag. For Qwen3.5-122B we use our hardcoded
+/// config since GGUF metadata may not have all the details we need.
+fn resolve_config_for_gguf(dir: &std::path::Path, args: &Args) -> anyhow::Result<ModelConfig> {
+    // If --arch is explicitly specified, use that
+    if args.arch != "auto" && !args.arch.is_empty() {
+        return match args.arch.as_str() {
+            "qwen3.5-122b" | "qwen35-122b" | "qwen3_5_moe" => Ok(ModelConfig::qwen35_122b()),
+            "qwen3.5-35b" | "qwen35-35b" => Ok(ModelConfig::qwen35_35b()),
+            "kimi-k2.5" => Ok(ModelConfig::kimi_k25()),
+            other => anyhow::bail!("Unknown architecture '{}' for GGUF conversion", other),
+        };
+    }
+
+    // Try to auto-detect from GGUF metadata
+    let gguf = vib3::storage::gguf::GgufFile::open_dir(dir)
+        .map_err(|e| anyhow::anyhow!("Failed to open GGUF: {}", e))?;
+
+    if let Some(arch) = gguf.get_metadata("general.architecture") {
+        let arch_str = format!("{:?}", arch);
+        println!("GGUF architecture: {}", arch_str);
+
+        // Match known architectures
+        if arch_str.contains("qwen3_5_moe")
+            || arch_str.contains("qwen3moe")
+            || arch_str.contains("qwen35moe")
+        {
+            // Determine architecture prefix for metadata keys
+            let arch_prefix = if arch_str.contains("qwen35moe") {
+                "qwen35moe"
+            } else if arch_str.contains("qwen3_5_moe") {
+                "qwen3_5_moe"
+            } else {
+                "qwen3moe"
+            };
+
+            // Distinguish 122B vs 35B by embedding_length (hidden_dim)
+            let emb_key = format!("{}.embedding_length", arch_prefix);
+            if let Some(emb_len) = gguf.get_metadata(&emb_key).and_then(|v| v.as_u32()) {
+                if emb_len <= 2048 {
+                    println!("Auto-detected Qwen3.5-35B-A3B (hidden_dim={})", emb_len);
+                    return Ok(ModelConfig::qwen35_35b());
+                } else {
+                    println!("Auto-detected Qwen3.5-122B-A10B (hidden_dim={})", emb_len);
+                    return Ok(ModelConfig::qwen35_122b());
+                }
+            }
+            // Fallback: check block_count
+            let blk_key = format!("{}.block_count", arch_prefix);
+            if let Some(n_layers) = gguf.get_metadata(&blk_key).and_then(|v| v.as_u32()) {
+                if n_layers <= 40 {
+                    println!("Auto-detected Qwen3.5-35B-A3B (layers={})", n_layers);
+                    return Ok(ModelConfig::qwen35_35b());
+                } else {
+                    println!("Auto-detected Qwen3.5-122B-A10B (layers={})", n_layers);
+                    return Ok(ModelConfig::qwen35_122b());
+                }
+            }
+            // Final fallback: default to 122B
+            return Ok(ModelConfig::qwen35_122b());
+        }
+    }
+
+    // Check file names as fallback heuristic
+    let has_qwen35 = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok()).any(|e| {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                name.contains("qwen3.5") || name.contains("qwen3_5")
+            })
+        })
+        .unwrap_or(false);
+
+    if has_qwen35 {
+        // Try to distinguish by filename
+        let has_35b = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    let name = e.file_name().to_string_lossy().to_lowercase();
+                    name.contains("35b")
+                })
+            })
+            .unwrap_or(false);
+        if has_35b {
+            println!("Auto-detected Qwen3.5-35B-A3B from filename");
+            return Ok(ModelConfig::qwen35_35b());
+        }
+        println!("Auto-detected Qwen3.5 from filename");
+        return Ok(ModelConfig::qwen35_122b());
+    }
+
+    anyhow::bail!(
+        "Could not auto-detect model architecture from GGUF metadata in {}. \
+         Use --arch qwen3.5-122b, --arch qwen3.5-35b, or similar.",
+        dir.display()
+    )
 }
