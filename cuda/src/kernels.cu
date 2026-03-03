@@ -3171,19 +3171,19 @@ __global__ void vib3_mma_tile_compare_kernel(
 }
 
 // ── Activation pre-quantization kernel ──
-// Quantizes an FP32 activation vector [K] into FP4 E2M1 split-half format
-// that can be directly consumed by the MMA GEMV kernel.
+// Quantizes an FP32 activation vector [K] into FP4 E2M1 sequential format
+// that can be directly consumed by the Blackwell MMA instruction.
 // This is done ONCE per MoE layer and reused across all 8+1 expert kernels.
 //
 // Output layout:
-//   act_fp4: [K/2] bytes — split-half packed FP4 nibbles (32 bytes per 64-element tile)
+//   act_fp4: [K/2] bytes — sequential packed FP4 nibbles (32 bytes per 64-element tile)
 //   act_scales: [K/32] uint8 E8M0 — one scale per group of 32 elements
 //
 // Launch: 1 block per K/64 tile, 32 threads per block (1 warp).
 // Each warp quantizes 64 FP32 values (2 groups of 32).
 __global__ void vib3_quantize_activation_fp4_kernel(
     const float* __restrict__ input,    // [K] FP32
-    uint8_t* __restrict__ act_fp4,      // [K/2] split-half FP4 output
+    uint8_t* __restrict__ act_fp4,      // [K/2] sequential FP4 output
     uint8_t* __restrict__ act_scales,   // [K/32] E8M0 scales output
     int K
 ) {
@@ -3196,7 +3196,7 @@ __global__ void vib3_quantize_activation_fp4_kernel(
 #if __CUDA_ARCH__ >= 1200
     const int group_id = lane_id / 4;
     const int lane_in_group = lane_id % 4;
-    const int base = group_id * 2;
+    const int seq_base = group_id * 4;
 
     // Process 2 groups of 32
     for (int g = 0; g < 2; g++) {
@@ -3219,11 +3219,12 @@ __global__ void vib3_quantize_activation_fp4_kernel(
         float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(e8m0_to_f32(e));
         float scaled_val = val * inv_s;
 
-        // Gather 4 values for split-half packing
-        float val0 = __shfl_sync(0xFFFFFFFF, scaled_val, base, 32);
-        float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 16, 32);
-        float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 1, 32);
-        float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 17, 32);
+        // Gather 4 consecutive values for sequential nibble packing
+        // (MMA expects sequential: byte j = {elem[2j] lo, elem[2j+1] hi})
+        float val0 = __shfl_sync(0xFFFFFFFF, scaled_val, seq_base, 32);
+        float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, seq_base + 1, 32);
+        float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, seq_base + 2, 32);
+        float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, seq_base + 3, 32);
 
         if (lane_in_group == 0) {
             __nv_fp4x4_e2m1 fp4_packed(make_float4(val0, val1, val2, val3));
@@ -4189,7 +4190,7 @@ int vib3_launch_repack_weights_inplace(
 // Uses a temp buffer (same size as data) for the reorder.
 __global__ void vib3_repack_row_to_tiled_kernel(
     const uint8_t* __restrict__ src,   // row-major split-half [M, packed_k]
-    uint8_t* __restrict__ dst,         // tiled output [M, packed_k] (same total size)
+    uint8_t* __restrict__ dst,         // tiled sequential output [M, packed_k] (same total size)
     int M,
     int packed_k  // = K / 2
 ) {
@@ -4214,11 +4215,25 @@ __global__ void vib3_repack_row_to_tiled_kernel(
     // Destination: tiled
     long long dst_offset = ((long long)row_block * num_k_tiles + k_tile) * 512 + (long long)row_in_block * 32;
 
-    // Copy 32 bytes using vectorized loads
-    const int4* s = (const int4*)(src + src_offset);
-    int4* d = (int4*)(dst + dst_offset);
-    d[0] = s[0];  // 16 bytes
-    d[1] = s[1];  // 16 bytes
+    // Convert 32 bytes from split-half to sequential nibble packing.
+    // Split-half:  byte j has {elem[j] lo, elem[j+16] hi} for j=0..15
+    // Sequential:  byte j has {elem[2j] lo, elem[2j+1] hi} for j=0..15
+    // The Blackwell MMA instruction expects sequential packing in registers.
+    const uint8_t* s = src + src_offset;
+    uint8_t* d = dst + dst_offset;
+
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const uint8_t* sh = s + half * 16;
+        uint8_t* dh = d + half * 16;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            uint8_t b0 = sh[2 * j];
+            uint8_t b1 = sh[2 * j + 1];
+            dh[j]     = (b0 & 0x0F) | ((b1 & 0x0F) << 4);  // {elem[2j], elem[2j+1]}
+            dh[j + 8] = (b0 >> 4)   | (b1 & 0xF0);          // {elem[2j+16], elem[2j+17]}
+        }
+    }
 }
 
 // Launcher: repack row-major → tiled layout using a temp buffer.
@@ -4885,9 +4900,10 @@ int vib3_launch_expert_batched(
             float f; memcpy(&f, &bits, 4); return f;
         };
 
-        // 4. Dequantize activation (split-half format)
-        // In split-half: bytes 0-15 = K 0-31 (both nibbles), bytes 16-31 = K 32-63 (both nibbles)
-        // So scale group depends on BYTE POSITION, not nibble position.
+        // 4. Dequantize activation (sequential format)
+        // act_fp4 is produced by vib3_quantize_activation_fp4_kernel:
+        //   byte j = {elem[2j], elem[2j+1]} with j in [0, 31] per 64-elem tile.
+        // bytes 0-15 use scale s0 (K 0-31), bytes 16-31 use scale s1 (K 32-63).
         float* act_deq = (float*)calloc(K_in, sizeof(float));
         for (int t = 0; t < num_k_tiles; t++) {
             float s0 = e8m0_to_f(h_act_sc[t * 2]);
@@ -4895,8 +4911,8 @@ int vib3_launch_expert_batched(
             for (int b = 0; b < 32; b++) {
                 uint8_t byte = h_act[t * 32 + b];
                 float as_scale = (b < 16) ? s0 : s1;
-                act_deq[t * 64 + b] = fp4_lut[byte & 0xF] * as_scale;
-                act_deq[t * 64 + b + 32] = fp4_lut[(byte >> 4) & 0xF] * as_scale;
+                act_deq[t * 64 + 2 * b] = fp4_lut[byte & 0xF] * as_scale;
+                act_deq[t * 64 + 2 * b + 1] = fp4_lut[(byte >> 4) & 0xF] * as_scale;
             }
         }
 
@@ -4928,15 +4944,19 @@ int vib3_launch_expert_batched(
                 if (sc_raw0 > 0x0100) n_nonzero_scales++;
 
                 // Weight data: tiled offset = rb * num_k_tiles * 512 + t * 512 + row_in_block * 32
-                // Split-half: bytes 0-15 use ws0 (K 0-31), bytes 16-31 use ws1 (K 32-63)
+                // Split-half mapping per 64-elem tile:
+                //   b in [0,15]: low->k=b,     high->k=b+16   (scale ws0)
+                //   b in [16,31]: low->k=b+16, high->k=b+32   (scale ws1)
                 long long wt_off = (long long)rb * num_k_tiles * 512 + (long long)t * 512 + row_in_block * 32;
                 for (int b = 0; b < 32; b++) {
                     uint8_t byte = h_wt[wt_off + b];
                     float ws = (b < 16) ? ws0 : ws1;
                     float w0 = fp4_lut[byte & 0xF] * ws;
                     float w1 = fp4_lut[(byte >> 4) & 0xF] * ws;
-                    cpu_dot += (double)w0 * (double)act_deq[t * 64 + b];
-                    cpu_dot += (double)w1 * (double)act_deq[t * 64 + b + 32];
+                    int k0 = (b < 16) ? b : (b + 16);
+                    int k1 = k0 + 16;
+                    cpu_dot += (double)w0 * (double)act_deq[t * 64 + k0];
+                    cpu_dot += (double)w1 * (double)act_deq[t * 64 + k1];
                 }
             }
 
@@ -4971,13 +4991,15 @@ int vib3_launch_expert_batched(
                     float ws_swap = (b < 16) ? ws1 : ws0;
                     float w0 = fp4_lut[byte & 0xF] * ws;
                     float w1 = fp4_lut[(byte >> 4) & 0xF] * ws;
-                    cpu_dot += (double)w0 * (double)act_deq[t * 64 + b];
-                    cpu_dot += (double)w1 * (double)act_deq[t * 64 + b + 32];
+                    int k0 = (b < 16) ? b : (b + 16);
+                    int k1 = k0 + 16;
+                    cpu_dot += (double)w0 * (double)act_deq[t * 64 + k0];
+                    cpu_dot += (double)w1 * (double)act_deq[t * 64 + k1];
                     // Swapped: ws0 ↔ ws1
                     float w0s = fp4_lut[byte & 0xF] * ws_swap;
                     float w1s = fp4_lut[(byte >> 4) & 0xF] * ws_swap;
-                    swap_dot += (double)w0s * (double)act_deq[t * 64 + b];
-                    swap_dot += (double)w1s * (double)act_deq[t * 64 + b + 32];
+                    swap_dot += (double)w0s * (double)act_deq[t * 64 + k0];
+                    swap_dot += (double)w1s * (double)act_deq[t * 64 + k1];
                 }
             }
             float cpu_val = (float)cpu_dot;
@@ -5073,10 +5095,12 @@ int vib3_launch_expert_batched(
                         float w1 = fp4_lut[(byte >> 4) & 0xF] * ws;
                         float w0s = fp4_lut[byte & 0xF] * ws_swap;
                         float w1s = fp4_lut[(byte >> 4) & 0xF] * ws_swap;
-                        tile_dot += (double)w0 * (double)act_deq[t * 64 + b];
-                        tile_dot += (double)w1 * (double)act_deq[t * 64 + b + 32];
-                        tile_dot_swap += (double)w0s * (double)act_deq[t * 64 + b];
-                        tile_dot_swap += (double)w1s * (double)act_deq[t * 64 + b + 32];
+                        int k0 = (b < 16) ? b : (b + 16);
+                        int k1 = k0 + 16;
+                        tile_dot += (double)w0 * (double)act_deq[t * 64 + k0];
+                        tile_dot += (double)w1 * (double)act_deq[t * 64 + k1];
+                        tile_dot_swap += (double)w0s * (double)act_deq[t * 64 + k0];
+                        tile_dot_swap += (double)w1s * (double)act_deq[t * 64 + k1];
                     }
                     running += tile_dot;
                     running_swap += tile_dot_swap;

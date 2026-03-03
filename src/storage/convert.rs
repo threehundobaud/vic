@@ -794,7 +794,7 @@ pub fn convert_gguf_dir(
 
     // Determine expert_dtype from GGUF source data: scan for the first stacked expert
     // tensor and use its type to decide the file-level expert_dtype.
-    // MXFP4 source → NVFP4 output; Q8_0 source → respects options.quantize_experts.
+    // MXFP4 source → NVFP4 output; other source dtypes respect options.quantize_experts.
     {
         let tensor_names_tmp: Vec<String> = gguf.tensors.keys().cloned().collect();
         for tname in &tensor_names_tmp {
@@ -805,7 +805,13 @@ pub fn convert_gguf_dir(
                         GgmlType::Mxfp4 => {
                             file_config.expert_dtype = DType::NVFP4;
                         }
-                        GgmlType::Q8_0 => match options.quantize_experts {
+                        GgmlType::Q8_0
+                        | GgmlType::Q4K
+                        | GgmlType::Q5K
+                        | GgmlType::Q6K
+                        | GgmlType::F16
+                        | GgmlType::BF16
+                        | GgmlType::F32 => match options.quantize_experts {
                             QuantFormat::Nvfp4 => file_config.expert_dtype = DType::NVFP4,
                             QuantFormat::Int4 => file_config.expert_dtype = DType::INT4,
                             QuantFormat::None => file_config.expert_dtype = DType::FP16,
@@ -816,6 +822,12 @@ pub fn convert_gguf_dir(
                 }
             }
         }
+    }
+
+    // GGUF conversion writes shared tensors as FP16 pages (dequantized/converted from source).
+    // Keep file-level metadata consistent with stored page data for runtime kernel dispatch.
+    if file_config.shared_dtype == DType::BF16 {
+        file_config.shared_dtype = DType::FP16;
     }
 
     tracing::info!("File expert_dtype set to {:?}", file_config.expert_dtype);
@@ -900,9 +912,28 @@ pub fn convert_gguf_dir(
                 expert_bytes
             );
 
-            for expert_idx in 0..n_experts {
-                let expert_slice =
-                    &raw_data[expert_idx * expert_bytes..(expert_idx + 1) * expert_bytes];
+            let available_experts = if expert_bytes > 0 {
+                raw_data.len() / expert_bytes
+            } else {
+                0
+            };
+            let experts_to_process = n_experts.min(available_experts);
+
+            if experts_to_process < n_experts {
+                tracing::warn!(
+                    "Stacked tensor {} expected {} experts ({} bytes each) but only {} fit in {} bytes; processing available experts only",
+                    tensor_name,
+                    n_experts,
+                    expert_bytes,
+                    experts_to_process,
+                    raw_data.len()
+                );
+            }
+
+            for expert_idx in 0..experts_to_process {
+                let start = expert_idx * expert_bytes;
+                let end = start + expert_bytes;
+                let expert_slice = &raw_data[start..end];
 
                 match info.dtype {
                     GgmlType::Mxfp4 => {
@@ -922,10 +953,23 @@ pub fn convert_gguf_dir(
                         total_output_bytes += nvfp4_data.len() as u64;
                         converted_experts += 1;
                     }
-                    GgmlType::Q8_0 => {
-                        // Q8_0 → FP16, then optionally quantize to NVFP4
-                        let fp16_data =
-                            crate::storage::gguf::dequant_q8_0_to_fp16(expert_slice, ne1, ne0);
+                    GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+                        let fp16_data = match info.dtype {
+                            GgmlType::Q8_0 => {
+                                crate::storage::gguf::dequant_q8_0_to_fp16(expert_slice, ne1, ne0)
+                            }
+                            GgmlType::Q4K => {
+                                crate::storage::gguf::dequant_q4k_to_fp16(expert_slice, ne1, ne0)
+                            }
+                            GgmlType::Q5K => {
+                                crate::storage::gguf::dequant_q5k_to_fp16(expert_slice, ne1, ne0)
+                            }
+                            GgmlType::Q6K => {
+                                crate::storage::gguf::dequant_q6k_to_fp16(expert_slice, ne1, ne0)
+                            }
+                            _ => unreachable!(),
+                        };
+
                         match options.quantize_experts {
                             QuantFormat::Nvfp4 => {
                                 let nvfp4 = kernels::quantize_fp16_to_nvfp4(&fp16_data, ne1, ne0);
@@ -956,7 +1000,15 @@ pub fn convert_gguf_dir(
                                 total_output_bytes += int4.len() as u64;
                             }
                             QuantFormat::None => {
-                                add_shared_pages(&mut writer, layer, 0xFFFF, segment, &fp16_data);
+                                add_fp16_expert_pages(
+                                    &mut writer,
+                                    layer,
+                                    expert_idx as u16,
+                                    segment,
+                                    ne1,
+                                    ne0,
+                                    &fp16_data,
+                                );
                                 total_output_bytes += fp16_data.len() as u64;
                             }
                         }
@@ -986,6 +1038,7 @@ pub fn convert_gguf_dir(
                 GgmlType::BF16 => {
                     crate::storage::gguf::convert_bf16_to_fp16(raw_data, ne0 * n_rows)
                 }
+                GgmlType::Q4K => crate::storage::gguf::dequant_q4k_to_fp16(raw_data, n_rows, ne0),
                 GgmlType::Q5K => crate::storage::gguf::dequant_q5k_to_fp16(raw_data, n_rows, ne0),
                 GgmlType::Q6K => crate::storage::gguf::dequant_q6k_to_fp16(raw_data, n_rows, ne0),
                 _ => {
@@ -1042,6 +1095,46 @@ pub fn convert_gguf_dir(
         page_count,
         index_vectors: 0, // TODO: build indexes
     })
+}
+
+/// Add FP16 expert tensor data as row-sliced pages.
+fn add_fp16_expert_pages(
+    writer: &mut Vib3Writer,
+    layer: u16,
+    expert: u16,
+    segment: u16,
+    rows: usize,
+    cols: usize,
+    fp16_data: &[u8],
+) {
+    let bytes_per_row = cols * 2;
+    let rows_per_page = if bytes_per_row > 0 {
+        (PAGE_SIZE / bytes_per_row).max(1)
+    } else {
+        rows
+    };
+    let num_pages = rows.div_ceil(rows_per_page);
+
+    for page_idx in 0..num_pages {
+        let row_start = page_idx * rows_per_page;
+        let row_count = rows_per_page.min(rows - row_start);
+        let start = row_start * bytes_per_row;
+        let end = start + row_count * bytes_per_row;
+        if end > fp16_data.len() {
+            break;
+        }
+
+        writer.add_page(
+            layer,
+            expert,
+            segment,
+            page_idx as u16,
+            row_start as u16,
+            row_count as u16,
+            cols as u16,
+            &fp16_data[start..end],
+        );
+    }
 }
 
 /// Add shared tensor data as pages (FP16 passthrough, no quantization).

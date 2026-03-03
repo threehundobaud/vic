@@ -1384,7 +1384,11 @@ impl Engine {
                                 nvfp4_buf.size() as f64 / (1024.0 * 1024.0),
                                 lm_start.elapsed().as_millis(),
                             );
-                            engine.lm_head_nvfp4 = Some(nvfp4_buf);
+                            if std::env::var("VIB3_FP16_LM_HEAD").map_or(false, |v| v == "1") {
+                                tracing::info!("VIB3_FP16_LM_HEAD=1: skipping NVFP4 lm_head, using FP16 fallback");
+                            } else {
+                                engine.lm_head_nvfp4 = Some(nvfp4_buf);
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("lm_head NVFP4 conversion failed at load time: {}", e);
@@ -2143,6 +2147,25 @@ impl Engine {
             let dump_path = format!("{}/vib3_attn_norm_0_tok{}.bin", dump_dir, self.position);
             let _ = std::fs::write(&dump_path, &f32_bytes);
         }
+        // Dump hidden_state_f32 (pre-norm) and attn_norm output for GQA layers 3/7 at early positions
+        if self.diag_enabled && (layer_idx == 3 || layer_idx == 7) && self.position <= 1 {
+            self.stream.synchronize()?;
+            let dump_dir = "/home/brian/code/vib3/dump";
+            let tok = self.position;
+            // FP32 hidden state (pre-norm residual)
+            let mut f32_buf = vec![0u8; hidden_dim * 4];
+            self.hidden_state_f32.copy_to_host(&mut f32_buf)?;
+            let f32_path = format!("{}/vib3_gqa_hidden_f32_pre_norm_L{}_tok{}.bin", dump_dir, layer_idx, tok);
+            let _ = std::fs::write(&f32_path, &f32_buf);
+            // FP16 attn-normed hidden state (input to Q/K/V projections)
+            if !is_gqa_nvfp4 {
+                let mut h_buf = vec![0u8; hidden_dim * 2];
+                self.hidden_state.copy_to_host(&mut h_buf)?;
+                let h_path = format!("{}/vib3_gqa_attn_normed_f16_L{}_tok{}.bin", dump_dir, layer_idx, tok);
+                let _ = std::fs::write(&h_path, &h_buf);
+            }
+            tracing::info!("GQA DIAG L{} tok{}: dumped pre-norm hidden_f32 and attn_normed", layer_idx, tok);
+        }
 
         // Residual buffer copy: only needed for CPU fallback attention and diagnostics.
         // Skip for DeltaNet layers (they don't use it) and when diagnostics are off.
@@ -2504,12 +2527,19 @@ impl Engine {
         let qkv_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 30);
         let z_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 31);
         let batched_qkv_z = qkv_nvfp4.is_some() && z_nvfp4.is_some();
+        let qkv_norm_ptr = self
+            .get_preassembled_weight(layer_idx, 6)
+            .map(|(p, _)| p)
+            .or_else(|| {
+                self.get_device_tensor(layer_idx, 6)
+                    .map(|(p, _)| p as *const u8)
+            });
         if let Some((nvfp4_ptr, _m, nvfp4_k)) = qkv_nvfp4 {
-            // NVFP4 path: fused RMSNorm + FP4 quantize in a single kernel
-            // Reads FP32 hidden_state, applies norm, outputs FP4 directly.
-            // FP16 hidden_state was already produced by the shared norm step for alpha/beta.
-            let eps = self.model_config.rms_norm_eps;
-            if let Some((norm_ptr, _)) = self.get_preassembled_weight(layer_idx, 6) {
+            if let Some(norm_ptr) = qkv_norm_ptr {
+                // NVFP4 path: fused RMSNorm + FP4 quantize in a single kernel
+                // Reads FP32 hidden_state, applies norm, outputs FP4 directly.
+                // FP16 hidden_state was already produced by the shared norm step for alpha/beta.
+                let eps = self.model_config.rms_norm_eps;
                 kernels::fused_rms_norm_quantize_fp4(
                     self.hidden_state_f32.as_ptr(),
                     norm_ptr,
@@ -2520,33 +2550,56 @@ impl Engine {
                     eps,
                     &self.stream,
                 )?;
-            }
-            if batched_qkv_z {
-                // Batched: QKV + Z in a single kernel launch (same FP4 activation, same K)
-                let (z_nvfp4_ptr, _z_m, _z_k) = z_nvfp4.unwrap();
-                let weight_pages = [nvfp4_ptr, z_nvfp4_ptr];
-                let m_slices = [qkv_dim as i32, inner_dim as i32];
-                let mut outputs = [
-                    self.dn_qkv_f32_dev.as_mut_ptr(),
-                    self.dn_z_f32_dev.as_mut_ptr(),
-                ];
-                kernels::batched_gemv_mma_nvfp4_tiled(
-                    self.preq_act_fp4.as_ptr(),
-                    self.preq_act_scales.as_ptr(),
-                    &weight_pages,
-                    &m_slices,
-                    &mut outputs,
-                    nvfp4_k,
+                if batched_qkv_z {
+                    // Batched: QKV + Z in a single kernel launch (same FP4 activation, same K)
+                    let (z_nvfp4_ptr, _z_m, _z_k) = z_nvfp4.unwrap();
+                    let weight_pages = [nvfp4_ptr, z_nvfp4_ptr];
+                    let m_slices = [qkv_dim as i32, inner_dim as i32];
+                    let mut outputs = [
+                        self.dn_qkv_f32_dev.as_mut_ptr(),
+                        self.dn_z_f32_dev.as_mut_ptr(),
+                    ];
+                    kernels::batched_gemv_mma_nvfp4_tiled(
+                        self.preq_act_fp4.as_ptr(),
+                        self.preq_act_scales.as_ptr(),
+                        &weight_pages,
+                        &m_slices,
+                        &mut outputs,
+                        nvfp4_k,
+                        &self.stream,
+                    )?;
+                } else {
+                    // Single QKV GEMV (Z will be done separately later)
+                    kernels::gemv_mma_nvfp4_tiled(
+                        self.preq_act_fp4.as_ptr(),
+                        self.preq_act_scales.as_ptr(),
+                        nvfp4_ptr,
+                        self.dn_qkv_f32_dev.as_mut_ptr(),
+                        nvfp4_k,
+                        qkv_dim,
+                        &self.stream,
+                    )?;
+                }
+            } else {
+                tracing::warn!(
+                    "DeltaNet L{}: NVFP4 QKV available but norm tensor (segment 6) missing; falling back to FP16 projection",
+                    layer_idx
+                );
+                let qkv_w_ptr = self
+                    .get_preassembled_weight(layer_idx, 30)
+                    .map(|(p, _)| p)
+                    .unwrap_or(self.dn_w_qkv.as_ptr());
+                kernels::linear_projection(
+                    self.hidden_state.as_ptr(),
+                    qkv_w_ptr,
+                    self.dn_qkv_proj_dev.as_mut_ptr(),
+                    hidden_dim,
+                    qkv_dim,
                     &self.stream,
                 )?;
-            } else {
-                // Single QKV GEMV (Z will be done separately later)
-                kernels::gemv_mma_nvfp4_tiled(
-                    self.preq_act_fp4.as_ptr(),
-                    self.preq_act_scales.as_ptr(),
-                    nvfp4_ptr,
+                kernels::f16_to_f32(
+                    self.dn_qkv_proj_dev.as_ptr(),
                     self.dn_qkv_f32_dev.as_mut_ptr(),
-                    nvfp4_k,
                     qkv_dim,
                     &self.stream,
                 )?;
@@ -3494,6 +3547,34 @@ impl Engine {
                 //   5. Partial RoPE on Q (64/256 dims, stride=head_dim)
                 //   6. Partial RoPE on K (64/256 dims, stride=head_dim)
                 //   7. Append K/V to KV cache
+
+                // GQA diagnostic: dump ALL intermediates for first GQA layer at early positions
+                let gqa_diag = self.diag_enabled && (layer == 3 || layer == 7) && self.position <= 1;
+
+                // Dump raw Q projection (interleaved Q+gate, BEFORE RMSNorm)
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    // Q proj: interleaved [num_heads * 2 * head_dim] FP16
+                    let q_total = num_heads * 2 * head_dim;
+                    let mut buf = vec![0u8; q_total * 2];
+                    self.q_proj_dev.copy_to_host(&mut buf)?;
+                    let path = format!("{}/vib3_gqa_q_proj_raw_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&path, &buf);
+                    // K proj: [num_kv_heads * head_dim] FP16
+                    let kv_total = num_kv_heads * head_dim;
+                    let mut kbuf = vec![0u8; kv_total * 2];
+                    self.k_proj_dev.copy_to_host(&mut kbuf)?;
+                    let kpath = format!("{}/vib3_gqa_k_proj_raw_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&kpath, &kbuf);
+                    // V proj: [num_kv_heads * head_dim] FP16
+                    let mut vbuf = vec![0u8; kv_total * 2];
+                    self.v_proj_dev.copy_to_host(&mut vbuf)?;
+                    let vpath = format!("{}/vib3_gqa_v_proj_raw_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&vpath, &vbuf);
+                    tracing::info!("GQA DIAG L{} tok{}: dumped raw Q/K/V projections", layer, tok);
+                }
                 //   8. Decode attention (Q × K^T / sqrt(head_dim), softmax, × V)
                 //   9. sigmoid(gate) * attention_output
                 //  10. O projection → hidden_state
@@ -3533,6 +3614,24 @@ impl Engine {
                     tracing::warn!("L{}: k_norm weight not available for gated attn", layer_idx);
                 }
 
+                // Dump Q after RMSNorm (interleaved) and K after RMSNorm
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    let q_total = num_heads * 2 * head_dim;
+                    let mut buf = vec![0u8; q_total * 2];
+                    self.q_proj_dev.copy_to_host(&mut buf)?;
+                    let path = format!("{}/vib3_gqa_q_after_norm_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&path, &buf);
+                    let kv_total = num_kv_heads * head_dim;
+                    let mut kbuf = vec![0u8; kv_total * 2];
+                    self.k_proj_dev.copy_to_host(&mut kbuf)?;
+                    let kpath = format!("{}/vib3_gqa_k_after_norm_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&kpath, &kbuf);
+                    tracing::info!("GQA DIAG L{} tok{}: dumped Q/K after RMSNorm", layer, tok);
+                }
+
                 // Step 4: Deinterleave Q+gate → attn_dev (Q) + gated_attn_gate_dev (gate)
                 // Input: q_proj_dev [num_heads * 2 * head_dim] interleaved
                 // Output: attn_dev [num_heads * head_dim] = Q, gated_attn_gate_dev [same] = gate
@@ -3544,6 +3643,23 @@ impl Engine {
                     num_heads,   // num_chunks
                     &self.stream,
                 )?;
+
+                // Dump Q and gate after deinterleave (before RoPE)
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    let attn_total = num_heads * head_dim;
+                    let mut qbuf = vec![0u8; attn_total * 2];
+                    self.attn_dev.copy_to_host(&mut qbuf)?;
+                    let qpath = format!("{}/vib3_gqa_q_deinterleaved_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&qpath, &qbuf);
+                    let mut gbuf = vec![0u8; attn_total * 2];
+                    self.gated_attn_gate_dev.copy_to_host(&mut gbuf)?;
+                    let gpath = format!("{}/vib3_gqa_gate_deinterleaved_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&gpath, &gbuf);
+                    tracing::info!("GQA DIAG L{} tok{}: dumped Q and gate after deinterleave", layer, tok);
+                }
 
                 // Step 5: Partial RoPE on Q (now in attn_dev, contiguous, stride=head_dim)
                 kernels::partial_rope(
@@ -3568,6 +3684,29 @@ impl Engine {
                     rope_base,
                     &self.stream,
                 )?;
+
+                // Dump Q and K after partial RoPE
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    let attn_total = num_heads * head_dim;
+                    let mut qbuf = vec![0u8; attn_total * 2];
+                    self.attn_dev.copy_to_host(&mut qbuf)?;
+                    let qpath = format!("{}/vib3_gqa_q_after_rope_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&qpath, &qbuf);
+                    let kv_total = num_kv_heads * head_dim;
+                    let mut kbuf = vec![0u8; kv_total * 2];
+                    self.k_proj_dev.copy_to_host(&mut kbuf)?;
+                    let kpath = format!("{}/vib3_gqa_k_after_rope_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&kpath, &kbuf);
+                    // Also dump V (unmodified after projection)
+                    let mut vbuf = vec![0u8; kv_total * 2];
+                    self.v_proj_dev.copy_to_host(&mut vbuf)?;
+                    let vpath = format!("{}/vib3_gqa_v_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&vpath, &vbuf);
+                    tracing::info!("GQA DIAG L{} tok{}: dumped Q/K after RoPE, V", layer, tok);
+                }
 
                 // Step 7: Append post-RoPE K/V to the GPU-resident KV cache
                 let err = unsafe {
@@ -3616,6 +3755,24 @@ impl Engine {
                     )));
                 }
 
+                // Dump attention output (before gating)
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    let attn_total = num_heads * head_dim;
+                    let mut abuf = vec![0u8; attn_total * 2];
+                    self.q_proj_dev.copy_to_host(&mut abuf)?; // attn output is in q_proj_dev
+                    let apath = format!("{}/vib3_gqa_attn_output_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&apath, &abuf);
+                    // Also log norms
+                    let f16_slice = unsafe { std::slice::from_raw_parts(abuf.as_ptr() as *const u16, attn_total) };
+                    let attn_l2: f32 = f16_slice.iter()
+                        .map(|&bits| { let v = half::f16::from_bits(bits).to_f32(); v * v })
+                        .sum::<f32>().sqrt();
+                    tracing::info!("GQA DIAG L{} tok{}: attn_output L2={:.4}", layer, tok, attn_l2);
+                }
+
                 // Step 9: Apply gating: attn_dev = attention_output * sigmoid(gate)
                 // attention_output is in q_proj_dev, gate is in gated_attn_gate_dev
                 // Write result to attn_dev for O projection input
@@ -3626,6 +3783,23 @@ impl Engine {
                     attn_dim,                             // num_heads * head_dim
                     &self.stream,
                 )?;
+
+                // Dump gated attention output (after sigmoid(gate) * attn_output)
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    let attn_total = num_heads * head_dim;
+                    let mut gbuf = vec![0u8; attn_total * 2];
+                    self.attn_dev.copy_to_host(&mut gbuf)?;
+                    let gpath = format!("{}/vib3_gqa_gated_output_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                    let _ = std::fs::write(&gpath, &gbuf);
+                    let f16_slice = unsafe { std::slice::from_raw_parts(gbuf.as_ptr() as *const u16, attn_total) };
+                    let gated_l2: f32 = f16_slice.iter()
+                        .map(|&bits| { let v = half::f16::from_bits(bits).to_f32(); v * v })
+                        .sum::<f32>().sqrt();
+                    tracing::info!("GQA DIAG L{} tok{}: gated_output L2={:.4}", layer, tok, gated_l2);
+                }
 
                 // Step 10: O projection — attn_dev [attn_dim] → hidden_state [hidden_dim]
                 if let Some((o_nvfp4_ptr, _o_m, o_nvfp4_k)) = o_nvfp4 {
@@ -3661,6 +3835,34 @@ impl Engine {
                         hidden_dim,
                         &self.stream,
                     )?;
+                }
+
+                // Dump O projection output
+                if gqa_diag {
+                    self.stream.synchronize()?;
+                    let dump_dir = "/home/brian/code/vib3/dump";
+                    let tok = self.position;
+                    if o_nvfp4.is_some() {
+                        // NVFP4: FP32 output in layer_output_buf
+                        let mut obuf = vec![0u8; hidden_dim * 4];
+                        self.layer_output_buf.copy_to_host(&mut obuf)?;
+                        let opath = format!("{}/vib3_gqa_o_proj_f32_L{}_tok{}.bin", dump_dir, layer, tok);
+                        let _ = std::fs::write(&opath, &obuf);
+                        let f32_slice = unsafe { std::slice::from_raw_parts(obuf.as_ptr() as *const f32, hidden_dim) };
+                        let o_l2 = f32_slice.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        tracing::info!("GQA DIAG L{} tok{}: o_proj (NVFP4→F32) L2={:.4}", layer, tok, o_l2);
+                    } else {
+                        // FP16 output in hidden_state
+                        let mut obuf = vec![0u8; hidden_dim * 2];
+                        self.hidden_state.copy_to_host(&mut obuf)?;
+                        let opath = format!("{}/vib3_gqa_o_proj_f16_L{}_tok{}.bin", dump_dir, layer, tok);
+                        let _ = std::fs::write(&opath, &obuf);
+                        let f16_slice = unsafe { std::slice::from_raw_parts(obuf.as_ptr() as *const u16, hidden_dim) };
+                        let o_l2: f32 = f16_slice.iter()
+                            .map(|&bits| { let v = half::f16::from_bits(bits).to_f32(); v * v })
+                            .sum::<f32>().sqrt();
+                        tracing::info!("GQA DIAG L{} tok{}: o_proj (FP16) L2={:.4}", layer, tok, o_l2);
+                    }
                 }
             } else {
                 // ── Standard (non-gated) GQA Attention Pipeline ──
@@ -4986,10 +5188,12 @@ impl Engine {
             }
 
             // ── CUDA Graph fast path: replay cached graph for layer loop ──
-            #[cfg(feature = "cuda")]
-            let use_graph = self.cuda_graph_exec.is_some();
-            #[cfg(not(feature = "cuda"))]
-            let use_graph = false;
+            // Disabled by default due decode correctness regressions observed on
+            // Qwen3.5 (token collapse under graph replay). Enable explicitly via:
+            //   VIB3_CUDA_GRAPH=1
+            let graph_enabled = cfg!(feature = "cuda")
+                && std::env::var("VIB3_CUDA_GRAPH").map_or(false, |v| v == "1");
+            let use_graph = graph_enabled && self.cuda_graph_exec.is_some();
 
             if use_graph {
                 // Replay the cached CUDA graph (all 48 layers in one launch)
@@ -5015,7 +5219,9 @@ impl Engine {
 
             if !use_graph {
             // ── Normal layer loop (also used for graph capture) ──
-            let capturing = step == 1 && !self.diag_enabled
+            let capturing = graph_enabled
+                && step == 1
+                && !self.diag_enabled
                 && self.cuda_graph_exec.is_none()
                 && self.moe_page_table_dev.is_some();
 
@@ -5561,7 +5767,8 @@ impl Engine {
         self.ensure_shared_tensor_device(0, 11).await;
 
         // Lazily convert lm_head to NVFP4 on first token
-        if self.lm_head_nvfp4.is_none() {
+        let fp16_lm_head = std::env::var("VIB3_FP16_LM_HEAD").map_or(false, |v| v == "1");
+        if self.lm_head_nvfp4.is_none() && !fp16_lm_head {
             if let Some((lm_head_ptr, lm_head_size)) = self.get_device_tensor(0, 11) {
                 let expected_fp16 = vocab_size * hidden_dim * 2;
                 if lm_head_size == expected_fp16 {
@@ -6403,15 +6610,28 @@ impl Engine {
                     )?;
 
                     // Dump shared expert down_proj output BEFORE sigmoid gating at L0
+                    // NOTE: shared_expert_down_dev is FP16 (output of partial_matmul)
                     if self.diag_enabled && layer == 0 {
                         self.stream.synchronize()?;
                         let dump_dir = "/home/brian/code/vib3/dump";
                         let tok = self.position;
-                        let mut buf = vec![0u8; hidden_dim * 4];
+                        // FP16 buffer: hidden_dim * 2 bytes
+                        let down_bytes = hidden_dim * 2;
+                        let mut buf = vec![0u8; down_bytes];
                         self.shared_expert_down_dev.copy_to_host(&mut buf)?;
                         let _ = std::fs::write(
                             format!("{}/vib3_shexp_down_L0_tok{}.bin", dump_dir, tok),
                             &buf,
+                        );
+                        // Convert to f32 for stats
+                        let f16_slice = unsafe {
+                            std::slice::from_raw_parts(buf.as_ptr() as *const f16, hidden_dim)
+                        };
+                        let l2: f32 = f16_slice.iter().map(|v| { let f = v.to_f32(); f * f }).sum::<f32>().sqrt();
+                        let max_abs = f16_slice.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                        tracing::info!(
+                            "SHEXP_DOWN L{} pos={}: L2={:.6}, max_abs={:.6}",
+                            layer, self.position, l2, max_abs,
                         );
                     }
 

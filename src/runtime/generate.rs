@@ -250,14 +250,13 @@ impl TokenizerWrapper {
         matches!(self, TokenizerWrapper::Real(_))
     }
 
-    /// Encode a chat conversation using the model's chat template.
+    /// Encode a chat conversation using a tokenizer-aware chat template.
     ///
-    /// For the real tokenizer, this applies the Kimi K2.5 chat template:
-    /// ```text
-    /// <|im_system|>system<|im_middle|>{system_prompt}<|im_end|>
-    /// <|im_user|>user<|im_middle|>{user_message}<|im_end|>
-    /// <|im_assistant|>assistant<|im_middle|>
-    /// ```
+    /// Chooses the template based on special tokens present in the loaded
+    /// tokenizer:
+    /// - Qwen ChatML: `<|im_start|>...<|im_end|>`
+    /// - Kimi: `<|im_system|>...<|im_middle|>...<|im_end|>`
+    ///
     /// For the simple tokenizer, this falls back to naive encoding.
     pub fn encode_chat(&self, user_message: &str, system_prompt: Option<&str>) -> Vec<u32> {
         match self {
@@ -360,15 +359,8 @@ impl SimpleTokenizer {
 
 /// Production tokenizer backed by HuggingFace's `tokenizers` library.
 ///
-/// Loads from `tokenizer.json` (standard HF format). Supports the Kimi K2.5
-/// chat template and all special tokens.
-///
-/// ## Kimi K2.5 chat template:
-/// ```text
-/// <|im_system|>system<|im_middle|>{system_prompt}<|im_end|>
-/// <|im_user|>user<|im_middle|>{user_message}<|im_end|>
-/// <|im_assistant|>assistant<|im_middle|><think>
-/// ```
+/// Loads from `tokenizer.json` (standard HF format) and supports model-aware
+/// chat templating (Qwen ChatML and Kimi-style templates).
 pub struct Vib3Tokenizer {
     inner: tokenizers::Tokenizer,
     /// BOS token ID (Kimi K2.5: 163584)
@@ -457,24 +449,34 @@ impl Vib3Tokenizer {
         }
     }
 
-    /// Encode with the Kimi K2.5 chat template.
+    /// Encode with a tokenizer-aware chat template.
     ///
-    /// Wraps the user message in the standard format:
-    /// ```text
-    /// <|im_system|>system<|im_middle|>{system_prompt}<|im_end|>
-    /// <|im_user|>user<|im_middle|>{user_message}<|im_end|>
-    /// <|im_assistant|>assistant<|im_middle|><think>
-    /// ```
+    /// Prefers Qwen ChatML (`<|im_start|>`) when available, otherwise falls
+    /// back to Kimi-style tags (`<|im_system|>`, `<|im_middle|>`).
     pub fn encode_chat(
         &self,
         user_message: &str,
         system_prompt: Option<&str>,
         thinking: bool,
     ) -> Vec<u32> {
-        let system =
-            system_prompt.unwrap_or("You are Kimi, an AI assistant created by Moonshot AI.");
+        let has_qwen_chatml = self.inner.token_to_id("<|im_start|>").is_some()
+            && self.inner.token_to_id("<|im_end|>").is_some();
 
-        let template = if thinking {
+        let system = system_prompt.unwrap_or("You are a helpful assistant.");
+
+        let template = if has_qwen_chatml {
+            if thinking {
+                format!(
+                    "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                    system, user_message
+                )
+            } else {
+                format!(
+                    "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    system, user_message
+                )
+            }
+        } else if thinking {
             format!(
                 "<|im_system|>system<|im_middle|>{}<|im_end|>\n<|im_user|>user<|im_middle|>{}<|im_end|>\n<|im_assistant|>assistant<|im_middle|><think>",
                 system, user_message
