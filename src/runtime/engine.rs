@@ -2076,6 +2076,27 @@ impl Engine {
 
         // Use pre-assembled weight (zero-copy for single-page norm tensor)
         if let Some((norm_ptr, _)) = self.get_preassembled_weight(layer_idx, 6) {
+            if self.diag_enabled && layer_idx == 0 && self.position == 0 {
+                self.stream.synchronize()?;
+                let mut w_bytes = vec![0u8; 64];
+                let _ = crate::compute::cuda_ffi::memcpy_d2h(w_bytes.as_mut_ptr(), norm_ptr as *const u8, w_bytes.len());
+                let mut h_bytes = vec![0u8; hidden_dim * 4];
+                self.hidden_state_f32.copy_to_host(&mut h_bytes)?;
+                let h = unsafe { std::slice::from_raw_parts(h_bytes.as_ptr() as *const f32, hidden_dim) };
+                let h_l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+                tracing::info!(
+                    "ATTN_NORM_WDBG preasm L{} pos={}: norm_first8={:02x?}, norm_nonzero={}/64, hidden_f32_l2={:.6}, hidden_first4=[{:.6},{:.6},{:.6},{:.6}]",
+                    layer_idx,
+                    self.position,
+                    &w_bytes[..8],
+                    w_bytes.iter().filter(|b| **b != 0).count(),
+                    h_l2,
+                    h[0],
+                    h[1],
+                    h[2],
+                    h[3],
+                );
+            }
             if is_gqa_nvfp4 {
                 // GQA NVFP4: skip FP16 norm entirely — the fused kernel in
                 // try_gpu_decode_attention will produce FP4 directly from FP32.
@@ -2106,9 +2127,61 @@ impl Engine {
                 )?;
             }
         } else {
-            // Fallback: fast synchronous D2D from resident snapshot
-            self.load_tensor_direct_resident(layer_idx, 6, self.attn_norm_w.as_ptr() as usize, self.attn_norm_w.size());
-            if let Some((norm_ptr, _)) = self.get_device_tensor(layer_idx, 6) {
+            // Fallback path when pre-assembled norm is unavailable:
+            // 1) try fast synchronous D2D from resident snapshot,
+            // 2) fall back to async page fetch + D2D,
+            // 3) finally fall back to shared tensor cache entry.
+            let mut loaded_bytes = self.load_tensor_direct_resident(
+                layer_idx,
+                6,
+                self.attn_norm_w.as_ptr() as usize,
+                self.attn_norm_w.size(),
+            );
+            if loaded_bytes == 0 {
+                loaded_bytes = self
+                    .load_tensor_direct(
+                        layer_idx,
+                        6,
+                        self.attn_norm_w.as_ptr() as usize,
+                        self.attn_norm_w.size(),
+                    )
+                    .await;
+            }
+
+            let norm_tensor = if loaded_bytes > 0 {
+                Some((self.attn_norm_w.as_ptr(), self.attn_norm_w.size()))
+            } else {
+                let _ = self.ensure_shared_tensor_device(layer_idx, 6).await;
+                self.get_preassembled_weight(layer_idx, 6).or_else(|| {
+                    let cache_key = (layer_idx as u32) << 16 | 6u32;
+                    self.shared_tensor_cache_device
+                        .get(&cache_key)
+                        .map(|dbuf| (dbuf.as_ptr(), dbuf.size()))
+                })
+            };
+
+            if let Some((norm_ptr, _)) = norm_tensor {
+                if self.diag_enabled && layer_idx == 0 && self.position == 0 {
+                    self.stream.synchronize()?;
+                    let mut w_bytes = vec![0u8; 64];
+                    let _ = crate::compute::cuda_ffi::memcpy_d2h(w_bytes.as_mut_ptr(), norm_ptr as *const u8, w_bytes.len());
+                    let mut h_bytes = vec![0u8; hidden_dim * 4];
+                    self.hidden_state_f32.copy_to_host(&mut h_bytes)?;
+                    let h = unsafe { std::slice::from_raw_parts(h_bytes.as_ptr() as *const f32, hidden_dim) };
+                    let h_l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    tracing::info!(
+                        "ATTN_NORM_WDBG device L{} pos={}: norm_first8={:02x?}, norm_nonzero={}/64, hidden_f32_l2={:.6}, hidden_first4=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx,
+                        self.position,
+                        &w_bytes[..8],
+                        w_bytes.iter().filter(|b| **b != 0).count(),
+                        h_l2,
+                        h[0],
+                        h[1],
+                        h[2],
+                        h[3],
+                    );
+                }
                 kernels::rms_norm_f32_to_f16(
                     self.hidden_state_f32.as_ptr(),
                     self.hidden_state.as_mut_ptr(),
@@ -2487,22 +2560,176 @@ impl Engine {
         // (segments 30=QKV, 31=Z, 38=out) to eliminate D2D staging copies.
         // Small single-page tensors still use D2D staging.
         let t_load = Instant::now();
-        let has_fp16_preassembled = self.get_preassembled_weight(layer_idx, 30).is_some();
-        let has_nvfp4 = self.get_preassembled_nvfp4(layer_idx, 30).is_some();
-        if !has_fp16_preassembled && !has_nvfp4 {
-            // Non-resident fallback: D2D from whatever pages are available
-            self.load_tensor_direct_resident(layer_idx, 30, self.dn_w_qkv.as_mut_ptr() as usize, self.dn_w_qkv.size());
-            self.load_tensor_direct_resident(layer_idx, 31, self.dn_w_z.as_mut_ptr() as usize, self.dn_w_z.size());
-            self.load_tensor_direct_resident(layer_idx, 38, self.dn_w_out.as_mut_ptr() as usize, self.dn_w_out.size());
+        let has_qkv_fp16_preassembled = self.get_preassembled_weight(layer_idx, 30).is_some();
+        let has_qkv_nvfp4_preassembled = self.get_preassembled_nvfp4(layer_idx, 30).is_some();
+        let has_z_fp16_preassembled = self.get_preassembled_weight(layer_idx, 31).is_some();
+        let has_z_nvfp4_preassembled = self.get_preassembled_nvfp4(layer_idx, 31).is_some();
+        let has_out_fp16_preassembled = self.get_preassembled_weight(layer_idx, 38).is_some();
+        let has_out_nvfp4_preassembled = self.get_preassembled_nvfp4(layer_idx, 38).is_some();
+
+        if !has_qkv_fp16_preassembled && !has_qkv_nvfp4_preassembled {
+            // Try fast resident snapshot first; if pages aren't resident, fall back to
+            // async page loading so staging buffers are never left stale/zero.
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                30,
+                self.dn_w_qkv.as_mut_ptr() as usize,
+                self.dn_w_qkv.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    30,
+                    self.dn_w_qkv.as_mut_ptr() as usize,
+                    self.dn_w_qkv.size(),
+                )
+                .await;
+            }
         }
-        if !has_fp16_preassembled && !has_nvfp4 {
-            // Small segments: always D2D (single-page, fast)
-            self.load_tensor_direct_resident(layer_idx, 32, self.dn_w_beta.as_mut_ptr() as usize, self.dn_w_beta.size());
-            self.load_tensor_direct_resident(layer_idx, 33, self.dn_w_alpha.as_mut_ptr() as usize, self.dn_w_alpha.size());
-            self.load_tensor_direct_resident(layer_idx, 34, self.dn_w_conv.as_mut_ptr() as usize, self.dn_w_conv.size());
-            self.load_tensor_direct_resident(layer_idx, 35, self.dn_w_dt_bias.as_mut_ptr() as usize, self.dn_w_dt_bias.size());
-            self.load_tensor_direct_resident(layer_idx, 36, self.dn_w_a_log.as_mut_ptr() as usize, self.dn_w_a_log.size());
-            self.load_tensor_direct_resident(layer_idx, 37, self.dn_w_norm.as_mut_ptr() as usize, self.dn_w_norm.size());
+
+        if !has_z_fp16_preassembled && !has_z_nvfp4_preassembled {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                31,
+                self.dn_w_z.as_mut_ptr() as usize,
+                self.dn_w_z.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    31,
+                    self.dn_w_z.as_mut_ptr() as usize,
+                    self.dn_w_z.size(),
+                )
+                .await;
+            }
+        }
+
+        if !has_out_fp16_preassembled && !has_out_nvfp4_preassembled {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                38,
+                self.dn_w_out.as_mut_ptr() as usize,
+                self.dn_w_out.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    38,
+                    self.dn_w_out.as_mut_ptr() as usize,
+                    self.dn_w_out.size(),
+                )
+                .await;
+            }
+        }
+
+        // Small segments: stage only when preassembled pointers are unavailable.
+        if self.get_preassembled_weight(layer_idx, 32).is_none() {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                32,
+                self.dn_w_beta.as_mut_ptr() as usize,
+                self.dn_w_beta.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    32,
+                    self.dn_w_beta.as_mut_ptr() as usize,
+                    self.dn_w_beta.size(),
+                )
+                .await;
+            }
+        }
+
+        if self.get_preassembled_weight(layer_idx, 33).is_none() {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                33,
+                self.dn_w_alpha.as_mut_ptr() as usize,
+                self.dn_w_alpha.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    33,
+                    self.dn_w_alpha.as_mut_ptr() as usize,
+                    self.dn_w_alpha.size(),
+                )
+                .await;
+            }
+        }
+
+        if self.get_preassembled_weight(layer_idx, 34).is_none() {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                34,
+                self.dn_w_conv.as_mut_ptr() as usize,
+                self.dn_w_conv.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    34,
+                    self.dn_w_conv.as_mut_ptr() as usize,
+                    self.dn_w_conv.size(),
+                )
+                .await;
+            }
+        }
+
+        if self.get_preassembled_weight(layer_idx, 35).is_none() {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                35,
+                self.dn_w_dt_bias.as_mut_ptr() as usize,
+                self.dn_w_dt_bias.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    35,
+                    self.dn_w_dt_bias.as_mut_ptr() as usize,
+                    self.dn_w_dt_bias.size(),
+                )
+                .await;
+            }
+        }
+
+        if self.get_preassembled_weight(layer_idx, 36).is_none() {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                36,
+                self.dn_w_a_log.as_mut_ptr() as usize,
+                self.dn_w_a_log.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    36,
+                    self.dn_w_a_log.as_mut_ptr() as usize,
+                    self.dn_w_a_log.size(),
+                )
+                .await;
+            }
+        }
+
+        if self.get_preassembled_weight(layer_idx, 37).is_none() {
+            if self.load_tensor_direct_resident(
+                layer_idx,
+                37,
+                self.dn_w_norm.as_mut_ptr() as usize,
+                self.dn_w_norm.size(),
+            ) == 0
+            {
+                self.load_tensor_direct(
+                    layer_idx,
+                    37,
+                    self.dn_w_norm.as_mut_ptr() as usize,
+                    self.dn_w_norm.size(),
+                )
+                .await;
+            }
         }
         if profile { self.stream.synchronize()?; }
         let load_us = t_load.elapsed().as_micros() as u64;
@@ -2520,6 +2747,37 @@ impl Engine {
             .map(|(p, _)| p).unwrap_or(self.dn_w_a_log.as_ptr());
         let norm_w_ptr = self.get_preassembled_weight(layer_idx, 37)
             .map(|(p, _)| p).unwrap_or(self.dn_w_norm.as_ptr());
+
+        if self.diag_enabled && layer_idx == 0 && self.position == 0 {
+            let qkv_dbg_ptr = self
+                .get_preassembled_weight(layer_idx, 30)
+                .map(|(p, _)| p)
+                .unwrap_or(self.dn_w_qkv.as_ptr());
+            let z_dbg_ptr = self
+                .get_preassembled_weight(layer_idx, 31)
+                .map(|(p, _)| p)
+                .unwrap_or(self.dn_w_z.as_ptr());
+            let out_dbg_ptr = self
+                .get_preassembled_weight(layer_idx, 38)
+                .map(|(p, _)| p)
+                .unwrap_or(self.dn_w_out.as_ptr());
+
+            self.stream.synchronize()?;
+            for (name, ptr) in [("qkv", qkv_dbg_ptr), ("z", z_dbg_ptr), ("out", out_dbg_ptr)] {
+                let mut buf = vec![0u8; 64];
+                let _ = crate::compute::cuda_ffi::memcpy_d2h(buf.as_mut_ptr(), ptr as *const u8, buf.len());
+                let nonzero = buf.iter().filter(|b| **b != 0).count();
+                tracing::info!(
+                    "DELTANET_WDBG L{} pos={}: {} first8={:02x?}, nonzero={}/{}",
+                    layer_idx,
+                    self.position,
+                    name,
+                    &buf[..8],
+                    nonzero,
+                    buf.len(),
+                );
+            }
+        }
 
         // ── 2. QKV + Z projections (batched when both NVFP4) ──
         // Check if weight is NVFP4 (4x bandwidth reduction via MMA GEMV)
