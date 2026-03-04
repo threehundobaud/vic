@@ -1,0 +1,82 @@
+{
+  "timestamp_unix": 1772603970,
+  "base_url": "http://127.0.0.1:8123/v1",
+  "model": "default",
+  "config": {
+    "runs": 24,
+    "concurrency": 2,
+    "max_tokens": 64,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": false,
+        "latency_ms": 2482.57,
+        "ttft_ms": 2482.47,
+        "content": "\u6d0b\u670d\n\n\nY1\n\nY2\n\nY2",
+        "error": ""
+      },
+      {
+        "name": "short_coherent",
+        "passed": true,
+        "latency_ms": 2727.57,
+        "ttft_ms": 2727.42,
+        "content": "\u6d0b\u670d\n\n\nY 10.\n\n\n\nY 2.\n\n\n\nY 2.\n\n\n\nY",
+        "error": ""
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 24,
+      "concurrency": 2,
+      "success": 24,
+      "errors": 0,
+      "req_s": 0.2,
+      "tok_s": 3.946,
+      "latency_ms_avg": 9782.6,
+      "latency_ms_p95": 10222.24,
+      "ttft_ms_avg": 9782.2,
+      "ttft_ms_p95": 10221.91,
+      "sample_errors": []
+    },
+    {
+      "scenario": "mixed",
+      "runs": 24,
+      "concurrency": 2,
+      "success": 24,
+      "errors": 0,
+      "req_s": 0.196,
+      "tok_s": 3.762,
+      "latency_ms_avg": 9963.44,
+      "latency_ms_p95": 10476.13,
+      "ttft_ms_avg": 9963.06,
+      "ttft_ms_p95": 10475.82,
+      "sample_errors": []
+    },
+    {
+      "scenario": "long",
+      "runs": 24,
+      "concurrency": 2,
+      "success": 24,
+      "errors": 0,
+      "req_s": 0.148,
+      "tok_s": 2.138,
+      "latency_ms_avg": 13237.32,
+      "latency_ms_p95": 13634.69,
+      "ttft_ms_avg": 13236.92,
+      "ttft_ms_p95": 13634.32,
+      "sample_errors": []
+    }
+  ]
+}
