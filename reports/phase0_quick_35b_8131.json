@@ -1,0 +1,82 @@
+{
+  "timestamp_unix": 1772595485,
+  "base_url": "http://127.0.0.1:8131/v1",
+  "model": "default",
+  "config": {
+    "runs": 6,
+    "concurrency": 2,
+    "max_tokens": 24,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": true,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": true,
+        "latency_ms": 783.24,
+        "ttft_ms": 783.19,
+        "content": "Four",
+        "error": ""
+      },
+      {
+        "name": "short_coherent",
+        "passed": true,
+        "latency_ms": 900.64,
+        "ttft_ms": 900.54,
+        "content": "The sky stretches endlessly above us in a vast canvas of blue.",
+        "error": ""
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 6,
+      "concurrency": 2,
+      "success": 6,
+      "errors": 0,
+      "req_s": 1.441,
+      "tok_s": 1.441,
+      "latency_ms_avg": 1272.09,
+      "latency_ms_p95": 1404.05,
+      "ttft_ms_avg": 1272.05,
+      "ttft_ms_p95": 1404.01,
+      "sample_errors": []
+    },
+    {
+      "scenario": "mixed",
+      "runs": 6,
+      "concurrency": 2,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.709,
+      "tok_s": 11.704,
+      "latency_ms_avg": 2546.86,
+      "latency_ms_p95": 3016.53,
+      "ttft_ms_avg": 2546.63,
+      "ttft_ms_p95": 3016.39,
+      "sample_errors": []
+    },
+    {
+      "scenario": "long",
+      "runs": 6,
+      "concurrency": 2,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.517,
+      "tok_s": 9.307,
+      "latency_ms_avg": 3538.04,
+      "latency_ms_p95": 4202.98,
+      "ttft_ms_avg": 3537.88,
+      "ttft_ms_p95": 4202.78,
+      "sample_errors": []
+    }
+  ]
+}

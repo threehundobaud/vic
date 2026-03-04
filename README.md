@@ -68,6 +68,18 @@ cargo run --release --bin vib3-bench -- --model kimi-k2.5.vib3 --runs 5
 cargo run --release --bin vib3-inspect -- --model kimi-k2.5.vib3 --all
 ```
 
+## Runtime Env Vars (Debug/Guardrails)
+
+- `VIB3_NVFP4_DELTANET=1` — request NVFP4 path for DeltaNet projections.
+- `VIB3_F32_DELTANET_PROJ=1` — enable experimental FP32-input DeltaNet projections (default OFF; may regress quality on some checkpoints).
+- `VIB3_ENABLE_SHARED_NVFP4_PREASSEMBLY=1` — enable shared projection preassembly conversion to NVFP4 on qwen3.5 (default OFF; FP16 shared projections are used by default for correctness).
+- `VIB3_ALLOW_UNSAFE_DELTANET_NVFP4=1` — explicit override for Qwen3.5 models; without this, DeltaNet NVFP4 is ignored due known severe quality regression.
+- `VIB3_NVFP4_DELTANET_QKV=0|1`, `VIB3_NVFP4_DELTANET_Z=0|1`, `VIB3_NVFP4_DELTANET_OUT=0|1` — per-projection DeltaNet NVFP4 toggles (when enabled).
+- `VIB3_NVFP4_DELTANET_SCALAR=1` — force scalar NVFP4 GEMV for DeltaNet (kernel-path isolation).
+- `VIB3_DIAG=1` — enable runtime diagnostics.
+- `VIB3_DIAG_NVFP4_COMPARE=1` — log runtime FP16-vs-NVFP4 projection deltas (`NVFP4_COMPARE`).
+- `VIB3_DIAG_NVFP4_WEIGHT_AUDIT=1` — log load-time FP16-vs-dequantized-NVFP4 weight deltas (`NVFP4_WEIGHT_AUDIT`).
+
 ## Project Structure
 
 ```

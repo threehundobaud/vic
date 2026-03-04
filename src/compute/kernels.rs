@@ -1594,7 +1594,26 @@ pub fn rms_norm_f32(
             return Ok(());
         }
     }
-    Err(Error::Cuda("rms_norm_f32 requires GPU".to_string()))
+    // CPU fallback
+    // SAFETY: Caller provides valid host pointers for `dim` elements.
+    let input_f32 = unsafe { std::slice::from_raw_parts(input as *const f32, dim) };
+    // SAFETY: Caller provides valid writable host pointer for `dim` elements.
+    let output_f32 = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, dim) };
+    // SAFETY: RMSNorm weight is FP16 with `dim` elements.
+    let weight_f16 = unsafe { std::slice::from_raw_parts(weight as *const f16, dim) };
+
+    let mut sum_sq = 0.0f64;
+    for &value in input_f32 {
+        let v = value as f64;
+        sum_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / ((sum_sq as f32 / dim as f32) + eps).sqrt();
+
+    for i in 0..dim {
+        output_f32[i] = input_f32[i] * inv_rms * weight_f16[i].to_f32();
+    }
+
+    Ok(())
 }
 
 /// FP32→FP16 RMSNorm: reads FP32 hidden state, normalizes in FP32 precision,
@@ -1631,7 +1650,27 @@ pub fn rms_norm_f32_to_f16(
             return Ok(());
         }
     }
-    Err(Error::Cuda("rms_norm_f32_to_f16 requires GPU".to_string()))
+    // CPU fallback
+    // SAFETY: Caller provides valid host pointers for `dim` elements.
+    let input_f32 = unsafe { std::slice::from_raw_parts(input as *const f32, dim) };
+    // SAFETY: Caller provides valid writable host pointer for `dim` FP16 elements.
+    let output_f16 = unsafe { std::slice::from_raw_parts_mut(output as *mut f16, dim) };
+    // SAFETY: RMSNorm weight is FP16 with `dim` elements.
+    let weight_f16 = unsafe { std::slice::from_raw_parts(weight as *const f16, dim) };
+
+    let mut sum_sq = 0.0f64;
+    for &value in input_f32 {
+        let v = value as f64;
+        sum_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / ((sum_sq as f32 / dim as f32) + eps).sqrt();
+
+    for i in 0..dim {
+        let normalized = input_f32[i] * inv_rms * weight_f16[i].to_f32();
+        output_f16[i] = f16::from_f32(normalized);
+    }
+
+    Ok(())
 }
 
 /// Fused RMSNorm + FP4 quantize: reads FP32 hidden state, applies RMSNorm
@@ -4438,7 +4477,16 @@ pub fn f32_to_f16(input: *const u8, output: *mut u8, n: usize, stream: &CudaStre
             return Ok(());
         }
     }
-    Err(Error::Cuda("f32_to_f16 requires GPU".to_string()))
+    // CPU fallback
+    // SAFETY: Caller guarantees `input` points to at least `n` f32 values and
+    // `output` points to at least `n` f16 values. Buffers are non-overlapping.
+    let input_f32 = unsafe { std::slice::from_raw_parts(input as *const f32, n) };
+    // SAFETY: See comment above; output has capacity for `n` f16 elements.
+    let output_f16 = unsafe { std::slice::from_raw_parts_mut(output as *mut f16, n) };
+    for i in 0..n {
+        output_f16[i] = f16::from_f32(input_f32[i]);
+    }
+    Ok(())
 }
 
 /// GPU FP16→F32 conversion.
@@ -4459,7 +4507,16 @@ pub fn f16_to_f32(input: *const u8, output: *mut u8, n: usize, stream: &CudaStre
             return Ok(());
         }
     }
-    Err(Error::Cuda("f16_to_f32 requires GPU".to_string()))
+    // CPU fallback
+    // SAFETY: Caller guarantees `input` points to at least `n` f16 values and
+    // `output` points to at least `n` f32 values. Buffers are non-overlapping.
+    let input_f16 = unsafe { std::slice::from_raw_parts(input as *const f16, n) };
+    // SAFETY: See comment above; output has capacity for `n` f32 elements.
+    let output_f32 = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, n) };
+    for i in 0..n {
+        output_f32[i] = input_f16[i].to_f32();
+    }
+    Ok(())
 }
 
 /// GPU FP32 residual accumulation: accumulator[i] += f32(layer_output_f16[i]).
@@ -4491,7 +4548,16 @@ pub fn residual_add_fp32(
             return Ok(());
         }
     }
-    Err(Error::Cuda("residual_add_fp32 requires GPU".to_string()))
+    // CPU fallback
+    // SAFETY: Caller provides `dim` FP32 accumulator elements and `dim` FP16
+    // layer output elements in valid, non-overlapping host buffers.
+    let accumulator_f32 = unsafe { std::slice::from_raw_parts_mut(accumulator as *mut f32, dim) };
+    // SAFETY: See comment above; layer output has `dim` FP16 elements.
+    let layer_output_f16 = unsafe { std::slice::from_raw_parts(layer_output as *const f16, dim) };
+    for i in 0..dim {
+        accumulator_f32[i] += layer_output_f16[i].to_f32();
+    }
+    Ok(())
 }
 
 /// Causal depthwise 1D convolution with SiLU activation.
@@ -4529,7 +4595,43 @@ pub fn causal_conv1d(
             return Ok(());
         }
     }
-    Err(Error::Cuda("causal_conv1d requires GPU".to_string()))
+    // CPU fallback
+    let state_len = kernel_size.saturating_sub(1);
+
+    // SAFETY: Caller provides valid host buffers with the documented shapes.
+    let conv_state_f32 = unsafe {
+        std::slice::from_raw_parts_mut(conv_state as *mut f32, num_channels * state_len)
+    };
+    // SAFETY: Caller provides valid host buffers with `num_channels` elements.
+    let new_input_f32 = unsafe { std::slice::from_raw_parts(new_input as *const f32, num_channels) };
+    // SAFETY: Caller provides `num_channels * kernel_size` FP32 weights.
+    let conv_weight_f32 = unsafe {
+        std::slice::from_raw_parts(conv_weight as *const f32, num_channels * kernel_size)
+    };
+    // SAFETY: Caller provides writable host output with `num_channels` FP32 elements.
+    let output_f32 = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, num_channels) };
+
+    for ch in 0..num_channels {
+        let state_base = ch * state_len;
+        let weight_base = ch * kernel_size;
+
+        let mut acc = 0.0f32;
+        for i in 0..state_len {
+            acc += conv_state_f32[state_base + i] * conv_weight_f32[weight_base + i];
+        }
+        acc += new_input_f32[ch] * conv_weight_f32[weight_base + state_len];
+
+        output_f32[ch] = acc / (1.0 + (-acc).exp());
+
+        if state_len > 0 {
+            for i in 0..(state_len - 1) {
+                conv_state_f32[state_base + i] = conv_state_f32[state_base + i + 1];
+            }
+            conv_state_f32[state_base + state_len - 1] = new_input_f32[ch];
+        }
+    }
+
+    Ok(())
 }
 
 /// L2 normalization: output[i] = input[i] / ||input[i]||_2.
@@ -4561,7 +4663,26 @@ pub fn l2_norm(
             return Ok(());
         }
     }
-    Err(Error::Cuda("l2_norm requires GPU".to_string()))
+    // CPU fallback
+    // SAFETY: Caller provides `num_vecs * dim` FP32 elements for input/output.
+    let input_f32 = unsafe { std::slice::from_raw_parts(input as *const f32, num_vecs * dim) };
+    // SAFETY: Caller provides writable output for `num_vecs * dim` FP32 elements.
+    let output_f32 = unsafe { std::slice::from_raw_parts_mut(output as *mut f32, num_vecs * dim) };
+
+    for vec_idx in 0..num_vecs {
+        let base = vec_idx * dim;
+        let mut sum_sq = 0.0f64;
+        for i in 0..dim {
+            let v = input_f32[base + i] as f64;
+            sum_sq += v * v;
+        }
+        let inv_norm = 1.0f32 / ((sum_sq as f32).sqrt() + eps);
+        for i in 0..dim {
+            output_f32[base + i] = input_f32[base + i] * inv_norm;
+        }
+    }
+
+    Ok(())
 }
 
 /// Tiled repeat FP32 vectors: expand [num_groups, dim] → [num_groups*repeat, dim].

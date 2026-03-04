@@ -1,0 +1,91 @@
+{
+  "timestamp_unix": 1772587158,
+  "base_url": "http://127.0.0.1:8123/v1",
+  "model": "default",
+  "config": {
+    "runs": 2,
+    "concurrency": 1,
+    "max_tokens": 8,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": false,
+        "latency_ms": 20.99,
+        "ttft_ms": null,
+        "content": "",
+        "error": "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      },
+      {
+        "name": "short_coherent",
+        "passed": false,
+        "latency_ms": 8.18,
+        "ttft_ms": null,
+        "content": "",
+        "error": "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 2,
+      "concurrency": 1,
+      "success": 0,
+      "errors": 2,
+      "req_s": 125.352,
+      "tok_s": 0.0,
+      "latency_ms_avg": 0.0,
+      "latency_ms_p95": 0.0,
+      "ttft_ms_avg": 0.0,
+      "ttft_ms_p95": 0.0,
+      "sample_errors": [
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      ]
+    },
+    {
+      "scenario": "mixed",
+      "runs": 2,
+      "concurrency": 1,
+      "success": 0,
+      "errors": 2,
+      "req_s": 126.687,
+      "tok_s": 0.0,
+      "latency_ms_avg": 0.0,
+      "latency_ms_p95": 0.0,
+      "ttft_ms_avg": 0.0,
+      "ttft_ms_p95": 0.0,
+      "sample_errors": [
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      ]
+    },
+    {
+      "scenario": "long",
+      "runs": 2,
+      "concurrency": 1,
+      "success": 0,
+      "errors": 2,
+      "req_s": 127.9,
+      "tok_s": 0.0,
+      "latency_ms_avg": 0.0,
+      "latency_ms_p95": 0.0,
+      "ttft_ms_avg": 0.0,
+      "ttft_ms_p95": 0.0,
+      "sample_errors": [
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 requires GPU\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      ]
+    }
+  ]
+}

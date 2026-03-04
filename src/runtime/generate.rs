@@ -1,5 +1,7 @@
 //! Generation loop — token sampling, streaming output, and KV cache management.
 
+use std::collections::HashSet;
+
 use half::f16;
 
 /// Sampling parameters for text generation.
@@ -39,13 +41,31 @@ impl Sampler {
     }
 
     /// Sample a token from logits using the given parameters.
-    pub fn sample(&mut self, logits: &[f32], params: &SamplingParams) -> u32 {
+    pub fn sample(&mut self, logits: &[f32], params: &SamplingParams, recent_tokens: &[u32]) -> u32 {
         let vocab_size = logits.len();
         if vocab_size == 0 {
             return 0;
         }
 
         let mut probs = logits.to_vec();
+
+        // Apply repetition penalty before temperature/top-k/top-p.
+        // GPT-style rule: if logit > 0 divide by penalty, else multiply.
+        if params.repetition_penalty > 1.0 && !recent_tokens.is_empty() {
+            let mut seen = HashSet::new();
+            for &token_id in recent_tokens {
+                let idx = token_id as usize;
+                if idx >= vocab_size || !seen.insert(idx) {
+                    continue;
+                }
+                let logit = probs[idx];
+                probs[idx] = if logit > 0.0 {
+                    logit / params.repetition_penalty
+                } else {
+                    logit * params.repetition_penalty
+                };
+            }
+        }
 
         // Apply temperature
         if params.temperature > 0.0 && params.temperature != 1.0 {

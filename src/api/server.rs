@@ -1,6 +1,7 @@
 //! OpenAI-compatible HTTP API server with streaming support.
 
 use crate::core::types::TaskContext;
+use crate::core::error::Error;
 use crate::runtime::engine::Engine;
 use crate::runtime::generate::SamplingParams;
 use axum::{
@@ -182,6 +183,7 @@ async fn chat_completions(
     let params = SamplingParams {
         temperature: req.temperature,
         top_p: req.top_p.unwrap_or(0.9),
+        repetition_penalty: 1.2,
         max_tokens: req.max_tokens,
         ..Default::default()
     };
@@ -257,8 +259,7 @@ async fn chat_completions(
                 let mut texts: Vec<String> = Vec::new();
 
                 if let Err(e) = engine.prefill_tokens(&input_tokens).await {
-                    texts.push(format!("[Error: {}]", e));
-                    return texts;
+                    return Err(e);
                 }
 
                 tracing::info!("Input tokens ({}): {:?}", input_tokens.len(),
@@ -267,7 +268,7 @@ async fn chat_completions(
                 let max_tokens = params.max_tokens;
                 let mut token_ids = Vec::new();
                 for step in 0..max_tokens {
-                    match engine.generate_one_token(step, &params).await {
+                    match engine.generate_one_token(step, &params, &token_ids).await {
                         Ok(token_id) => {
                             tracing::info!("Generated token[{}]: id={}", step, token_id);
                             token_ids.push(token_id);
@@ -278,14 +279,28 @@ async fn chat_completions(
                             }
                             texts.push(engine.tokenizer().decode(&[token_id]));
                         }
-                        Err(_) => break,
+                        Err(e) => return Err(e),
                     }
                 }
                 tracing::info!("All generated token IDs: {:?}", token_ids);
-                texts
+                Ok::<Vec<String>, Error>(texts)
             })
             .await
-            .unwrap_or_default()
+            .map_err(|e| Error::Other(anyhow::anyhow!("Task panicked: {}", e)))
+        };
+
+        let token_texts = match token_texts {
+            Ok(Ok(texts)) => texts,
+            Ok(Err(e)) | Err(e) => {
+                let error_resp = ApiError {
+                    error: ApiErrorBody {
+                        message: format!("{}", e),
+                        r#type: "server_error".into(),
+                        code: Some("internal_error".into()),
+                    },
+                };
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(error_resp)).into_response();
+            }
         };
 
         // Build SSE events from collected tokens
@@ -392,7 +407,7 @@ async fn chat_completions(
                 let mut generated = Vec::new();
                 let max_tokens = params.max_tokens;
                 for step in 0..max_tokens {
-                    match engine.generate_one_token(step, &params).await {
+                    match engine.generate_one_token(step, &params, &generated).await {
                         Ok(token_id) => {
                             if stop_ids.contains(&token_id)
                                 || params.stop_tokens.contains(&token_id)

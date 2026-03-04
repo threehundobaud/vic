@@ -1,0 +1,82 @@
+{
+  "timestamp_unix": 1772595738,
+  "base_url": "http://127.0.0.1:8132/v1",
+  "model": "default",
+  "config": {
+    "runs": 6,
+    "concurrency": 1,
+    "max_tokens": 24,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": false,
+        "latency_ms": 5400.83,
+        "ttft_ms": 5400.72,
+        "content": "What is 2+2. Answer with one word.",
+        "error": ""
+      },
+      {
+        "name": "short_coherent",
+        "passed": true,
+        "latency_ms": 6205.17,
+        "ttft_ms": 6205.02,
+        "content": "The 1000000000000000000000",
+        "error": ""
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.181,
+      "tok_s": 2.196,
+      "latency_ms_avg": 5539.71,
+      "latency_ms_p95": 6332.48,
+      "ttft_ms_avg": 5539.59,
+      "ttft_ms_p95": 6332.32,
+      "sample_errors": []
+    },
+    {
+      "scenario": "mixed",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.16,
+      "tok_s": 1.517,
+      "latency_ms_avg": 6260.95,
+      "latency_ms_p95": 7352.98,
+      "ttft_ms_avg": 6595.73,
+      "ttft_ms_p95": 7381.04,
+      "sample_errors": []
+    },
+    {
+      "scenario": "long",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.106,
+      "tok_s": 1.668,
+      "latency_ms_avg": 9389.59,
+      "latency_ms_p95": 10735.61,
+      "ttft_ms_avg": 9389.4,
+      "ttft_ms_p95": 10735.38,
+      "sample_errors": []
+    }
+  ]
+}

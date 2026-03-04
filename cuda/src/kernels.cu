@@ -6753,8 +6753,11 @@ int vib3_launch_fused_rms_norm_quantize_fp4(
 }
 
 int vib3_update_device_int32(void* d_ptr, int value, void* stream) {
-    return (int)cudaMemcpyAsync(d_ptr, &value, sizeof(int),
-                                 cudaMemcpyHostToDevice, (cudaStream_t)stream);
+    cudaStream_t s = (cudaStream_t)stream;
+    cudaError_t err = cudaMemcpyAsync(d_ptr, &value, sizeof(int),
+                                      cudaMemcpyHostToDevice, s);
+    if (err != cudaSuccess) return (int)err;
+    return (int)cudaStreamSynchronize(s);
 }
 
 } // extern "C" (reconstructed kernels)

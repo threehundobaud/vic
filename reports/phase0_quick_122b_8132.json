@@ -1,0 +1,100 @@
+{
+  "timestamp_unix": 1772595512,
+  "base_url": "http://127.0.0.1:8132/v1",
+  "model": "default",
+  "config": {
+    "runs": 6,
+    "concurrency": 1,
+    "max_tokens": 24,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": false,
+        "latency_ms": 5166.82,
+        "ttft_ms": null,
+        "content": "",
+        "error": "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      },
+      {
+        "name": "short_coherent",
+        "passed": false,
+        "latency_ms": 4324.89,
+        "ttft_ms": null,
+        "content": "",
+        "error": "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 0,
+      "errors": 6,
+      "req_s": 0.19,
+      "tok_s": 0.0,
+      "latency_ms_avg": 0.0,
+      "latency_ms_p95": 0.0,
+      "ttft_ms_avg": 0.0,
+      "ttft_ms_p95": 0.0,
+      "sample_errors": [
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      ]
+    },
+    {
+      "scenario": "mixed",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 0,
+      "errors": 6,
+      "req_s": 0.168,
+      "tok_s": 0.0,
+      "latency_ms_avg": 0.0,
+      "latency_ms_p95": 0.0,
+      "ttft_ms_avg": 0.0,
+      "ttft_ms_p95": 0.0,
+      "sample_errors": [
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      ]
+    },
+    {
+      "scenario": "long",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 0,
+      "errors": 6,
+      "req_s": 0.117,
+      "tok_s": 0.0,
+      "latency_ms_avg": 0.0,
+      "latency_ms_p95": 0.0,
+      "ttft_ms_avg": 0.0,
+      "ttft_ms_p95": 0.0,
+      "sample_errors": [
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}",
+        "HTTPError 500: {\"error\":{\"message\":\"CUDA error: f16_to_f32 launch failed (err=2)\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+      ]
+    }
+  ]
+}

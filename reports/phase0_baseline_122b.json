@@ -1,0 +1,82 @@
+{
+  "timestamp_unix": 1772586657,
+  "base_url": "http://127.0.0.1:8123/v1",
+  "model": "default",
+  "config": {
+    "runs": 8,
+    "concurrency": 1,
+    "max_tokens": 32,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": false,
+        "latency_ms": 507.44,
+        "ttft_ms": 507.37,
+        "content": "[Error: CUDA error: f16_to_f32 requires GPU]",
+        "error": ""
+      },
+      {
+        "name": "short_coherent",
+        "passed": true,
+        "latency_ms": 8.81,
+        "ttft_ms": 8.76,
+        "content": "[Error: CUDA error: f16_to_f32 requires GPU]",
+        "error": ""
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 8,
+      "concurrency": 1,
+      "success": 8,
+      "errors": 0,
+      "req_s": 93.769,
+      "tok_s": 562.612,
+      "latency_ms_avg": 10.42,
+      "latency_ms_p95": 14.38,
+      "ttft_ms_avg": 10.3,
+      "ttft_ms_p95": 14.2,
+      "sample_errors": []
+    },
+    {
+      "scenario": "mixed",
+      "runs": 8,
+      "concurrency": 1,
+      "success": 8,
+      "errors": 0,
+      "req_s": 104.859,
+      "tok_s": 629.155,
+      "latency_ms_avg": 9.35,
+      "latency_ms_p95": 14.3,
+      "ttft_ms_avg": 9.26,
+      "ttft_ms_p95": 14.12,
+      "sample_errors": []
+    },
+    {
+      "scenario": "long",
+      "runs": 8,
+      "concurrency": 1,
+      "success": 8,
+      "errors": 0,
+      "req_s": 108.589,
+      "tok_s": 651.535,
+      "latency_ms_avg": 8.97,
+      "latency_ms_p95": 12.38,
+      "ttft_ms_avg": 8.89,
+      "ttft_ms_p95": 12.27,
+      "sample_errors": []
+    }
+  ]
+}

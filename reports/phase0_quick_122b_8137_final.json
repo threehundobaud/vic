@@ -1,0 +1,82 @@
+{
+  "timestamp_unix": 1772597535,
+  "base_url": "http://127.0.0.1:8137/v1",
+  "model": "default",
+  "config": {
+    "runs": 6,
+    "concurrency": 1,
+    "max_tokens": 24,
+    "temperature": 0.0,
+    "timeout": 120,
+    "scenarios": [
+      "short",
+      "mixed",
+      "long"
+    ]
+  },
+  "smoke": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "math_one_word",
+        "passed": false,
+        "latency_ms": 2653.18,
+        "ttft_ms": 2653.09,
+        "content": "The answer is 2+3.",
+        "error": ""
+      },
+      {
+        "name": "short_coherent",
+        "passed": true,
+        "latency_ms": 2253.39,
+        "ttft_ms": 2253.3,
+        "content": "The 2015",
+        "error": ""
+      }
+    ]
+  },
+  "performance": [
+    {
+      "scenario": "short",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.384,
+      "tok_s": 3.651,
+      "latency_ms_avg": 2601.75,
+      "latency_ms_p95": 2959.6,
+      "ttft_ms_avg": 2601.65,
+      "ttft_ms_p95": 2959.47,
+      "sample_errors": []
+    },
+    {
+      "scenario": "mixed",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.418,
+      "tok_s": 2.089,
+      "latency_ms_avg": 2393.57,
+      "latency_ms_p95": 2621.65,
+      "ttft_ms_avg": 2467.91,
+      "ttft_ms_p95": 2624.38,
+      "sample_errors": []
+    },
+    {
+      "scenario": "long",
+      "runs": 6,
+      "concurrency": 1,
+      "success": 6,
+      "errors": 0,
+      "req_s": 0.255,
+      "tok_s": 1.104,
+      "latency_ms_avg": 3925.87,
+      "latency_ms_p95": 4597.35,
+      "ttft_ms_avg": 4011.77,
+      "ttft_ms_p95": 4641.02,
+      "sample_errors": []
+    }
+  ]
+}
