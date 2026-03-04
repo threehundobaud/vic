@@ -494,7 +494,7 @@ fn test_greedy_sampling() {
         temperature: 0.0, // greedy
         ..Default::default()
     };
-    let token = sampler.sample(&logits, &params);
+    let token = sampler.sample(&logits, &params, &[]);
     assert_eq!(token, 2);
 }
 
@@ -512,7 +512,7 @@ fn test_temperature_sampling() {
     // Sample many times and check distribution
     let mut counts = vec![0u32; 4];
     for _ in 0..1000 {
-        let token = sampler.sample(&logits, &params);
+        let token = sampler.sample(&logits, &params, &[]);
         counts[token as usize] += 1;
     }
     // Token 3 should be most common (highest logit)
@@ -5226,7 +5226,7 @@ async fn test_step_zero_does_not_advance_position() {
         ..Default::default()
     };
 
-    let _tok0 = engine.generate_one_token(0, &params).await.unwrap();
+    let _tok0 = engine.generate_one_token(0, &params, &[]).await.unwrap();
     assert_eq!(
         engine.position(),
         prefill_pos,
@@ -5234,7 +5234,7 @@ async fn test_step_zero_does_not_advance_position() {
     );
     assert_eq!(engine.decode_step(), 1);
 
-    let _tok1 = engine.generate_one_token(1, &params).await.unwrap();
+    let _tok1 = engine.generate_one_token(1, &params, &[]).await.unwrap();
     assert_eq!(
         engine.position(),
         prefill_pos + 1,
@@ -5336,11 +5336,11 @@ async fn test_mixtral_cpu_decode_smoke() {
         ..Default::default()
     };
 
-    let _tok0 = engine.generate_one_token(0, &params).await.unwrap();
+    let _tok0 = engine.generate_one_token(0, &params, &[]).await.unwrap();
     assert_eq!(engine.position(), prefill_pos);
     assert_eq!(engine.decode_step(), 1);
 
-    let _tok1 = engine.generate_one_token(1, &params).await.unwrap();
+    let _tok1 = engine.generate_one_token(1, &params, &[]).await.unwrap();
     assert_eq!(engine.position(), prefill_pos + 1);
     assert_eq!(engine.decode_step(), 2);
 }

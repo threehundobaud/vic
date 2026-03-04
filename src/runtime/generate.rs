@@ -492,7 +492,7 @@ impl Vib3Tokenizer {
                 )
             } else {
                 format!(
-                    "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
                     system, user_message
                 )
             }
@@ -546,7 +546,7 @@ impl Vib3Tokenizer {
         self.inner.token_to_id(token)
     }
 
-    /// Encode with the Qwen3.5 chat template (thinking mode).
+    /// Encode with the Qwen3.5 chat template.
     ///
     /// Wraps the user message in the standard Qwen3.5 format:
     /// ```text
@@ -555,12 +555,11 @@ impl Vib3Tokenizer {
     /// <|im_start|>user
     /// {user_message}<|im_end|>
     /// <|im_start|>assistant
-    /// <think>
     /// ```
     pub fn encode_chat_qwen35(&self, user_message: &str, system_prompt: Option<&str>) -> Vec<u32> {
         let sys = system_prompt.unwrap_or("You are a helpful assistant.");
         let template = format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             sys, user_message
         );
         self.encode(&template)
