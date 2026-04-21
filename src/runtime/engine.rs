@@ -4859,15 +4859,26 @@ impl Engine {
         self.ensure_shared_tensor_device(layer_idx, 21).await; // q_b_proj
         self.ensure_shared_tensor_device(layer_idx, 22).await; // kv_a_proj
         self.ensure_shared_tensor_device(layer_idx, 5).await;  // o_proj
+        // Predict whether we'll take the fully-GPU attention path. If so, skip
+        // the host-side loads below — they're only used in CPU fallbacks.
+        let will_take_gpu_attn = self.stream.is_real()
+            && self.kv_b_proj_f32_device.contains_key(&layer_idx)
+            && self.mla_rope_freqs_dev.is_some()
+            && (layer_idx as usize) < self.mla_gpu_kv_latent.len();
         // kv_b_proj stays on host — only load if not already cached as F32
         let kvb_data = if self.kv_b_proj_f32_cache.contains_key(&layer_idx) {
             None // Already cached as F32, skip the 16.8MB clone
         } else {
             self.load_shared_tensor(layer_idx, 23).await
         };
-        // Layernorm weights (small, 1 page each)
-        let q_norm_data = self.load_shared_tensor(layer_idx, 24).await;
-        let kv_norm_data = self.load_shared_tensor(layer_idx, 25).await;
+        // Layernorm weights (small, 1 page each) — only needed on CPU fallback paths
+        let (q_norm_data, kv_norm_data) = if will_take_gpu_attn {
+            (None, None)
+        } else {
+            let q = self.load_shared_tensor(layer_idx, 24).await;
+            let kv = self.load_shared_tensor(layer_idx, 25).await;
+            (q, kv)
+        };
 
         let qa_device = self.get_device_tensor(layer_idx, 20).map(|(p, s)| (p as usize, s));
         let qb_device = self.get_device_tensor(layer_idx, 21).map(|(p, s)| (p as usize, s));
