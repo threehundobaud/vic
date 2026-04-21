@@ -142,7 +142,14 @@ impl QueryPlanner {
     /// index and do NOT need this adjustment.
     #[inline]
     fn expert_storage_layer(&self, engine_layer: u16) -> u16 {
-        engine_layer + self.model_config.dense_layer_idx as u16
+        // GGUF-derived .vib3 files store experts at the raw block index
+        // (`blk.N.ffn_*_exps.weight` → storage_layer = N). The engine also
+        // uses the raw block index as its layer index, so no adjustment is
+        // needed. Previously this added `dense_layer_idx`, which queried
+        // storage_layer = 2 for K2.6's first MoE (engine_layer=1) whose
+        // data actually lives at storage_layer=1 — off-by-one → wrong
+        // experts, wrong bytes in VRAM, catastrophic MoE drift.
+        engine_layer
     }
 
     /// Plan computation for one layer given router activations.

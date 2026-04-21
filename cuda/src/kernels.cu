@@ -38,12 +38,19 @@ __device__ __forceinline__ float bf16_to_float(unsigned short bf16) {
     return result;
 }
 
-// FP16 → float conversion for INT4 quantization scales.
-// compressed-tensors stores scales as IEEE 754 half-precision (FP16),
-// NOT BF16. Using bf16_to_float on FP16 data produces ~1e-23 values
-// instead of ~0.003, causing matmul output to flush to zero.
+// FP16 → float conversion (used by NVFP4 scale reading).
 __device__ __forceinline__ float fp16_scale_to_float(unsigned short fp16_bits) {
     return __half2float(*reinterpret_cast<const half*>(&fp16_bits));
+}
+
+// BF16 → float conversion for INT4 quantization scales.
+// vib3 quantize_weights_to_int4() stores scales as BF16 (sign=1, exp=8, mantissa=7)
+// which has the same exponent range as FP32.  Reading BF16 bits as FP16 would
+// produce wildly wrong values (the 8-bit BF16 exponent overflows the 5-bit FP16 exponent).
+__device__ __forceinline__ float bf16_scale_to_float(unsigned short bf16_bits) {
+    // BF16 is the upper 16 bits of an FP32: just shift left by 16.
+    unsigned int fp32_bits = (unsigned int)bf16_bits << 16;
+    return __uint_as_float(fp32_bits);
 }
 
 // ─── Device Kernels ──────────────────────────────────────────────────────
@@ -106,12 +113,12 @@ __global__ void vib3_partial_matmul_fp16(
     }
 }
 
-// Tiled GEMV INT4: dequantize on the fly with per-group scales
+// Tiled GEMV INT4: dequantize on the fly with per-group BF16 scales
 // Same tiling strategy as FP16 but with INT4 unpacking
 __global__ void vib3_partial_matmul_int4(
     const half* __restrict__ input,
     const uint8_t* __restrict__ weight,
-    const unsigned short* __restrict__ scales,  // FP16 scale values (from compressed-tensors)
+    const unsigned short* __restrict__ scales,  // BF16 scale values (from quantize_weights_to_int4)
     half* __restrict__ output,
     int K,
     int M_slice,
@@ -137,7 +144,7 @@ __global__ void vib3_partial_matmul_int4(
         int w1 = (int)((packed >> 4) & 0xF) - 8;
 
         int group = k / group_size;
-        float scale = fp16_scale_to_float(row_scales[group]);
+        float scale = bf16_scale_to_float(row_scales[group]);
 
         acc += __half2float(input[k]) * (float)w0 * scale;
         if (k + 1 < K) {
@@ -200,7 +207,7 @@ __global__ void vib3_partial_matmul_int4_f32(
         int w1 = (int)((packed >> 4) & 0xF) - 8;
 
         int group = k / group_size;
-        float scale = fp16_scale_to_float(row_scales[group]);
+        float scale = bf16_scale_to_float(row_scales[group]);
 
         acc += input[k] * (float)w0 * scale;
         if (k + 1 < K) {
@@ -307,12 +314,12 @@ __global__ void vib3_fused_swiglu_int4_f32(
         int group = k / group_size;
 
         uint8_t up_packed = up_row[byte_idx];
-        float up_scale = fp16_scale_to_float(up_s[group]);
+        float up_scale = bf16_scale_to_float(up_s[group]);
         int up_w0 = (int)((up_packed >> 0) & 0xF) - 8;
         int up_w1 = (int)((up_packed >> 4) & 0xF) - 8;
 
         uint8_t gate_packed = gate_row[byte_idx];
-        float gate_scale = fp16_scale_to_float(gate_s[group]);
+        float gate_scale = bf16_scale_to_float(gate_s[group]);
         int gate_w0 = (int)((gate_packed >> 0) & 0xF) - 8;
         int gate_w1 = (int)((gate_packed >> 4) & 0xF) - 8;
 
@@ -1601,11 +1608,21 @@ __global__ void vib3_mla_decode_attn_kernel(
         }
         __syncthreads();
     }
-    float global_max = -1e30f;
-    if (tid == 0) { for (int p = 0; p < seq_len; p++) if (scores[p] > global_max) global_max = scores[p]; }
-    if (tid == 0) smem_mla[0] = global_max;
+    // Broadcast global_max via a DEDICATED shared slot, not smem_mla[0]:
+    // `scores == smem_mla`, so writing smem_mla[0] would clobber scores[0]
+    // and cause softmax to compute expf(0)=1.0 for position 0 regardless of
+    // its actual score — over-weighting position 0 at all positions where
+    // seq_len > 1.
+    __shared__ float gmax_shared;
+    if (tid == 0) {
+        float m = -1e30f;
+        for (int p = 0; p < seq_len; p++) {
+            if (scores[p] > m) m = scores[p];
+        }
+        gmax_shared = m;
+    }
     __syncthreads();
-    global_max = smem_mla[0];
+    float global_max = gmax_shared;
     float total_exp = 0.0f;
     if (tid == 0) {
         for (int p = 0; p < seq_len; p++) { float e = expf(scores[p] - global_max); scores[p] = e; total_exp += e; }
@@ -3932,20 +3949,25 @@ __device__ __forceinline__ void bitonic_cas_descending(
 //              Then if normalize: weights /= sum(weights), then weights *= scaling_factor.
 __global__ void vib3_router_topk_kernel(
     const float* __restrict__ raw_scores,  // [num_experts] from router GEMV
-    const float* __restrict__ bias,        // [num_experts] or NULL
+    const __half* __restrict__ bias,       // [num_experts] FP16 aux-free bias, or NULL
     unsigned short* __restrict__ out_ids,   // [top_k] output expert IDs
     float* __restrict__ out_weights,        // [top_k] output routing weights
     int num_experts,
+    int num_experts_padded,                 // next pow2 ≥ num_experts; shared-mem + block size
     int top_k,
     int scoring_mode,                       // 0=softmax, 1=sigmoid
     float scaling_factor                    // only for sigmoid mode
 ) {
-    // Shared memory for bitonic sort: keys (selection scores) + indices
+    // Shared memory for bitonic sort: keys (selection scores) + indices.
+    // Allocated for num_experts_padded so the bitonic sort never goes out of
+    // bounds when num_experts is not a power of 2 (Kimi K2.6 has 384 experts;
+    // padded to 512). Padding slots are filled with -INF keys so they lose
+    // every compare-and-swap and can never appear in the top-k output.
     extern __shared__ char smem_raw[];
     float* s_keys = (float*)smem_raw;
-    int* s_indices = (int*)(s_keys + num_experts);
+    int* s_indices = (int*)(s_keys + num_experts_padded);
     // For sigmoid: also store un-biased sigmoid scores for final weight output
-    float* s_sigmoid_scores = (float*)(s_indices + num_experts);
+    float* s_sigmoid_scores = (float*)(s_indices + num_experts_padded);
 
     int tid = threadIdx.x;
 
@@ -3956,7 +3978,8 @@ __global__ void vib3_router_topk_kernel(
         // produce slightly different sums due to FP associativity,
         // which compounds across 48 MoE layers into wrong output.
 
-        // Step 1: All threads load raw scores into shared memory
+        // Step 1: All threads load raw scores into shared memory. Padded
+        // slots (tid >= num_experts) get -INF so they fall out of top-k.
         s_keys[tid] = (tid < num_experts) ? raw_scores[tid] : -1e30f;
         __syncthreads();
 
@@ -3983,6 +4006,10 @@ __global__ void vib3_router_topk_kernel(
                     s_keys[i] *= inv_sum;
                 }
             }
+            // Fill padded region with -INF so it never wins a compare-and-swap
+            for (int i = num_experts; i < num_experts_padded; i++) {
+                s_keys[i] = -1e30f;
+            }
         }
         __syncthreads();
 
@@ -3992,14 +4019,21 @@ __global__ void vib3_router_topk_kernel(
 
     } else {
         // ── Sigmoid mode ──
-        float raw_val = (tid < num_experts) ? raw_scores[tid] : 0.0f;
-        float sig = (tid < num_experts) ? (1.0f / (1.0f + expf(-raw_val))) : 0.0f;
+        bool live = (tid < num_experts);
+        float raw_val = live ? raw_scores[tid] : 0.0f;
+        float sig = live ? (1.0f / (1.0f + expf(-raw_val))) : 0.0f;
         s_sigmoid_scores[tid] = sig;  // store un-biased score for final weights
 
-        // Selection score = sigmoid + bias (if present)
-        float sel = sig;
-        if (bias != NULL && tid < num_experts) {
-            sel += bias[tid];
+        // Selection score = sigmoid + bias (if present). Padded threads
+        // (tid >= num_experts) get -INF so they never appear in top-k.
+        // Bias is stored as FP16 in the .vib3 sidecar (DeepSeek-V3 /
+        // Kimi K2.6 exp_probs_b.bias is tiny so FP16 is adequate).
+        float sel;
+        if (live) {
+            sel = sig;
+            if (bias != NULL) sel += __half2float(bias[tid]);
+        } else {
+            sel = -1e30f;
         }
 
         s_keys[tid] = sel;
@@ -4007,9 +4041,11 @@ __global__ void vib3_router_topk_kernel(
     }
     __syncthreads();
 
-    // ── Bitonic sort (descending) over num_experts elements ──
-    // num_experts must be power of 2 (256 for Qwen3.5/DeepSeek)
-    for (int k = 2; k <= num_experts; k <<= 1) {
+    // ── Bitonic sort (descending) over num_experts_padded elements ──
+    // num_experts_padded is power of 2 by construction. Real experts occupy
+    // the first num_experts slots; padding slots carry -INF so they sink to
+    // the bottom of the sorted order and never appear in the top-k output.
+    for (int k = 2; k <= num_experts_padded; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
             int ixj = tid ^ j;
             if (ixj > tid) {
@@ -4077,7 +4113,7 @@ int vib3_launch_router_topk(
     const void* hidden_state,      // [hidden_dim] FP32
     const void* router_weights,    // [num_experts × hidden_dim] FP16
     float* scores_buf,             // [num_experts] FP32 temp buffer (device)
-    const float* bias,             // [num_experts] FP32 or NULL
+    const __half* bias,            // [num_experts] FP16 aux-free bias, or NULL
     unsigned short* out_ids,       // [top_k] output (device)
     float* out_weights,            // [top_k] output (device)
     int hidden_dim,
@@ -4096,12 +4132,18 @@ int vib3_launch_router_topk(
         hidden_dim, num_experts
     );
 
-    // Step 2: Top-k selection kernel
-    // Shared memory: s_keys[N] + s_indices[N] + s_sigmoid_scores[N] (sigmoid mode)
-    int smem_bytes = num_experts * (sizeof(float) + sizeof(int) + sizeof(float));
-    vib3_router_topk_kernel<<<1, num_experts, smem_bytes, s>>>(
+    // Step 2: Top-k selection kernel. The bitonic sort requires a power-of-2
+    // element count; num_experts for K2.6 is 384 (not pow2), so we round up
+    // to the next power of 2 (512) and fill the padding slots with -INF so
+    // they never appear in the top-k output. Up to block-size limit of 1024.
+    int num_experts_padded = 1;
+    while (num_experts_padded < num_experts) num_experts_padded <<= 1;
+    // Shared memory: s_keys[N_pad] + s_indices[N_pad] + s_sigmoid_scores[N_pad]
+    int smem_bytes =
+        num_experts_padded * (sizeof(float) + sizeof(int) + sizeof(float));
+    vib3_router_topk_kernel<<<1, num_experts_padded, smem_bytes, s>>>(
         scores_buf, bias, out_ids, out_weights,
-        num_experts, top_k, scoring_mode, scaling_factor
+        num_experts, num_experts_padded, top_k, scoring_mode, scaling_factor
     );
 
     return (int)cudaGetLastError();
