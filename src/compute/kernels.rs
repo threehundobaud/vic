@@ -491,53 +491,33 @@ pub fn partial_swiglu_f32(
                     }
                 }
                 DType::INT4 | DType::NF4 => {
-                    // Decompose: up=matmul_f32, gate=matmul_f32, output=SiLU(gate)*up
-                    let buf_size = m_slice * 2; // FP16
-                    let (up_result, gate_result, allocated) =
-                        if let Some((up_tmp, gate_tmp)) = swiglu_temps {
-                            (up_tmp, gate_tmp, false)
-                        } else {
-                            let up = cuda_ffi::device_alloc(buf_size)?;
-                            let gate = cuda_ffi::device_alloc(buf_size)?;
-                            (up, gate, true)
-                        };
-
-                    partial_matmul_f32(
-                        input,
-                        up_page,
-                        up_result,
-                        hidden_dim,
-                        m_slice,
-                        weight_dtype,
-                        stream,
-                    )?;
-                    partial_matmul_f32(
-                        input,
-                        gate_page,
-                        gate_result,
-                        hidden_dim,
-                        m_slice,
-                        weight_dtype,
-                        stream,
-                    )?;
+                    // Single fused launch: up×gate×silu_mul in one kernel.
+                    // Layout per page: [rows * packed_k INT4 bytes] [rows * num_groups BF16 scales].
+                    let _ = swiglu_temps; // not needed for fused path
+                    let packed_k = hidden_dim.div_ceil(2);
+                    let weight_data_size = packed_k * m_slice;
+                    let up_scales = unsafe { up_page.add(weight_data_size) };
+                    let gate_scales = unsafe { gate_page.add(weight_data_size) };
 
                     let err = unsafe {
-                        cuda_ffi::vib3_launch_silu_mul(
-                            gate_result as *const u8,
-                            up_result as *const u8,
+                        cuda_ffi::vib3_launch_fused_swiglu_int4_f32(
+                            input,
+                            up_page,
+                            up_scales,
+                            gate_page,
+                            gate_scales,
                             output,
+                            hidden_dim as i32,
                             m_slice as i32,
+                            INT4_GROUP_SIZE as i32,
                             stream.raw_ptr(),
                         )
                     };
-
-                    if allocated {
-                        cuda_ffi::device_free(up_result, buf_size);
-                        cuda_ffi::device_free(gate_result, buf_size);
-                    }
-
                     if err != 0 {
-                        return Err(Error::Cuda(format!("silu_mul launch failed (err={})", err)));
+                        return Err(Error::Cuda(format!(
+                            "fused_swiglu_int4_f32 launch failed (err={})",
+                            err
+                        )));
                     }
                 }
                 DType::NVFP4 => {
@@ -1847,6 +1827,7 @@ pub fn run_router_f32(
 /// on the GPU and only transferring back the final top-k results (tiny D2H).
 ///
 /// Returns Vec<(expert_id, weight)> sorted by weight descending.
+#[allow(clippy::too_many_arguments)]
 pub fn run_router_gpu_topk(
     hidden_state_f32: *const u8, // FP32 normalized hidden state (device)
     router_weights: *const u8,   // FP16 router weight matrix (device)
@@ -1857,6 +1838,7 @@ pub fn run_router_gpu_topk(
     scores_dev: *mut f32,      // [num_experts] temp buffer (device)
     topk_ids_dev: *mut u8,     // [top_k] u16 output (device)
     topk_weights_dev: *mut u8, // [top_k] f32 output (device)
+    bias: *const u8,           // optional aux-free expert bias (FP16 device ptr), NULL to skip
     stream: &CudaStream,
 ) -> Result<Vec<(u16, f32)>> {
     #[cfg(feature = "cuda")]
@@ -1876,7 +1858,7 @@ pub fn run_router_gpu_topk(
                     hidden_state_f32,
                     router_weights,
                     scores_dev,
-                    std::ptr::null(), // no bias (NULL)
+                    bias,
                     topk_ids_dev as *mut u16,
                     topk_weights_dev as *mut f32,
                     hidden_dim as i32,
@@ -1926,6 +1908,7 @@ pub fn run_router_gpu_topk(
 /// GPU router that launches the kernel but does NOT synchronize or D2H.
 /// Expert IDs and weights remain on device for consumption by
 /// `moe_experts_fused_gpu`. No host-side expert list is returned.
+#[allow(clippy::too_many_arguments)]
 pub fn run_router_gpu_topk_nosync(
     hidden_state_f32: *const u8, // FP32 normalized hidden state (device)
     router_weights: *const u8,   // FP16 router weight matrix (device)
@@ -1936,6 +1919,7 @@ pub fn run_router_gpu_topk_nosync(
     scores_dev: *mut f32,      // [num_experts] temp buffer (device)
     topk_ids_dev: *mut u8,     // [top_k] u16 output (device)
     topk_weights_dev: *mut u8, // [top_k] f32 output (device)
+    bias: *const u8,           // optional aux-free expert bias (FP16 device ptr), NULL to skip
     stream: &CudaStream,
 ) -> Result<()> {
     #[cfg(feature = "cuda")]
@@ -1954,7 +1938,7 @@ pub fn run_router_gpu_topk_nosync(
                     hidden_state_f32,
                     router_weights,
                     scores_dev,
-                    std::ptr::null(),
+                    bias,
                     topk_ids_dev as *mut u16,
                     topk_weights_dev as *mut f32,
                     hidden_dim as i32,
@@ -1985,6 +1969,7 @@ pub fn run_router_gpu_topk_nosync(
         topk_ids_dev,
         topk_weights_dev,
         stream,
+        bias,
     );
     Err(Error::Cuda(
         "run_router_gpu_topk_nosync requires GPU".to_string(),
