@@ -89,12 +89,12 @@ against the 150 ms baseline with the same prompt sequence.
   `run_mla_attention`. Projected gain: 3–5 ms/token. Risk: kernel bug at
   RMSNorm reduction. `cuda/src/kernels.cu` + engine.rs:4936.
 
-- **#7a  Fused INT4 SwiGLU (up + gate + silu_mul)** — the NVFP4 path has
-  `vib3_launch_fused_swiglu_nvfp4`; INT4 decomposes to three kernel
-  launches per expert. Write an INT4 analogue. Projected gain:
-  5–10 ms/token (960 fewer launches per token). Risk: scale-table
-  indexing across two weight matrices. `cuda/src/kernels.cu` +
-  `compute/kernels.rs:partial_swiglu_f32`.
+- **#7a  Fused INT4 SwiGLU (up + gate + silu_mul)** — SHIPPED `fc23e50`.
+  The kernel `vib3_fused_swiglu_int4_f32` already existed but wasn't
+  wired up; `partial_swiglu_f32` still launched up+gate+silu_mul
+  separately. Wired to the fused launcher. Measured: ~7 ms/token
+  improvement (150 ms → 143 ms warm steady state), smaller than the
+  10 ms projection because CUDA was already pipelining launches.
 
 - **#28  Remove `ensure_shared_tensor_device` awaits from MLA hot path**
   — 4 awaits per attention layer × 60 = 240 async boundary crossings per
@@ -227,23 +227,35 @@ VIB3_DIAG=0 PATH=/usr/local/cuda/bin:$PATH \
 
 ---
 
-## 6. Reference timings (commit 8f663c7, 2026-04-21)
+## 6. Reference timings
+
+### commit fc23e50, 2026-04-21 — after #7a fused INT4 SwiGLU wired in
+
+```
+multi-prompt session, token 7-15 steady state:
+  Total:              143 ms = 7.0 tok/s
+  ├─ Attention:        90 ms  (60 layers × 1.5 ms MLA — 9 kernel launches each)
+  ├─ MoE:              51 ms  (60 layers × 0.85 ms — 8 experts fused SwiGLU + 1 shared)
+  ├─ lm_head + logits: 0.6 ms
+  └─ GPU sync:         0.5 ms
+
+best-token observed: 135 ms = 7.4 tok/s
+worst (non-eviction) steady-state token: 148 ms = 6.8 tok/s
+```
+
+### commit 8f663c7, pre-fusion baseline — for comparison
 
 ```
 multi-prompt session, token 7-15 steady state:
   Total:              150 ms = 6.7 tok/s
-  ├─ Attention:        98 ms  (60 layers × 1.6 ms MLA — 9 kernel launches each)
-  ├─ MoE:              50 ms  (60 layers × 0.83 ms — 8 experts + 1 shared)
+  ├─ Attention:        98 ms
+  ├─ MoE:              50 ms  (24 launches per MoE layer — up+gate+silu_mul × 8 experts)
   ├─ lm_head + logits: 0.6 ms
   └─ GPU sync:         0.7 ms
 
-diverse-prompt session, token 7-15 steady state:
-  4.6 tok/s average
-  T1 hit rate: 95%
+diverse-prompt session: 4.6 tok/s average, T1 hit rate 95%
 
-cold first invocation:
-  0.3 tok/s
-  TTFT: 70-97 s  (NVMe → T1+T2 cold load of 576 GB model)
+cold first invocation: 0.3 tok/s, TTFT 70-97 s
 ```
 
 The compute floor is ~200 μs/layer attention if launch overhead went to
