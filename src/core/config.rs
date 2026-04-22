@@ -91,6 +91,46 @@ pub struct ModelConfig {
     /// Default 0 means infer as hidden_dim / num_heads (standard transformers).
     #[serde(default)]
     pub attn_head_dim: u32,
+
+    /// Number of expert groups for grouped top-k routing (DeepSeek-V3 field
+    /// `n_group`). Experts are partitioned into `n_group` contiguous groups of
+    /// `num_experts / n_group` each. When `> 1`, routing picks `topk_group`
+    /// groups by aggregate group score and then top-k experts within those
+    /// groups. When `1` (Kimi K2.5 / K2.6), routing degenerates to flat top-k.
+    #[serde(default = "default_one_u32")]
+    pub n_group: u32,
+
+    /// Number of expert groups selected per token for grouped top-k routing
+    /// (DeepSeek-V3 field `topk_group`). Only meaningful when `n_group > 1`.
+    /// Default 1 matches the flat-top-k degenerate case.
+    #[serde(default = "default_one_u32")]
+    pub topk_group: u32,
+
+    /// Number of native multi-token-prediction layers (DeepSeek-V3 field
+    /// `num_nextn_predict_layers`). K2.5/K2.6 ship `0`. When `> 0`, the model
+    /// carries MTP draft heads that can feed a speculative-decode front end.
+    #[serde(default)]
+    pub num_nextn_predict_layers: u32,
+
+    /// M-RoPE interleaved section lengths (temporal, height, width), each in
+    /// rotary-pair units. Present on Qwen-VL-family models (Qwen3.6, Qwen2.5-VL)
+    /// that encode 3D positions. For text-only inference all three axes share
+    /// the token position, so M-RoPE collapses to standard partial RoPE and
+    /// this field is purely metadata — it becomes load-bearing when/if the
+    /// engine adds a vision tower.
+    #[serde(default)]
+    pub mrope_sections: Option<Vec<u32>>,
+
+    /// YaRN scaling factor for RoPE frequency extension. Qwen3.6-27B ships
+    /// `factor=4.0` with `original_max_position_embeddings=262144` to reach
+    /// ~1M context. `None` means no YaRN (native context only).
+    #[serde(default)]
+    pub rope_yarn_factor: Option<f32>,
+
+    /// Native (pre-YaRN) max position count. Only meaningful when
+    /// `rope_yarn_factor` is set.
+    #[serde(default)]
+    pub rope_original_max_position: Option<u32>,
 }
 
 impl ModelConfig {
@@ -142,6 +182,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_one_u32() -> u32 {
+    1
+}
+
 fn default_rms_norm_eps() -> f32 {
     1e-5
 }
@@ -179,6 +223,12 @@ impl Default for ModelConfig {
             shared_intermediate_size: 0,
             dense_intermediate_size: 0,
             attn_head_dim: 0,
+            n_group: 1,
+            topk_group: 1,
+            num_nextn_predict_layers: 0,
+            mrope_sections: None,
+            rope_yarn_factor: None,
+            rope_original_max_position: None,
         }
     }
 }
@@ -375,14 +425,26 @@ impl ModelConfig {
             + dn_per_layer * num_dn_layers
     }
 
-    /// Create config for Kimi K2.5.
+    /// Create config for Kimi K2.5 / K2.6.
     ///
-    /// Values sourced from `moonshotai/Kimi-K2.5/config.json` on HuggingFace.
+    /// Values sourced from `moonshotai/Kimi-K2.6/config.json` on HuggingFace.
+    /// K2.5 and K2.6 share the exact same architecture constants (hf model_type
+    /// `kimi_k25`, text model_type `kimi_k2`, DeepseekV3ForCausalLM stack); only
+    /// the weights differ. Use the `name` and `architecture` args to distinguish
+    /// them at the registry/telemetry level.
     pub fn kimi_k25() -> Self {
+        Self::kimi_k2_family("Kimi-K2.5", "kimi-k2.5")
+    }
+
+    pub fn kimi_k26() -> Self {
+        Self::kimi_k2_family("Kimi-K2.6", "kimi-k2.6")
+    }
+
+    fn kimi_k2_family(name: &str, architecture: &str) -> Self {
         use crate::core::types::kimi_k25::*;
         Self {
-            name: "Kimi-K2.5".into(),
-            architecture: "kimi-k2.5".into(),
+            name: name.into(),
+            architecture: architecture.into(),
             hidden_dim: HIDDEN_DIM,
             expert_hidden_dim: EXPERT_HIDDEN_DIM,
             num_layers: NUM_LAYERS,
@@ -395,7 +457,7 @@ impl ModelConfig {
             max_seq_len: MAX_SEQ_LEN,
             vocab_size: VOCAB_SIZE,
             rope_theta: ROPE_THETA as f32,
-            rms_norm_eps: 1e-5, // Kimi K2.5 text_config.rms_norm_eps
+            rms_norm_eps: 1e-5, // Kimi K2 family text_config.rms_norm_eps
             expert_dtype: DType::INT4,
             shared_dtype: DType::BF16,
             mla: Some(MlaConfig {
@@ -417,8 +479,14 @@ impl ModelConfig {
             norm_topk_prob: true,
             num_shared_experts: NUM_SHARED_EXPERTS,
             shared_intermediate_size: SHARED_INTERMEDIATE_SIZE,
-            dense_intermediate_size: 18432, // Kimi K2.5 dense layer intermediate_size
+            dense_intermediate_size: 18432, // Kimi K2 family dense-layer intermediate_size
             attn_head_dim: 0,               // Standard: head_dim = hidden_dim / num_heads
+            n_group: N_GROUP,
+            topk_group: TOPK_GROUP,
+            num_nextn_predict_layers: NUM_NEXTN_PREDICT_LAYERS,
+            mrope_sections: None,
+            rope_yarn_factor: None,
+            rope_original_max_position: None,
         }
     }
 
@@ -469,6 +537,12 @@ impl ModelConfig {
             shared_intermediate_size: SHARED_EXPERT_INTERMEDIATE_SIZE,
             dense_intermediate_size: 0, // no dense layers
             attn_head_dim: HEAD_DIM,    // 256 (differs from hidden_dim/num_heads = 96)
+            n_group: 1,
+            topk_group: 1,
+            num_nextn_predict_layers: 0,
+            mrope_sections: None,
+            rope_yarn_factor: None,
+            rope_original_max_position: None,
         }
     }
 
@@ -520,6 +594,77 @@ impl ModelConfig {
             shared_intermediate_size: SHARED_EXPERT_INTERMEDIATE_SIZE,
             dense_intermediate_size: 0, // no dense layers
             attn_head_dim: HEAD_DIM,    // 256 (differs from hidden_dim/num_heads = 128)
+            n_group: 1,
+            topk_group: 1,
+            num_nextn_predict_layers: 0,
+            mrope_sections: None,
+            rope_yarn_factor: None,
+            rope_original_max_position: None,
+        }
+    }
+
+    /// Create config for Qwen3.6-27B (dense hybrid, VLM-capable).
+    ///
+    /// 64 layers of 3:1 DeltaNet → GatedAttention, no routed experts (each
+    /// layer ends in a single FFN with intermediate_size=17408). Released
+    /// 2026-04-21; positioned as flagship-tier coding in a 27 B dense model.
+    ///
+    /// M-RoPE interleaved `[11, 11, 10]` is carried as metadata; for
+    /// text-only inference (T=H=W) it reduces to standard partial RoPE
+    /// over the 64-dim rotary slice, so no new kernel is needed.
+    ///
+    /// NOTE: the dense + DeltaNet-hybrid shape is a new class for vib3.
+    /// The runtime expert/routing code still needs a path that bypasses
+    /// the MoE router for `num_experts == 0`. Until that lands the config
+    /// parses but `Engine::new` will fail on dispatch.
+    pub fn qwen36_27b() -> Self {
+        use crate::core::types::qwen36_27b::*;
+
+        let layer_is_attention: Vec<bool> =
+            (0..NUM_LAYERS).map(is_attention_layer).collect();
+
+        Self {
+            name: "Qwen3.6-27B".into(),
+            architecture: "qwen3_6_dense".into(),
+            hidden_dim: HIDDEN_DIM,
+            expert_hidden_dim: 0,        // dense — no routed experts
+            num_layers: NUM_LAYERS,
+            num_moe_layers: 0,           // all layers dense
+            dense_layer_idx: NUM_LAYERS, // every layer is a dense FFN
+            num_experts: 0,
+            num_active_experts: 0,
+            num_heads: NUM_ATTN_HEADS,
+            num_kv_heads: NUM_KV_HEADS,
+            max_seq_len: MAX_SEQ_LEN,
+            vocab_size: VOCAB_SIZE,
+            rope_theta: ROPE_THETA as f32,
+            rms_norm_eps: RMS_NORM_EPS as f32,
+            expert_dtype: DType::BF16, // BF16-only weights at release (no official quant)
+            shared_dtype: DType::BF16,
+            mla: None,
+            deltanet: Some(DeltaNetConfig {
+                num_key_heads: DELTANET_NUM_KEY_HEADS,
+                num_value_heads: DELTANET_NUM_VALUE_HEADS,
+                key_head_dim: DELTANET_KEY_HEAD_DIM,
+                value_head_dim: DELTANET_VALUE_HEAD_DIM,
+                conv_kernel_size: DELTANET_CONV_KERNEL,
+                inner_dim: DELTANET_INNER_DIM,
+                full_attention_interval: FULL_ATTN_INTERVAL,
+                layer_is_attention,
+            }),
+            scoring_func: "softmax".to_string(),
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: true,
+            num_shared_experts: 0,
+            shared_intermediate_size: 0,
+            dense_intermediate_size: INTERMEDIATE_SIZE,
+            attn_head_dim: HEAD_DIM, // 256 (differs from hidden_dim/num_heads = 213)
+            n_group: 1,
+            topk_group: 1,
+            num_nextn_predict_layers: 0,
+            mrope_sections: Some(MROPE_SECTIONS.to_vec()),
+            rope_yarn_factor: Some(YARN_FACTOR as f32),
+            rope_original_max_position: Some(MAX_SEQ_LEN),
         }
     }
 }
@@ -679,6 +824,12 @@ impl ModelConfig {
             "deepseek_v2" | "deepseek_v3" => "deepseek-v2",
             "qwen2_moe" => "qwen2-moe",
             "qwen3_5_moe" | "qwen3_5_moe_text" => "qwen3_5_moe",
+            // Qwen3.6 family: dense-attention hybrid (DeltaNet + GatedAttention).
+            // `qwen3_6` covers the 27B dense model (VLM-capable, published
+            // 2026-04-21). `qwen3_5` is the internal class reused by the 27B.
+            // `qwen3_6_moe` is the 35B-A3B MoE sibling.
+            "qwen3_6" | "qwen3_6_dense" => "qwen3_6_dense",
+            "qwen3_6_moe" | "qwen3_6_moe_text" => "qwen3_6_moe",
             _ => model_type,
         };
 
@@ -815,6 +966,63 @@ impl ModelConfig {
         // Qwen3.5: head_dim=256 while hidden_dim=3072/32_heads=96.
         let attn_head_dim = json.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
+        // Grouped top-k (DeepSeek-V3 / Kimi K2.5 / K2.6). n_group=1 on Kimi
+        // degenerates to flat top-k. topk_group defaults to n_group.
+        let n_group = json
+            .get("n_group")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let topk_group = json
+            .get("topk_group")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(n_group as u64) as u32;
+
+        // Native multi-token prediction layer count (DeepSeek-V3 family).
+        // K2.5/K2.6 ship 0.
+        let num_nextn_predict_layers = json
+            .get("num_nextn_predict_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        // Qwen-VL family (Qwen3.6, Qwen2.5-VL) stores rotary/M-RoPE config
+        // under `rope_parameters` (preferred) or legacy `rope_scaling`.
+        //   rope_parameters: {
+        //     rope_type: "mrope" | "yarn" | ...,
+        //     mrope_section: [11, 11, 10],
+        //     mrope_interleaved: true,
+        //     factor: 4.0,                           // YaRN scale
+        //     original_max_position_embeddings: 262144,
+        //   }
+        // For text-only inference M-RoPE degenerates to standard partial RoPE
+        // (T=H=W=token position), so we just surface the metadata.
+        let rope_params = json
+            .get("rope_parameters")
+            .or_else(|| json.get("rope_scaling"));
+        let mrope_sections: Option<Vec<u32>> = rope_params
+            .and_then(|rp| rp.get("mrope_section"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as u32)
+                    .collect()
+            });
+        let rope_yarn_factor: Option<f32> = rope_params.and_then(|rp| {
+            let typ = rp
+                .get("rope_type")
+                .or_else(|| rp.get("type"))
+                .and_then(|v| v.as_str());
+            if typ == Some("yarn") {
+                rp.get("factor").and_then(|v| v.as_f64()).map(|v| v as f32)
+            } else {
+                None
+            }
+        });
+        let rope_original_max_position: Option<u32> = rope_params
+            .and_then(|rp| rp.get("original_max_position_embeddings"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         Ok(ModelConfig {
             name: name.to_string(),
             architecture: architecture.to_string(),
@@ -842,6 +1050,12 @@ impl ModelConfig {
             shared_intermediate_size,
             dense_intermediate_size,
             attn_head_dim,
+            n_group,
+            topk_group,
+            num_nextn_predict_layers,
+            mrope_sections,
+            rope_yarn_factor,
+            rope_original_max_position,
         })
     }
 

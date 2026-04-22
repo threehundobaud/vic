@@ -60,6 +60,14 @@ pub mod kimi_k25 {
     // Router config
     pub const ROUTED_SCALING_FACTOR: f64 = 2.827;
     pub const SCORING_FUNC: &str = "sigmoid"; // sigmoid gating, not softmax
+    // Grouped top-k (DeepSeek-V3 field). K2.5/K2.6 both ship n_group=1 so the
+    // top-k is effectively flat across all experts, but the fields need to be
+    // present so the router code can take the grouped branch for future siblings.
+    pub const N_GROUP: u32 = 1;
+    pub const TOPK_GROUP: u32 = 1;
+
+    // Native multi-token prediction. K2.5/K2.6 ship num_nextn_predict_layers=0.
+    pub const NUM_NEXTN_PREDICT_LAYERS: u32 = 0;
 
     // Quantization config
     pub const QUANT_GROUP_SIZE: u32 = 32;
@@ -111,6 +119,57 @@ pub mod qwen35_122b {
     pub const MROPE_SECTIONS: [u32; 3] = [11, 11, 10]; // temporal, height, width
 
     /// Returns true if layer `i` is a full attention layer.
+    pub const fn is_attention_layer(layer_idx: u32) -> bool {
+        (layer_idx + 1) % FULL_ATTN_INTERVAL == 0
+    }
+}
+
+// ─── Qwen3.6-27B (dense, hybrid DeltaNet + GatedAttention, VLM-capable) ──
+//
+// Reference: Qwen/Qwen3.6-27B, config.json (2026-04-21 release).
+// Same 3:1 hybrid attention pattern as Qwen3.5, same Qwen2Tokenizer family,
+// but dense (no routed experts — MoE sibling is Qwen3.6-35B-A3B) and with a
+// bumped RoPE theta, expanded vocab, and native M-RoPE positional encoding
+// (degenerates to standard RoPE for text-only inference where T/H/W
+// positions coincide).
+pub mod qwen36_27b {
+    // Core dimensions
+    pub const HIDDEN_DIM: u32 = 5120;
+    pub const NUM_LAYERS: u32 = 64;
+    pub const INTERMEDIATE_SIZE: u32 = 17_408;
+    pub const VOCAB_SIZE: u32 = 248_320;
+    pub const MAX_SEQ_LEN: u32 = 262_144;
+    pub const YARN_EXTENDED_SEQ_LEN: u32 = 1_010_000; // YaRN factor 4.0
+
+    // Attention: GQA 24 Q / 4 KV, head_dim 256, partial rotary 0.25
+    pub const FULL_ATTN_INTERVAL: u32 = 4;
+    pub const NUM_ATTN_LAYERS: u32 = 16; // 64 / 4
+    pub const NUM_DELTANET_LAYERS: u32 = 48; // 64 - 16
+    pub const NUM_ATTN_HEADS: u32 = 24;
+    pub const NUM_KV_HEADS: u32 = 4;
+    pub const HEAD_DIM: u32 = 256;
+    pub const PARTIAL_ROTARY_FACTOR: f64 = 0.25; // rotary dim = 64
+    pub const ROPE_THETA: f64 = 10_000_000.0;
+    pub const YARN_FACTOR: f64 = 4.0;
+
+    // DeltaNet (linear attention) config — 48 of 64 layers
+    pub const DELTANET_NUM_KEY_HEADS: u32 = 16;
+    pub const DELTANET_NUM_VALUE_HEADS: u32 = 48;
+    pub const DELTANET_KEY_HEAD_DIM: u32 = 128;
+    pub const DELTANET_VALUE_HEAD_DIM: u32 = 128;
+    pub const DELTANET_CONV_KERNEL: u32 = 4;
+    pub const DELTANET_INNER_DIM: u32 = 6144; // 48 * 128
+
+    // Norm config
+    pub const RMS_NORM_EPS: f64 = 1e-6;
+
+    // M-RoPE (interleaved) dimension sections: temporal, height, width.
+    // Sum is rotary_dim/2 = 32. For text-only inference T=H=W so M-RoPE
+    // collapses to standard partial RoPE — this field is carried as
+    // metadata for future VLM support.
+    pub const MROPE_SECTIONS: [u32; 3] = [11, 11, 10];
+
+    /// Returns true if layer `i` is a full attention (gated) layer.
     pub const fn is_attention_layer(layer_idx: u32) -> bool {
         (layer_idx + 1) % FULL_ATTN_INTERVAL == 0
     }
