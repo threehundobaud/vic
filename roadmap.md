@@ -132,12 +132,22 @@ against the 150 ms baseline with the same prompt sequence.
 
 ### Week-scoped — real engineering, big levers
 
-- **#31  Port vLLM's sm_100 CUTLASS MLA kernel.**
-  `/code/vllm-source/csrc/attention/mla/sm100_cutlass_mla_kernel.cu`.
-  Replaces ~9 sequential MLA kernels with one persistent fused kernel.
-  Projected attention time: 98 ms → ~20 ms. Integration cost: CUTLASS
-  build infra, Blackwell MMA tile tuning, correctness diff vs. current
-  MLA. Single highest-impact item.
+- **#31  Port vLLM's sm_100 CUTLASS MLA kernel** — SCAFFOLDING SHIPPED
+  `a082735`, **blocked on sm_120a smem limit**.
+  Full CUTLASS 4.2.1 tree in `third_party/cutlass/` (gitignored, fetch
+  via `scripts/fetch_cutlass.sh`). `cuda/src/cutlass_mla.cu` wraps
+  `Sm100FmhaMlaKernelTmaWarpspecialized` with raw-pointer (no-torch)
+  entry points, builds clean. `run_mla_attention` has a
+  `VIB3_CUTLASS_MLA=1` gate with a sticky runtime fallback. **But**:
+  kernel needs 212 KB shared memory per block, RTX PRO 6000 Blackwell
+  Workstation (sm_120a) only exposes 99 KB opt-in — `cudaFuncSetAttribute`
+  rejects. Both TMA (IsPaged128=true) and cp.async (IsPaged128=false)
+  paths share the same TileShape `<_128,_128,<_512,_64>>` and so share
+  the wall. Unblocking requires either a smaller-tile CUTLASS
+  instantiation that fits in 99 KB or a port of `xqa/mla_sm120.cu`
+  from flashinfer (already bundled in the system's flashinfer archive,
+  written specifically for sm_120). Either is substantial kernel work.
+  The scaffolding is reusable when that work happens.
 
 - **#32  CUDA graph replay with dynamic MoE dispatch.**
   The `VIB3_CUDA_GRAPH=1` fast path exists but NaNs on K2.6 because
