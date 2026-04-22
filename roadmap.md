@@ -144,10 +144,18 @@ against the 150 ms baseline with the same prompt sequence.
   Smem wall investigation results:
     upstream (StagesQK=12): 212 KB  ✗  (> 99 KB device opt-in)
     patched  (StagesQK=2):  129 KB  ✗  (still > 99 KB by 30 KB)
-    StagesQK=1:             doesn't compile — StagesPV = StagesQK and
-                            the CollectiveMma template asserts >= 2.
+    StagesQK=1:             structurally impossible —
+                            cutlass/gemm/collective/sm100_mma_warpspecialized.hpp:188
+                            `static_assert(DispatchPolicy::Stages >= 2, ...)`
+                            The TMA+UMMA warp-specialized pipeline is a
+                            producer/consumer split; one stage can't
+                            both fill and drain. Both CollectiveMmaQK
+                            and CollectiveMmaPV hit the same assert.
     IsPersistent=false:     same 129 KB — scheduler state isn't the driver.
     cp.async vs TMA:        same 129 KB — load path doesn't change tile.
+    kIs2Sm cluster=<_2,1,1>: already the minimum; switching to 1-SM
+                            mode would double per-CTA smem (no multicast
+                            sharing between CTAs). Going the wrong way.
   
   The 129 KB floor is dominated by the tile shape
   `<TileShapeH=128, TileShapeS=128, <TileShapeL=512, TileShapeR=64>>`
