@@ -689,6 +689,17 @@ impl ModelConfig {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
+        // Qwen3.6-27B ships under `model_type = "qwen3_5"` / `"qwen3_5_text"`.
+        // Distinguish dense vs MoE by the presence of MoE field names — the
+        // 27B dense carries none, the 35B-A3B MoE sibling does.
+        let has_moe_fields = json.get("num_local_experts").is_some()
+            || json.get("n_routed_experts").is_some()
+            || json.get("num_experts").is_some();
+        let is_qwen_dense = matches!(
+            model_type,
+            "qwen3_5" | "qwen3_5_text" | "qwen3_6" | "qwen3_6_dense"
+        ) && !has_moe_fields;
+
         let hidden_dim = json
             .get("hidden_size")
             .and_then(|v| v.as_u64())
@@ -719,7 +730,9 @@ impl ModelConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(4096) as u32;
 
-        // MoE-specific fields
+        // MoE-specific fields. Default to 1 so historical non-MoE configs
+        // (Llama-style dense) still load; dense-architecture detection below
+        // zeroes this out for qwen3_6_dense etc.
         let num_experts = json
             .get("num_local_experts")
             .or_else(|| json.get("n_routed_experts"))
@@ -742,11 +755,22 @@ impl ModelConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(hidden_dim as u64 * 4) as u32;
 
-        // First k dense layers (DeepSeek-style: first_k_dense_replace)
-        let dense_layer_idx = json
-            .get("first_k_dense_replace")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        // First k dense layers (DeepSeek-style: first_k_dense_replace).
+        // For fully dense architectures (Qwen3.6-27B has no routed experts),
+        // every layer is a dense FFN, so bump `dense_layer_idx` to cover them
+        // all so the engine's `is_dense_ffn_layer = layer < dense_layer_idx`
+        // guard fires on each layer.
+        let dense_layer_idx = if is_qwen_dense {
+            num_layers
+        } else {
+            json.get("first_k_dense_replace")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32
+        };
+        // Force `num_experts = 0` under dense mode so buffer allocation +
+        // router dispatch treat this as no-MoE rather than 1-expert-MoE.
+        let num_experts = if is_qwen_dense { 0 } else { num_experts };
+        let num_active_experts = if is_qwen_dense { 0 } else { num_active_experts };
 
         // Number of MoE layers = total layers - dense layers at the start
         let num_moe_layers = if num_experts > 1 {
@@ -818,18 +842,19 @@ impl ModelConfig {
             .and_then(|v| v.as_str())
             .unwrap_or("bfloat16");
 
-        // Architecture string
+        // Architecture string. Qwen3.6-27B reuses the `qwen3_5` / `qwen3_5_text`
+        // model_type class name (Qwen team shipped it under the 3.5 internal
+        // class). `is_qwen_dense` was computed earlier in this function from
+        // the presence/absence of MoE field names.
         let architecture = match model_type {
             "mixtral" => "mixtral",
             "deepseek_v2" | "deepseek_v3" => "deepseek-v2",
             "qwen2_moe" => "qwen2-moe",
             "qwen3_5_moe" | "qwen3_5_moe_text" => "qwen3_5_moe",
-            // Qwen3.6 family: dense-attention hybrid (DeltaNet + GatedAttention).
-            // `qwen3_6` covers the 27B dense model (VLM-capable, published
-            // 2026-04-21). `qwen3_5` is the internal class reused by the 27B.
-            // `qwen3_6_moe` is the 35B-A3B MoE sibling.
-            "qwen3_6" | "qwen3_6_dense" => "qwen3_6_dense",
+            // Qwen3.6 family: dense hybrid (DeltaNet + GatedAttention), no
+            // routed experts. `qwen3_6_moe` = the 35B-A3B MoE sibling.
             "qwen3_6_moe" | "qwen3_6_moe_text" => "qwen3_6_moe",
+            _ if is_qwen_dense => "qwen3_6_dense",
             _ => model_type,
         };
 
@@ -1455,6 +1480,97 @@ impl Default for EngineConfig {
             prefetch_confidence_threshold: 0.1,
             page_mode: PageMode::Exact,
             api_port: 8080,
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen36_parse_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Parse the real Qwen3.6-27B HF config.json and verify the fields vib3
+    /// lifts match the Qwen team's reference. The test is skipped when the
+    /// cached config isn't on disk so CI doesn't hit the network.
+    #[test]
+    fn parse_qwen36_27b_hf_config() {
+        let path = std::path::Path::new("/tmp/qwen36_config.json");
+        if !path.exists() {
+            // Write a minimal trimmed fixture inline so the test has signal
+            // even without network / cache access.
+            let fixture = r#"{
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 5120,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 4,
+                    "head_dim": 256,
+                    "intermediate_size": 17408,
+                    "vocab_size": 248320,
+                    "max_position_embeddings": 262144,
+                    "rms_norm_eps": 1e-6,
+                    "partial_rotary_factor": 0.25,
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 48,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "rope_parameters": {
+                        "rope_theta": 10000000,
+                        "rope_type": "default",
+                        "mrope_section": [11, 11, 10],
+                        "mrope_interleaved": true,
+                        "partial_rotary_factor": 0.25
+                    }
+                }
+            }"#;
+            let mut f = std::fs::File::create(path).unwrap();
+            f.write_all(fixture.as_bytes()).unwrap();
+        }
+
+        let cfg = ModelConfig::from_hf_config_path(path)
+            .expect("Qwen3.6-27B config should parse");
+
+        // Core dims
+        assert_eq!(cfg.architecture, "qwen3_6_dense");
+        assert_eq!(cfg.hidden_dim, 5120);
+        assert_eq!(cfg.num_layers, 64);
+        assert_eq!(cfg.num_heads, 24);
+        assert_eq!(cfg.num_kv_heads, 4);
+        assert_eq!(cfg.attn_head_dim, 256);
+        assert_eq!(cfg.vocab_size, 248_320);
+
+        // Dense classification: zero experts, every layer is dense FFN
+        assert_eq!(cfg.num_experts, 0, "Qwen3.6-27B must be dense");
+        assert_eq!(cfg.num_active_experts, 0);
+        assert_eq!(cfg.num_moe_layers, 0);
+        assert_eq!(cfg.dense_layer_idx, cfg.num_layers);
+        assert_eq!(cfg.dense_intermediate_size, 17408);
+
+        // RoPE
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+
+        // M-RoPE metadata surfaced
+        assert_eq!(cfg.mrope_sections.as_deref(), Some(&[11u32, 11, 10][..]));
+
+        // DeltaNet: 3:1 pattern
+        let dn = cfg.deltanet.as_ref().expect("qwen3.6-27b carries DeltaNet config");
+        assert_eq!(dn.num_key_heads, 16);
+        assert_eq!(dn.num_value_heads, 48);
+        assert_eq!(dn.full_attention_interval, 4);
+        assert_eq!(dn.layer_is_attention.len(), 64);
+        // layer 3, 7, 11, ..., 63 are full attention.
+        for i in 0..64 {
+            let expect_attn = (i + 1) % 4 == 0;
+            assert_eq!(
+                dn.layer_is_attention[i], expect_attn,
+                "layer {i} should be {}",
+                if expect_attn { "full" } else { "deltanet" }
+            );
         }
     }
 }
