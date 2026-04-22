@@ -8812,7 +8812,14 @@ impl Engine {
 
         let shared_nvfp4_enabled = std::env::var("VIB3_ENABLE_SHARED_NVFP4_PREASSEMBLY")
             .map_or(false, |v| v == "1");
-        let is_qwen35 = self.model_config.architecture == "qwen3_5_moe";
+        // Qwen3.5/3.6 family: shared (attention) projections are NVFP4-sensitive
+        // and degrade output quality if auto-converted at preassembly time.
+        // Both qwen3_5_moe (existing gate) and qwen3_6_dense (Qwen3.6-27B) keep
+        // shared projections at FP16 unless explicitly opted in.
+        let is_qwen35 = matches!(
+            self.model_config.architecture.as_str(),
+            "qwen3_5_moe" | "qwen3_6_dense" | "qwen3_6_moe"
+        );
 
         // Only preassemble segments that are loaded per-token via load_tensor_direct_resident
         // (the source of ~31K D2D copies per run). Segments handled by the dynamic cache
