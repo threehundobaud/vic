@@ -1,5 +1,43 @@
 # Qwen3.6-27B port — status & remaining work
 
+## Bisection progress (2026-04-22, session 3)
+
+**Landed**: DeltaNet `gate` kernel was wrong formula — `A_log * softplus`
+instead of `-exp(A_log) * softplus`. For Qwen3.6-27B layer 0 A_log is all
+negative so `A_log * softplus` gives the right *sign* (but wrong scale);
+layers 1+ have **positive** A_log values so the old formula yielded
+`gate > 0` → `decay = exp(gate) > 1` → state amplifies every step
+instead of decaying. Fixed in `cuda/src/kernels.cu::vib3_deltanet_gate_kernel`.
+
+**Impact of the fix**: at prefill pos=0 the DeltaNet `step_out` is
+independent of `gate` (initial state = 0 zeros out the decay branch),
+so layer-0 output bit-identical. At pos=1 cos moves +1-2% per layer.
+Small but real; the gate was a co-contributor, not the dominant bug.
+
+**Remaining divergence after the gate fix**: tok0 L2 output still cos≈0.58,
+and Qwen3.6-27B still emits gibberish tokens instead of " Paris". The
+dominant DeltaNet correctness bug is elsewhere — likely one of:
+
+1. **Output RMSNormGated** — `linear_attn.norm.weight` is the per-head
+   output norm applied inside the gated-RMSNorm combination with z.
+   Formulation options (RMSNormGated vs L2Norm+z vs RMSNorm*gate) may
+   not match HF's.
+2. **in_proj_a / in_proj_b semantics** — alpha and beta are 1D projections
+   [num_v_heads, 5120]; current code applies sigmoid to beta but the
+   dt-bias + softplus path is applied to alpha+dt_bias. Sign conventions
+   or order may differ from HF's `alpha = in_proj_a(x) + dt_bias` path.
+3. **Q/K conv1d + SiLU ordering** — HF does `qkv = in_proj_qkv(x);
+   conv1d(qkv); silu(qkv); split(q,k,v)`. vib3's ordering of conv +
+   activation + split to confirm.
+4. **Repeat semantics** — `repeat_tile_f32` uses contiguous-repeat
+   (`heads 0,0,0, 1,1,1, ...`). HF uses `repeat_interleave(dim=1, repeats=...)`
+   which matches. But the K repeat may differ; verify for 16→48 ratio.
+
+Next session, dump `dn_norm_out_dev` (post output-norm) and `dn_z_proj_dev`
+(z projection) and compare against HF's DeltaNet intermediates by hooking
+`model.model.language_model.layers.N.linear_attn.norm` and the post-silu
+z-gate.
+
 ## Bisection against HF reference (2026-04-22)
 
 **HF reference top-1 on "The capital of France is":** token 11751 = `" Paris"` with logit 15.625.

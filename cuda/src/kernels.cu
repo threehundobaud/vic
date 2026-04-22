@@ -2354,8 +2354,16 @@ __global__ void vib3_sigmoid_kernel(
     output[i] = 1.0f / (1.0f + expf(-input[i]));
 }
 
-// DeltaNet gate: gate = -exp(A_log) * softplus(alpha + dt_bias)
+// DeltaNet gate: gate = -exp(A_log) * softplus(alpha + dt_bias).
 // One thread per head.
+//
+// `A_log` is the raw log-parameterized A coefficient (can be positive or
+// negative — Qwen3.6 layer 1+ has A_log > 0). The Mamba-2 / Qwen-DeltaNet
+// convention is A = -exp(A_log), always negative, so gate is always
+// non-positive and decay = exp(gate) stays in (0, 1]. A prior version of
+// this kernel wrote `a_log[h] * softplus` directly — that works on layer 0
+// where A_log happens to be negative, but amplifies state on L1+ where
+// A_log is positive, corrupting hybrid DeltaNet/attention output.
 __global__ void vib3_deltanet_gate_kernel(
     const float* __restrict__ alpha,
     const float* __restrict__ dt_bias,
@@ -2367,7 +2375,7 @@ __global__ void vib3_deltanet_gate_kernel(
     if (h >= num_heads) return;
     float a = alpha[h] + dt_bias[h];
     float softplus = logf(1.0f + expf(a));
-    gate_out[h] = a_log[h] * softplus;
+    gate_out[h] = -expf(a_log[h]) * softplus;
 }
 
 // ─── Utility Kernels ───────────────────────────────────────────────────────
