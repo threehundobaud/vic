@@ -11,7 +11,7 @@
 //!   - HNSW index building from page signatures during conversion
 //!   - Random model generation for testing
 //!
-//! Both the `vib3-convert` binary and `vib3 pull` call directly into this module.
+//! Both the `vic-convert` binary and `vic pull` call directly into this module.
 
 use crate::compute::kernels;
 use crate::core::config::ModelConfig;
@@ -21,6 +21,7 @@ use crate::index::hnsw_backend::{
 };
 use crate::storage::format::{CompressionMethod, Vib3Writer};
 use half::f16;
+use std::collections::HashMap;
 use std::path::Path;
 
 // ─── Public API ─────────────────────────────────────────────────────────
@@ -174,6 +175,13 @@ pub fn convert_safetensors_dir(
         for (name, tensor_view) in tensors.tensors() {
             total_tensors += 1;
 
+            // Ignore MTP branch tensors for now. The runtime planner and page-id
+            // scheme are currently built for the main language-model trunk.
+            if name.starts_with("mtp.") || name.contains(".mtp.") {
+                skipped_tensors.push(name.to_string());
+                continue;
+            }
+
             let mapping = match classify_tensor(&name, config) {
                 Some(m) => m,
                 None => {
@@ -190,10 +198,238 @@ pub fn convert_safetensors_dir(
             let shape = tensor_view.shape();
             let src_dtype = tensor_view.dtype();
 
+            // ── Stacked expert tensors (Qwen3.5 safetensors): [num_experts, rows, cols] ──
+            if mapping.expert == 0xFFFD
+                && !mapping.is_scale
+                && !mapping.is_zero_point
+                && !mapping.is_packed
+            {
+                total_source_bytes += tensor_data.len() as u64;
+
+                if shape.len() != 3 {
+                    skipped_tensors.push(format!(
+                        "{} (stacked tensor expected 3D shape, got {:?})",
+                        name, shape
+                    ));
+                    continue;
+                }
+
+                let num_experts = shape[0];
+                let packed_rows = shape[1];
+                let cols = shape[2];
+
+                let elem_size = safetensors_dtype_bytes(src_dtype);
+                if elem_size == 0 {
+                    skipped_tensors.push(format!(
+                        "{} (unsupported dtype {} for stacked experts)",
+                        name,
+                        safetensors_dtype_to_str(src_dtype)
+                    ));
+                    continue;
+                }
+
+                let elems_per_expert = packed_rows * cols;
+                let bytes_per_expert = elems_per_expert.saturating_mul(elem_size);
+                if bytes_per_expert == 0 {
+                    skipped_tensors.push(format!("{} (invalid stacked expert shape {:?})", name, shape));
+                    continue;
+                }
+
+                let available_experts = tensor_data.len() / bytes_per_expert;
+                let experts_to_process = num_experts
+                    .min(available_experts)
+                    .min(config.num_experts as usize);
+
+                if experts_to_process == 0 {
+                    skipped_tensors.push(format!(
+                        "{} (no expert slices available: shape={:?}, bytes={})",
+                        name,
+                        shape,
+                        tensor_data.len()
+                    ));
+                    continue;
+                }
+
+                for expert_idx in 0..experts_to_process {
+                    let base = expert_idx * bytes_per_expert;
+                    let end = base + bytes_per_expert;
+                    let expert_slice = &tensor_data[base..end];
+
+                    // gate_up_proj packs [gate; up] along rows. We emit two segments:
+                    // segment 1 = gate, segment 0 = up.
+                    let sub_mats: Vec<(u16, usize, &[u8])> = if mapping.segment == 0 {
+                        if packed_rows % 2 != 0 {
+                            skipped_tensors.push(format!(
+                                "{} (gate_up rows {} not divisible by 2)",
+                                name, packed_rows
+                            ));
+                            break;
+                        }
+                        let half_rows = packed_rows / 2;
+                        let half_bytes = half_rows * cols * elem_size;
+                        vec![
+                            (1, half_rows, &expert_slice[..half_bytes]), // gate
+                            (0, half_rows, &expert_slice[half_bytes..]), // up
+                        ]
+                    } else {
+                        vec![(mapping.segment, packed_rows, expert_slice)]
+                    };
+
+                    for (segment, rows, mat_bytes) in sub_mats {
+                        let num_elements = rows * cols;
+
+                        if options.quantize_experts != QuantFormat::None {
+                            let (quant_data, out_dtype) = match options.quantize_experts {
+                                QuantFormat::Int4 => {
+                                    let data = match src_dtype {
+                                        safetensors::Dtype::F16 => {
+                                            kernels::quantize_fp16_to_int4(mat_bytes, rows, cols)
+                                        }
+                                        safetensors::Dtype::BF16 => {
+                                            kernels::quantize_bf16_to_int4(mat_bytes, rows, cols)
+                                        }
+                                        safetensors::Dtype::F32 => {
+                                            let f32_slice = unsafe {
+                                                std::slice::from_raw_parts(
+                                                    mat_bytes.as_ptr() as *const f32,
+                                                    num_elements,
+                                                )
+                                            };
+                                            kernels::quantize_weights_to_int4(f32_slice, rows, cols)
+                                        }
+                                        other => {
+                                            skipped_tensors.push(format!(
+                                                "{} (unsupported dtype {} for stacked INT4 quantization)",
+                                                name,
+                                                safetensors_dtype_to_str(other)
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    (data, DType::INT4)
+                                }
+                                QuantFormat::Nvfp4 => {
+                                    let data = match src_dtype {
+                                        safetensors::Dtype::F16 => {
+                                            kernels::quantize_fp16_to_nvfp4(mat_bytes, rows, cols)
+                                        }
+                                        safetensors::Dtype::BF16 => {
+                                            kernels::quantize_bf16_to_nvfp4(mat_bytes, rows, cols)
+                                        }
+                                        safetensors::Dtype::F32 => {
+                                            let f32_slice = unsafe {
+                                                std::slice::from_raw_parts(
+                                                    mat_bytes.as_ptr() as *const f32,
+                                                    num_elements,
+                                                )
+                                            };
+                                            kernels::quantize_weights_to_nvfp4(f32_slice, rows, cols)
+                                        }
+                                        other => {
+                                            skipped_tensors.push(format!(
+                                                "{} (unsupported dtype {} for stacked NVFP4 quantization)",
+                                                name,
+                                                safetensors_dtype_to_str(other)
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    (data, DType::NVFP4)
+                                }
+                                QuantFormat::None => unreachable!(),
+                            };
+
+                            total_output_bytes += quant_data.len() as u64;
+                            let pages_before = writer.page_count();
+                            add_pages_from_data(
+                                &mut writer,
+                                mapping.layer,
+                                expert_idx as u16,
+                                segment,
+                                rows,
+                                cols,
+                                &quant_data,
+                                out_dtype,
+                            );
+
+                            if let Some(ref mut collector) = sig_collector {
+                                let f32_weights: Vec<f32> = match src_dtype {
+                                    safetensors::Dtype::F16 => fp16_bytes_to_f32(mat_bytes),
+                                    safetensors::Dtype::BF16 => mat_bytes
+                                        .chunks_exact(2)
+                                        .map(|c| {
+                                            let bits = u16::from_le_bytes([c[0], c[1]]);
+                                            half::bf16::from_bits(bits).to_f32()
+                                        })
+                                        .collect(),
+                                    safetensors::Dtype::F32 => unsafe {
+                                        std::slice::from_raw_parts(
+                                            mat_bytes.as_ptr() as *const f32,
+                                            num_elements,
+                                        )
+                                    }
+                                    .to_vec(),
+                                    _ => vec![],
+                                };
+                                if !f32_weights.is_empty() {
+                                    compute_expert_page_signatures(
+                                        collector,
+                                        &f32_weights,
+                                        rows,
+                                        cols,
+                                        pages_before,
+                                        true,
+                                    );
+                                }
+                            }
+                        } else {
+                            let fp16_data = match src_dtype {
+                                safetensors::Dtype::F16 => mat_bytes.to_vec(),
+                                safetensors::Dtype::BF16 => {
+                                    kernels::convert_bf16_to_fp16(mat_bytes, num_elements)
+                                }
+                                safetensors::Dtype::F32 => {
+                                    kernels::convert_f32_to_fp16(mat_bytes, num_elements)
+                                }
+                                other => {
+                                    skipped_tensors.push(format!(
+                                        "{} (unsupported dtype {} for stacked passthrough)",
+                                        name,
+                                        safetensors_dtype_to_str(other)
+                                    ));
+                                    continue;
+                                }
+                            };
+
+                            total_output_bytes += fp16_data.len() as u64;
+                            add_pages_from_data(
+                                &mut writer,
+                                mapping.layer,
+                                expert_idx as u16,
+                                segment,
+                                rows,
+                                cols,
+                                &fp16_data,
+                                DType::FP16,
+                            );
+                        }
+
+                        converted_experts += 1;
+                    }
+                }
+
+                continue;
+            }
+
             let (rows, cols) = if shape.len() == 2 {
                 (shape[0], shape[1])
             } else if shape.len() == 1 {
                 (1, shape[0])
+            } else if shape.len() == 3 && shape[1] == 1 {
+                // DeltaNet conv1d kernel: [out_channels, in_channels=1, kernel_size]
+                // (depthwise grouped conv). Squeeze middle dim to a 2D
+                // [out_channels, kernel_size] tensor — same memory layout.
+                (shape[0], shape[2])
             } else {
                 skipped_tensors.push(format!("{} (unsupported shape {:?})", name, shape));
                 continue;
@@ -579,14 +815,27 @@ pub fn convert_safetensors_dir(
     }
 
     if !skipped_tensors.is_empty() {
-        let show = skipped_tensors.len().min(20);
-        println!(
-            "\n  Skipped tensors (showing {}/{}):",
-            show,
-            skipped_tensors.len()
-        );
-        for name in skipped_tensors.iter().take(show) {
-            println!("    - {}", name);
+        // Suppress visual.* / vision_tower.* spam when text-only — Qwen3.6-VLM
+        // ships a 333-tensor ViT we don't load. Always print non-vision skips.
+        let interesting: Vec<&String> = skipped_tensors
+            .iter()
+            .filter(|n| !n.contains("visual.") && !n.contains("vision_tower.") && !n.contains("vision_model."))
+            .collect();
+        if !interesting.is_empty() {
+            println!(
+                "\n  Skipped tensors (text-only, {}; vision suppressed):",
+                interesting.len()
+            );
+            for name in interesting.iter().take(60) {
+                println!("    - {}", name);
+            }
+            if interesting.len() > 60 {
+                println!("    ... {} more", interesting.len() - 60);
+            }
+        }
+        let vision_count = skipped_tensors.len() - interesting.len();
+        if vision_count > 0 {
+            println!("  Skipped {} vision tensors (text-only mode).", vision_count);
         }
     }
 
@@ -651,6 +900,90 @@ pub fn convert_safetensors_dir(
 // ═════════════════════════════════════════════════════════════════════════════
 
 use crate::storage::gguf::{GgmlType, GgufFile};
+
+/// Segment numbers used when stitching the llama.cpp split `kv_b` layout
+/// back to the combined `kv_b_proj` layout that `mla_attention_layer` expects.
+const SEG_KV_B_COMBINED: u16 = 23;
+const SEG_ATTN_K_B_SPLIT: u16 = 42;
+const SEG_ATTN_V_B_SPLIT: u16 = 43;
+
+/// Stitch llama.cpp's per-head split `attn_k_b` + `attn_v_b` into the combined
+/// `kv_b_proj` layout `[num_heads*(qk_nope_head_dim + v_head_dim), kv_lora_rank]`
+/// in row-major FP16, which is what `mla_attention_layer` reads via
+/// `MlaWeights::kv_b_proj` (see `src/runtime/attention.rs`).
+///
+/// GGUF shapes (innermost dim first):
+///   attn_k_b: [qk_nope_head_dim, kv_lora_rank, num_heads]
+///             memory offset(h, l, nope) = h*(kv_lora*qk_nope) + l*qk_nope + nope
+///   attn_v_b: [kv_lora_rank, v_head_dim, num_heads]
+///             memory offset(h, v, l)    = h*(v_head*kv_lora) + v*kv_lora + l
+///
+/// Combined HF layout (row-major):
+///   out row i = h*(qk_nope + v_head) + r
+///     r < qk_nope         → k_nope weights for head h
+///     r in [qk_nope, 2q)  → v weights for head h
+///   out row width = kv_lora_rank
+///
+/// Panics if input sizes don't match the declared dims.
+fn stitch_kv_b_fp16(
+    k_b_bytes: &[u8],
+    v_b_bytes: &[u8],
+    num_heads: usize,
+    qk_nope: usize,
+    v_head: usize,
+    kv_lora: usize,
+) -> Vec<u8> {
+    assert_eq!(
+        k_b_bytes.len(),
+        num_heads * kv_lora * qk_nope * std::mem::size_of::<f16>(),
+        "attn_k_b size mismatch",
+    );
+    assert_eq!(
+        v_b_bytes.len(),
+        num_heads * v_head * kv_lora * std::mem::size_of::<f16>(),
+        "attn_v_b size mismatch",
+    );
+    let k_src: &[f16] = unsafe {
+        std::slice::from_raw_parts(
+            k_b_bytes.as_ptr() as *const f16,
+            k_b_bytes.len() / std::mem::size_of::<f16>(),
+        )
+    };
+    let v_src: &[f16] = unsafe {
+        std::slice::from_raw_parts(
+            v_b_bytes.as_ptr() as *const f16,
+            v_b_bytes.len() / std::mem::size_of::<f16>(),
+        )
+    };
+    let per_head = qk_nope + v_head;
+    let out_rows = num_heads * per_head;
+    let mut out = vec![f16::ZERO; out_rows * kv_lora];
+    for h in 0..num_heads {
+        let k_head_base = h * kv_lora * qk_nope;
+        let v_head_base = h * v_head * kv_lora;
+        let hf_head_base = h * per_head * kv_lora;
+        // k_nope rows — strided gather along lora (stride = qk_nope)
+        for r in 0..qk_nope {
+            let hf_row_base = hf_head_base + r * kv_lora;
+            for l in 0..kv_lora {
+                out[hf_row_base + l] = k_src[k_head_base + l * qk_nope + r];
+            }
+        }
+        // v rows — contiguous 512-wide copies
+        for v_idx in 0..v_head {
+            let hf_row_base = hf_head_base + (qk_nope + v_idx) * kv_lora;
+            let v_src_base = v_head_base + v_idx * kv_lora;
+            out[hf_row_base..hf_row_base + kv_lora]
+                .copy_from_slice(&v_src[v_src_base..v_src_base + kv_lora]);
+        }
+    }
+    // Re-view as bytes without reallocating.
+    let ptr = out.as_ptr() as *const u8;
+    let byte_len = out.len() * std::mem::size_of::<f16>();
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) }.to_vec();
+    drop(out);
+    bytes
+}
 
 /// Classify a GGUF tensor name into (layer, expert, segment) mapping.
 ///
@@ -735,6 +1068,7 @@ fn classify_gguf_tensor(name: &str) -> Option<TensorMapping> {
         // ── Norms and biases (F32 → FP16 shared) ──
         "attn_norm.weight" => shared(6),
         "post_attention_norm.weight" => shared(7),
+        "ffn_norm.weight" => shared(7), // llama.cpp/deepseek2 naming for post-attention RMSNorm
         "attn_q_norm.weight" => shared(27),
         "attn_k_norm.weight" => shared(28),
 
@@ -743,6 +1077,20 @@ fn classify_gguf_tensor(name: &str) -> Option<TensorMapping> {
         "attn_k.weight" => shared(12),
         "attn_v.weight" => shared(13),
         "attn_output.weight" => shared(5),
+
+        // ── MLA projections & norms (DeepSeek-V3 / Kimi K2.5 / K2.6) ──
+        // Segments 20-25 match the HF classifier (classify_attention_tensor).
+        "attn_q_a.weight" => shared(20),       // q_a_proj   [hidden, q_lora_rank]
+        "attn_q_b.weight" => shared(21),       // q_b_proj   [q_lora_rank, num_heads*(qk_nope+qk_rope)]
+        "attn_kv_a_mqa.weight" => shared(22),  // kv_a_proj_with_mqa [hidden, kv_lora_rank+qk_rope]
+        "attn_q_a_norm.weight" => shared(24),  // q_a_layernorm (F32 -> FP16)
+        "attn_kv_a_norm.weight" => shared(25), // kv_a_layernorm
+        // llama.cpp splits the combined kv_b_proj into two per-head 3D tensors.
+        // Kept as separate segments; the engine (or a converter pre-pass) must
+        // stitch them back into the [num_heads*(qk_nope + v_head_dim), kv_lora]
+        // layout that mla_attention_layer expects (attention.rs:368).
+        "attn_k_b.weight" => shared(42), // [qk_nope_head_dim, kv_lora_rank, num_heads]
+        "attn_v_b.weight" => shared(43), // [kv_lora_rank, v_head_dim, num_heads]
 
         // ── DeltaNet (linear attention) tensors ──
         "attn_qkv.weight" => shared(30), // in_proj_qkv (DeltaNet layers)
@@ -761,11 +1109,21 @@ fn classify_gguf_tensor(name: &str) -> Option<TensorMapping> {
         "ffn_gate_shexp.weight" => shared(15), // Shared expert gate_proj
         "ffn_up_shexp.weight" => shared(14), // Shared expert up_proj
         "ffn_down_shexp.weight" => shared(16), // Shared expert down_proj
+        // Aux-loss-free router bias (DeepSeek-V3 & K2.5 / K2.6).
+        // Per-expert scalar added to selection logits before top-k.
+        "exp_probs_b.bias" => shared(29),
 
-        // ── Stacked expert weights (MXFP4, 3D [dim_a, dim_b, 256]) ──
-        "ffn_gate_exps.weight" => stacked(1), // Expert gate_proj (w3)
-        "ffn_up_exps.weight" => stacked(0),   // Expert up_proj (w1)
-        "ffn_down_exps.weight" => stacked(2), // Expert down_proj (w2)
+        // ── Stacked expert weights (Q4_0 for K2.6, MXFP4 for Qwen3.5, 3D
+        //    [dim_a, dim_b, num_experts]) ──
+        "ffn_gate_exps.weight" => stacked(1), // Expert gate_proj
+        "ffn_up_exps.weight" => stacked(0),   // Expert up_proj
+        "ffn_down_exps.weight" => stacked(2), // Expert down_proj
+
+        // ── Dense (non-MoE) FFN — used by K2.6 layer 0 (first_k_dense_replace=1) ──
+        // Mirrors the HF `dense_layer_idx`-branch segments.
+        "ffn_gate.weight" => shared(18), // dense gate_proj
+        "ffn_up.weight" => shared(17),   // dense up_proj
+        "ffn_down.weight" => shared(19), // dense down_proj
 
         _ => {
             tracing::debug!("GGUF: unclassified tensor: {}", name);
@@ -805,7 +1163,8 @@ pub fn convert_gguf_dir(
                         GgmlType::Mxfp4 => {
                             file_config.expert_dtype = DType::NVFP4;
                         }
-                        GgmlType::Q8_0
+                        GgmlType::Q4_0
+                        | GgmlType::Q8_0
                         | GgmlType::Q4K
                         | GgmlType::Q5K
                         | GgmlType::Q6K
@@ -843,6 +1202,22 @@ pub fn convert_gguf_dir(
     let mut total_source_bytes = 0u64;
     let mut total_output_bytes = 0u64;
     let num_experts = config.num_experts as usize;
+
+    // Per-layer buffers for the llama.cpp split kv_b halves. The deepseek2 GGUF
+    // ships kv_b_proj as two 3D tensors (attn_k_b, attn_v_b). The engine's MLA
+    // path reads a single combined kv_b_proj tensor (seg 23). We hold each half
+    // aside until we have both, then stitch and emit seg 23 pages once.
+    let mut kv_b_k_half: HashMap<u16, Vec<u8>> = HashMap::new();
+    let mut kv_b_v_half: HashMap<u16, Vec<u8>> = HashMap::new();
+    let (mla_num_heads, mla_qk_nope, mla_v_head, mla_kv_lora) = match &config.mla {
+        Some(mla) => (
+            config.num_heads as usize,
+            mla.qk_nope_head_dim as usize,
+            mla.v_head_dim as usize,
+            mla.kv_lora_rank as usize,
+        ),
+        None => (0, 0, 0, 0),
+    };
 
     // Collect tensor names and sort for deterministic processing
     let mut tensor_names: Vec<String> = gguf.tensors.keys().cloned().collect();
@@ -953,8 +1328,15 @@ pub fn convert_gguf_dir(
                         total_output_bytes += nvfp4_data.len() as u64;
                         converted_experts += 1;
                     }
-                    GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+                    GgmlType::Q4_0
+                    | GgmlType::Q8_0
+                    | GgmlType::Q4K
+                    | GgmlType::Q5K
+                    | GgmlType::Q6K => {
                         let fp16_data = match info.dtype {
+                            GgmlType::Q4_0 => {
+                                crate::storage::gguf::dequant_q4_0_to_fp16(expert_slice, ne1, ne0)
+                            }
                             GgmlType::Q8_0 => {
                                 crate::storage::gguf::dequant_q8_0_to_fp16(expert_slice, ne1, ne0)
                             }
@@ -1032,6 +1414,9 @@ pub fn convert_gguf_dir(
             let n_rows: usize = info.shape.iter().skip(1).product::<u64>().max(1) as usize;
 
             let fp16_data = match info.dtype {
+                GgmlType::Q4_0 => {
+                    crate::storage::gguf::dequant_q4_0_to_fp16(raw_data, n_rows, ne0)
+                }
                 GgmlType::Q8_0 => crate::storage::gguf::dequant_q8_0_to_fp16(raw_data, n_rows, ne0),
                 GgmlType::F32 => crate::storage::gguf::convert_f32_to_fp16(raw_data, ne0 * n_rows),
                 GgmlType::F16 => raw_data.to_vec(),
@@ -1061,6 +1446,54 @@ pub fn convert_gguf_dir(
             // Therefore NO additional reorder is needed here — the GGUF data is
             // already in tiled order for all V-head-indexed tensors.
 
+            // ── Stitch llama.cpp-split MLA kv_b halves back into seg 23 ──
+            // When we see the first half we buffer it; when we see the second
+            // we stitch and emit the combined kv_b_proj for that layer.
+            if segment == SEG_ATTN_K_B_SPLIT || segment == SEG_ATTN_V_B_SPLIT {
+                if mla_num_heads == 0 {
+                    tracing::warn!(
+                        "Tensor {} is an MLA kv_b split half but config has no mla block; skipping",
+                        tensor_name
+                    );
+                    skipped.push(tensor_name.clone());
+                    continue;
+                }
+                if segment == SEG_ATTN_K_B_SPLIT {
+                    kv_b_k_half.insert(layer, fp16_data);
+                } else {
+                    kv_b_v_half.insert(layer, fp16_data);
+                }
+                // If both halves are now buffered, stitch and emit.
+                // IMPORTANT: check presence with contains_key before remove, because
+                // `(map.remove(&k), map2.remove(&k))` would eagerly call both removes
+                // and drop the retrieved values if the tuple pattern doesn't match —
+                // silently losing whichever half just arrived.
+                if kv_b_k_half.contains_key(&layer) && kv_b_v_half.contains_key(&layer) {
+                    let k = kv_b_k_half.remove(&layer).expect("k half present");
+                    let v = kv_b_v_half.remove(&layer).expect("v half present");
+                    let combined = stitch_kv_b_fp16(
+                        &k,
+                        &v,
+                        mla_num_heads,
+                        mla_qk_nope,
+                        mla_v_head,
+                        mla_kv_lora,
+                    );
+                    tracing::info!(
+                        "MLA kv_b stitched for layer {}: {} bytes combined ({} heads × {} × {} FP16)",
+                        layer,
+                        combined.len(),
+                        mla_num_heads,
+                        mla_qk_nope + mla_v_head,
+                        mla_kv_lora,
+                    );
+                    add_shared_pages(&mut writer, layer, 0xFFFF, SEG_KV_B_COMBINED, &combined);
+                    total_output_bytes += combined.len() as u64;
+                    converted_shared += 1;
+                }
+                continue;
+            }
+
             add_shared_pages(&mut writer, layer, 0xFFFF, segment, &fp16_data);
             total_output_bytes += fp16_data.len() as u64;
             converted_shared += 1;
@@ -1069,6 +1502,54 @@ pub fn convert_gguf_dir(
 
         // Shouldn't reach here — all tensors are either stacked or shared
         skipped.push(tensor_name.clone());
+    }
+
+    // Flag any MLA kv_b half that never found its pair — this points to a
+    // corrupt or truncated GGUF.
+    for (layer, _) in kv_b_k_half.iter() {
+        tracing::error!(
+            "MLA layer {}: attn_k_b present but attn_v_b missing; kv_b_proj (seg 23) will NOT be written for this layer",
+            layer
+        );
+    }
+    for (layer, _) in kv_b_v_half.iter() {
+        tracing::error!(
+            "MLA layer {}: attn_v_b present but attn_k_b missing; kv_b_proj (seg 23) will NOT be written for this layer",
+            layer
+        );
+    }
+
+    // ── Tied embeddings: duplicate segment 10 → segment 11 if lm_head absent ──
+    // Many GGUF models with `tie_word_embeddings = true` omit `output.weight`.
+    // The runtime can fall back to segment 10, but writing the pages at conversion
+    // time avoids the per-request probe and keeps the .vib3 self-contained.
+    let has_embed = writer.pages().iter().any(|p| p.layer == 0 && p.expert == 0xFFFF && p.segment == 10);
+    let has_lm_head = writer.pages().iter().any(|p| p.layer == 0 && p.expert == 0xFFFF && p.segment == 11);
+    if has_embed && !has_lm_head {
+        tracing::info!(
+            "No output.weight / lm_head found (tied embeddings); copying segment 10 → segment 11"
+        );
+        let embed_pages: Vec<_> = writer
+            .pages()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.layer == 0 && p.expert == 0xFFFF && p.segment == 10)
+            .map(|(i, p)| (i, *p))
+            .collect();
+        for (_idx, page) in &embed_pages {
+            let page_data = writer.read_page_data(*_idx);
+            writer.add_page(
+                0,
+                0xFFFF,
+                11, // lm_head segment
+                page.page_idx,
+                page.row_start,
+                page.row_count,
+                page.col_count,
+                &page_data,
+            );
+        }
+        converted_shared += 1;
     }
 
     let page_count = writer.page_count();
@@ -1652,6 +2133,189 @@ mod tests {
     }
 
     #[test]
+    fn test_stitch_kv_b_fp16_matches_per_head_matvec() {
+        // Deterministic small MLA dims — exercise the whole stitching op.
+        // Verify: for a fixed latent x, combined[i, :] · x equals the per-head
+        // k_nope / v matvec computed directly from the split halves.
+        let num_heads = 3usize;
+        let qk_nope = 2usize;
+        let v_head = 2usize;
+        let kv_lora = 4usize;
+
+        // attn_k_b layout: offset(h, l, r) = h*(kv_lora*qk_nope) + l*qk_nope + r
+        let k_len = num_heads * kv_lora * qk_nope;
+        let mut k_b: Vec<f16> = Vec::with_capacity(k_len);
+        for h in 0..num_heads {
+            for l in 0..kv_lora {
+                for r in 0..qk_nope {
+                    let v = (h as f32) * 100.0 + (l as f32) * 10.0 + (r as f32) + 0.1;
+                    k_b.push(f16::from_f32(v));
+                }
+            }
+        }
+        // attn_v_b layout: offset(h, v_idx, l) = h*(v_head*kv_lora) + v_idx*kv_lora + l
+        let v_len = num_heads * v_head * kv_lora;
+        let mut v_b: Vec<f16> = Vec::with_capacity(v_len);
+        for h in 0..num_heads {
+            for v_idx in 0..v_head {
+                for l in 0..kv_lora {
+                    let v = (h as f32) * 1000.0 + (v_idx as f32) * 50.0 + (l as f32) * 3.0 + 0.5;
+                    v_b.push(f16::from_f32(v));
+                }
+            }
+        }
+        let k_bytes: Vec<u8> = k_b
+            .iter()
+            .flat_map(|x| x.to_le_bytes().into_iter())
+            .collect();
+        let v_bytes: Vec<u8> = v_b
+            .iter()
+            .flat_map(|x| x.to_le_bytes().into_iter())
+            .collect();
+
+        let combined_bytes =
+            stitch_kv_b_fp16(&k_bytes, &v_bytes, num_heads, qk_nope, v_head, kv_lora);
+        let combined: &[f16] = unsafe {
+            std::slice::from_raw_parts(
+                combined_bytes.as_ptr() as *const f16,
+                combined_bytes.len() / 2,
+            )
+        };
+
+        // Latent input: random but fixed
+        let latent: Vec<f32> = (0..kv_lora).map(|l| (l as f32) * 0.25 - 0.3).collect();
+
+        // Per-row dot product from combined layout
+        let per_head = qk_nope + v_head;
+        for h in 0..num_heads {
+            for r in 0..per_head {
+                let row = h * per_head + r;
+                let mut dot_combined = 0.0f32;
+                for l in 0..kv_lora {
+                    dot_combined += combined[row * kv_lora + l].to_f32() * latent[l];
+                }
+                // Reference dot using the split tensors.
+                let dot_split = if r < qk_nope {
+                    let nope = r;
+                    let mut s = 0.0f32;
+                    for l in 0..kv_lora {
+                        let idx = h * (kv_lora * qk_nope) + l * qk_nope + nope;
+                        s += k_b[idx].to_f32() * latent[l];
+                    }
+                    s
+                } else {
+                    let v_idx = r - qk_nope;
+                    let mut s = 0.0f32;
+                    for l in 0..kv_lora {
+                        let idx = h * (v_head * kv_lora) + v_idx * kv_lora + l;
+                        s += v_b[idx].to_f32() * latent[l];
+                    }
+                    s
+                };
+                assert!(
+                    (dot_combined - dot_split).abs() < 1e-2,
+                    "mismatch at h={h} r={r}: combined={dot_combined} split={dot_split}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_kv_b_buffering_logic_preserves_first_half_until_second_arrives() {
+        // Regression for a buffering bug: writing
+        //   if let (Some(k), Some(v)) = (map_k.remove(&layer), map_v.remove(&layer))
+        // eagerly calls BOTH removes, and if the tuple pattern fails to match the
+        // returned values are dropped — silently losing the half just inserted.
+        // The correct pattern is: check contains_key on both, then remove.
+        let mut kv_b_k_half: HashMap<u16, Vec<u8>> = HashMap::new();
+        let mut kv_b_v_half: HashMap<u16, Vec<u8>> = HashMap::new();
+        let layer: u16 = 7;
+
+        // First arrival: k half
+        kv_b_k_half.insert(layer, vec![0xAA, 0xAA]);
+        // Must NOT stitch yet (v half not present). The guard must leave the
+        // k half in the map so that it's still there when v arrives.
+        if kv_b_k_half.contains_key(&layer) && kv_b_v_half.contains_key(&layer) {
+            let _ = (kv_b_k_half.remove(&layer), kv_b_v_half.remove(&layer));
+            panic!("should not stitch — only k half present");
+        }
+        assert!(
+            kv_b_k_half.contains_key(&layer),
+            "BUG: k half dropped before v arrived — this is the bug the fix guards against",
+        );
+
+        // Second arrival: v half
+        kv_b_v_half.insert(layer, vec![0xBB, 0xBB]);
+        let mut stitched = false;
+        if kv_b_k_half.contains_key(&layer) && kv_b_v_half.contains_key(&layer) {
+            let k = kv_b_k_half.remove(&layer).unwrap();
+            let v = kv_b_v_half.remove(&layer).unwrap();
+            assert_eq!(k, vec![0xAA, 0xAA]);
+            assert_eq!(v, vec![0xBB, 0xBB]);
+            stitched = true;
+        }
+        assert!(stitched, "both halves present, stitch should have fired");
+        assert!(!kv_b_k_half.contains_key(&layer));
+        assert!(!kv_b_v_half.contains_key(&layer));
+    }
+
+    #[test]
+    fn test_classify_gguf_tensor_kimi_k2_6_deepseek2() {
+        // Every tensor-name template observed in AesSedai/Kimi-K2.6-GGUF Q4_X
+        // must classify successfully. deepseek2 arch covers K2.5, K2.6, and
+        // DeepSeek-V2/V3. Segment numbers must match the HF classifier so the
+        // engine sees a single layout regardless of ingestion path.
+        let cases: &[(&str, u16, u16)] = &[
+            // (gguf_name, expected_segment, expected_layer)
+            ("token_embd.weight", 10, 0),
+            ("output.weight", 11, 0),
+            ("output_norm.weight", 8, 0xFFFF),
+            // attention / MLA
+            ("blk.0.attn_norm.weight", 6, 0),
+            ("blk.7.ffn_norm.weight", 7, 7),
+            ("blk.12.attn_q_a.weight", 20, 12),
+            ("blk.12.attn_q_b.weight", 21, 12),
+            ("blk.12.attn_kv_a_mqa.weight", 22, 12),
+            ("blk.12.attn_q_a_norm.weight", 24, 12),
+            ("blk.12.attn_kv_a_norm.weight", 25, 12),
+            ("blk.12.attn_k_b.weight", 42, 12),
+            ("blk.12.attn_v_b.weight", 43, 12),
+            ("blk.12.attn_output.weight", 5, 12),
+            // MoE router + shared + aux-free bias
+            ("blk.1.ffn_gate_inp.weight", 3, 1),
+            ("blk.1.ffn_gate_shexp.weight", 15, 1),
+            ("blk.1.ffn_up_shexp.weight", 14, 1),
+            ("blk.1.ffn_down_shexp.weight", 16, 1),
+            ("blk.1.exp_probs_b.bias", 29, 1),
+            // Stacked routed experts (shared across 384 experts).
+            // layer comes from blk.N; expert is the EXPERT_STACKED sentinel
+            // (0xFFFD).
+            ("blk.1.ffn_gate_exps.weight", 1, 1),
+            ("blk.1.ffn_up_exps.weight", 0, 1),
+            ("blk.1.ffn_down_exps.weight", 2, 1),
+            // Dense L0 FFN (first_k_dense_replace = 1)
+            ("blk.0.ffn_gate.weight", 18, 0),
+            ("blk.0.ffn_up.weight", 17, 0),
+            ("blk.0.ffn_down.weight", 19, 0),
+        ];
+        for (name, seg, layer) in cases {
+            let m = classify_gguf_tensor(name)
+                .unwrap_or_else(|| panic!("classify_gguf_tensor unclassified: {name}"));
+            assert_eq!(m.segment, *seg, "segment mismatch for {name}");
+            assert_eq!(m.layer, *layer, "layer mismatch for {name}");
+        }
+        // Stacked expert sentinel for ffn_*_exps
+        for name in [
+            "blk.1.ffn_gate_exps.weight",
+            "blk.1.ffn_up_exps.weight",
+            "blk.1.ffn_down_exps.weight",
+        ] {
+            let m = classify_gguf_tensor(name).unwrap();
+            assert_eq!(m.expert, 0xFFFD, "{name} should be EXPERT_STACKED sentinel");
+        }
+    }
+
+    #[test]
     fn test_convert_result_roundtrip_read() {
         // Full roundtrip: create safetensors -> convert -> read back pages
         let dir = tempfile::tempdir().unwrap();
@@ -1805,6 +2469,93 @@ pub fn convert_random(
         }
     }
 
+    // ── Shared weights (embeddings, norms, lm_head, attention, router) ──
+    // Without these, the engine cannot run inference (no token embeddings,
+    // no logit projection, no layer norms, no attention weights).
+    let mut converted_shared = 0usize;
+    let vocab_size = config.vocab_size as usize;
+    let num_heads = config.num_heads as usize;
+    let num_kv_heads = config.num_kv_heads as usize;
+    let head_dim = if num_heads > 0 {
+        hidden_dim / num_heads
+    } else {
+        hidden_dim
+    };
+
+    let mut rand_fp16_bytes = |n: usize| -> Vec<u8> {
+        let mut data = vec![0u8; n * 2];
+        for chunk in data.chunks_exact_mut(2) {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let val = f16::from_f32(((rng_state as f32 / u64::MAX as f32) - 0.5) * 0.1);
+            let bytes = val.to_le_bytes();
+            chunk[0] = bytes[0];
+            chunk[1] = bytes[1];
+        }
+        data
+    };
+
+    // Token embeddings (layer=0, segment=10)
+    let embed_data = rand_fp16_bytes(vocab_size * hidden_dim);
+    add_shared_pages(&mut writer, 0, 0xFFFF, 10, &embed_data);
+    converted_shared += 1;
+
+    // LM head (layer=0, segment=11)
+    let lm_head_data = rand_fp16_bytes(vocab_size * hidden_dim);
+    add_shared_pages(&mut writer, 0, 0xFFFF, 11, &lm_head_data);
+    converted_shared += 1;
+
+    // Final norm (layer=0xFFFF, segment=8)
+    let norm_data = rand_fp16_bytes(hidden_dim);
+    add_shared_pages(&mut writer, 0xFFFF, 0xFFFF, 8, &norm_data);
+    converted_shared += 1;
+
+    // Per-layer shared weights
+    for layer in 0..config.num_moe_layers {
+        let layer_idx = layer as u16 + config.dense_layer_idx as u16;
+
+        // Router weights (segment=3): [num_experts, hidden_dim]
+        let router_data = rand_fp16_bytes(config.num_experts as usize * hidden_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 3, &router_data);
+        converted_shared += 1;
+
+        // Attention Q projection (segment=4): [num_heads * head_dim, hidden_dim]
+        let q_data = rand_fp16_bytes(num_heads * head_dim * hidden_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 4, &q_data);
+        converted_shared += 1;
+
+        // Attention O projection (segment=5): [hidden_dim, num_heads * head_dim]
+        let o_data = rand_fp16_bytes(hidden_dim * num_heads * head_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 5, &o_data);
+        converted_shared += 1;
+
+        // Input layernorm (segment=6): [hidden_dim]
+        let in_norm = rand_fp16_bytes(hidden_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 6, &in_norm);
+        converted_shared += 1;
+
+        // Post-attention layernorm (segment=7): [hidden_dim]
+        let post_norm = rand_fp16_bytes(hidden_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 7, &post_norm);
+        converted_shared += 1;
+
+        // Attention K projection (segment=12): [num_kv_heads * head_dim, hidden_dim]
+        let k_data = rand_fp16_bytes(num_kv_heads * head_dim * hidden_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 12, &k_data);
+        converted_shared += 1;
+
+        // Attention V projection (segment=13): [num_kv_heads * head_dim, hidden_dim]
+        let v_data = rand_fp16_bytes(num_kv_heads * head_dim * hidden_dim);
+        add_shared_pages(&mut writer, layer_idx, 0xFFFF, 13, &v_data);
+        converted_shared += 1;
+    }
+
+    println!(
+        "  Shared weights:  {} tensors (embed, lm_head, norms, attention, router)",
+        converted_shared
+    );
+
     let output_str = output.to_string_lossy();
     println!("Writing {} ...", output_str);
     writer.finalize(output)?;
@@ -1818,9 +2569,9 @@ pub fn convert_random(
     );
 
     Ok(ConvertResult {
-        total_tensors: converted_experts,
+        total_tensors: converted_experts + converted_shared,
         converted_experts,
-        converted_shared: 0,
+        converted_shared,
         skipped_tensors: vec![],
         source_bytes: 0,
         output_bytes: 0,
@@ -1931,7 +2682,7 @@ fn combine_packed_and_scales(
 ///
 /// Splits the data into 2MB pages based on the weight layout.
 #[allow(clippy::too_many_arguments)]
-fn add_pages_from_data(
+pub fn add_pages_from_data(
     writer: &mut Vib3Writer,
     layer: u16,
     expert: u16,

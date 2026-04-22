@@ -4624,6 +4624,38 @@ pub fn f32_to_f16(input: *const u8, output: *mut u8, n: usize, stream: &CudaStre
     Ok(())
 }
 
+/// GPU BF16→FP16 conversion. Used to feed BF16-source weights (Qwen3.6-27B
+/// dense FFN ships BF16) into the existing FP16-input NVFP4 weight quantizer
+/// (`fp16_to_nvfp4_weight`). Same byte-width on both sides; in-place safe.
+pub fn bf16_to_fp16(input: *const u8, output: *mut u8, n: usize, stream: &CudaStream) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() {
+            let err = unsafe {
+                cuda_ffi::vib3_launch_bf16_to_fp16(input, output, n as i32, stream.raw_ptr())
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "bf16_to_fp16 launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    // CPU fallback
+    // SAFETY: Caller guarantees `input`/`output` point to at least `n` 16-bit
+    // elements each. Buffers are non-overlapping (or in-place — both paths OK).
+    let input_bf16 = unsafe { std::slice::from_raw_parts(input as *const u16, n) };
+    let output_f16 = unsafe { std::slice::from_raw_parts_mut(output as *mut f16, n) };
+    for i in 0..n {
+        // BF16 → F32 → F16 via bit-shift (BF16 = top 16 bits of an F32).
+        let bits_f32 = (input_bf16[i] as u32) << 16;
+        output_f16[i] = f16::from_f32(f32::from_bits(bits_f32));
+    }
+    Ok(())
+}
+
 /// GPU FP16→F32 conversion.
 /// Converts `n` half-precision elements to single-precision.
 pub fn f16_to_f32(input: *const u8, output: *mut u8, n: usize, stream: &CudaStream) -> Result<()> {

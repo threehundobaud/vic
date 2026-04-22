@@ -2301,15 +2301,24 @@ impl Engine {
             // Shared expert (fires every MoE layer):
             //   14=up_shexp, 15=gate_shexp, 16=down_shexp
             //
-            // We DO NOT evict: 3=router, 7=ffn_norm, 17/18/19=dense FFN
-            // (single layer only), 26=shared-gate-scalar, 29=exp_probs_b.
-            const ATTN_SEGMENTS: [u16; 15] = [
+            // We DO NOT evict: 3=router, 7=ffn_norm,
+            // 26=shared-gate-scalar, 29=exp_probs_b.
+            //
+            // Dense FFN (17/18/19) is now in the evict list. For DeepSeek-
+            // style models with one dense layer at layer 0 the `cached_layer
+            // == 0` clause below keeps that layer's FFN resident anyway.
+            // For fully dense architectures (Qwen3.6-27B: 64 dense layers,
+            // ~534 MB FFN per layer) without this eviction VRAM saturates
+            // around L52.
+            const ATTN_SEGMENTS: [u16; 18] = [
                 // Standard / GQA attention
                 4, 5, 12, 13, 27, 28,
                 // MLA
                 20, 21, 22, 23, 24, 25,
                 // Shared expert
                 14, 15, 16,
+                // Dense FFN (per-layer for fully-dense archs)
+                17, 18, 19,
             ];
             self.shared_tensor_cache_device.retain(|key, _| {
                 let cached_layer = (*key >> 16) as u16;

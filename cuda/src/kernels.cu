@@ -1773,6 +1773,16 @@ __global__ void vib3_fp16_to_fp32_kernel(const half* __restrict__ input, float* 
     if (idx < n) output[idx] = __half2float(input[idx]);
 }
 
+// BF16 → FP16 element-wise. Used to feed BF16 source weights (Qwen3.6-27B
+// dense FFN ships BF16) into the existing FP16-input NVFP4 conversion path
+// (vib3_launch_fp16_to_nvfp4_weight). Both source and dest are 16-bit, so
+// shape stays the same and the conversion is in-place safe.
+__global__ void vib3_bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ input,
+                                         half* __restrict__ output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) output[idx] = __float2half(__bfloat162float(input[idx]));
+}
+
 __global__ void vib3_residual_add_fp32_kernel(float* __restrict__ accumulator, const half* __restrict__ layer_output, int dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < dim) accumulator[idx] += __half2float(layer_output[idx]);
@@ -1818,6 +1828,13 @@ int vib3_launch_f32_to_f16(const void* input, void* output, int n, void* stream)
 int vib3_launch_fp16_to_fp32(const void* input, void* output, int n, void* stream) {
     cudaStream_t s = (cudaStream_t)stream;
     vib3_fp16_to_fp32_kernel<<<(n+255)/256, 256, 0, s>>>((const half*)input, (float*)output, n);
+    return (int)cudaGetLastError();
+}
+
+int vib3_launch_bf16_to_fp16(const void* input, void* output, int n, void* stream) {
+    cudaStream_t s = (cudaStream_t)stream;
+    vib3_bf16_to_fp16_kernel<<<(n+255)/256, 256, 0, s>>>(
+        (const __nv_bfloat16*)input, (half*)output, n);
     return (int)cudaGetLastError();
 }
 

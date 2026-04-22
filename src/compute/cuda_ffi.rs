@@ -524,6 +524,17 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+    /// Element-wise BF16 → FP16 on device. Used to feed BF16-source weights
+    /// (Qwen3.6-27B dense FFN ships BF16) into the existing FP16-input NVFP4
+    /// quantizer (`vib3_launch_fp16_to_nvfp4_weight`). Same byte-width on
+    /// both sides; in-place safe.
+    pub fn vib3_launch_bf16_to_fp16(
+        input: *const u8,
+        output: *mut u8,
+        n: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
     pub fn vib3_launch_residual_add_fp32(
         accumulator: *mut u8,
         layer_output: *const u8,
