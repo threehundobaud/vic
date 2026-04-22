@@ -16,10 +16,11 @@
 //   out:     [num_heads, D_latent = 512]  FP32, attention in latent space.
 //            Caller applies V-up-projection (kv_b_proj V-partition) + o_proj.
 
-#if defined(__CUDACC__) && CUDA_VERSION >= 12040
-
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda.h>  // defines CUDA_VERSION
+
+#if defined(__CUDACC__) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
 
 #include "cutlass/cutlass.h"
 #include "cutlass/kernel_hardware_info.h"
@@ -192,9 +193,36 @@ static int run_mla(
         num_heads, max_seq_len, page_count_total, page_size,
         sm_scale, num_kv_splits, sm_count);
 
-    if (fmha.can_implement(args) != cutlass::Status::kSuccess) return -10;
-    if (fmha.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return -11;
-    if (fmha.run(args, workspace, stream) != cutlass::Status::kSuccess) return -12;
+    auto can_stat = fmha.can_implement(args);
+    if (can_stat != cutlass::Status::kSuccess) {
+        fprintf(stderr, "[vib3_cutlass_mla] can_implement failed: %s\n",
+                cutlassGetStatusString(can_stat));
+        return -10;
+    }
+
+    // Diagnostic: dump kernel smem request and device limit to locate
+    // cudaFuncSetAttribute failures on sm_120a (where per-block smem is
+    // smaller than sm_100 B200).
+    int smem_req = MlaType::Fmha::Kernel::SharedStorageSize;
+    int smem_dev_optin = 0;
+    cudaDeviceGetAttribute(&smem_dev_optin,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    fprintf(stderr,
+        "[vib3_cutlass_mla] kernel_smem=%d bytes, device_smem_optin=%d bytes\n",
+        smem_req, smem_dev_optin);
+
+    auto init_stat = fmha.initialize(args, workspace, stream);
+    if (init_stat != cutlass::Status::kSuccess) {
+        fprintf(stderr, "[vib3_cutlass_mla] initialize failed: %s (workspace=%p)\n",
+                cutlassGetStatusString(init_stat), workspace);
+        return -11;
+    }
+    auto run_stat = fmha.run(args, workspace, stream);
+    if (run_stat != cutlass::Status::kSuccess) {
+        fprintf(stderr, "[vib3_cutlass_mla] run failed: %s\n",
+                cutlassGetStatusString(run_stat));
+        return -12;
+    }
     return 0;
 }
 
@@ -210,7 +238,12 @@ extern "C" int vib3_launch_cutlass_mla_decode(
     void* stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    const bool is_paged_128 = (page_size == 128);
+    // Force CP.Async mode (kIsCpAsync=!IsPaged128=true). On consumer/workstation
+    // Blackwell (sm_120a) the TMA path's per-block shared memory footprint
+    // exceeds the device limit, so cudaFuncSetAttribute fails inside
+    // device::MLA::initialize(). The CP.Async variant uses less shared memory
+    // and accepts page_size=128 (power of two, == TileShapeS) same as paged.
+    const bool is_paged_128 = false;
     const bool manual_split = (num_kv_splits > 1);
 
     // FP16 I/O for K2.6 (MLA projections are FP16).
@@ -262,6 +295,55 @@ extern "C" size_t vib3_cutlass_mla_workspace_size(
     return MlaType::Fmha::get_workspace_size(args);
 }
 
+// ── Conversion helpers for Q/KV staging ──
+//
+// The CUTLASS MLA kernel takes FP16 I/O but vib3's MLA pipeline uses FP32
+// for the absorbed Q, the K-rope, and the compressed KV cache. We add
+// simple element-wise conversion kernels here (kept co-located with the
+// CUTLASS wrapper so they only compile when CUTLASS is available).
+
+__global__ void vib3_f32_to_f16_mla_kernel(
+    const float* __restrict__ input,
+    half* __restrict__ output,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = __float2half(input[i]);
+}
+
+__global__ void vib3_f16_to_f32_mla_kernel(
+    const half* __restrict__ input,
+    float* __restrict__ output,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = __half2float(input[i]);
+}
+
+extern "C" int vib3_mla_f32_to_f16(
+    const void* input, void* output, int n, void* stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    int blocks = (n + 255) / 256;
+    vib3_f32_to_f16_mla_kernel<<<blocks, 256, 0, s>>>(
+        reinterpret_cast<const float*>(input),
+        reinterpret_cast<half*>(output),
+        n);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int vib3_mla_f16_to_f32(
+    const void* input, void* output, int n, void* stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    int blocks = (n + 255) / 256;
+    vib3_f16_to_f32_mla_kernel<<<blocks, 256, 0, s>>>(
+        reinterpret_cast<const half*>(input),
+        reinterpret_cast<float*>(output),
+        n);
+    return (int)cudaGetLastError();
+}
+
 #else  // CUDA_VERSION < 12040 — stub out
 
 extern "C" int vib3_launch_cutlass_mla_decode(
@@ -278,5 +360,8 @@ extern "C" int vib3_launch_cutlass_mla_decode(
 extern "C" size_t vib3_cutlass_mla_workspace_size(int, int, int, int, int) {
     return 0;
 }
+
+extern "C" int vib3_mla_f32_to_f16(const void*, void*, int, void*) { return -100; }
+extern "C" int vib3_mla_f16_to_f32(const void*, void*, int, void*) { return -100; }
 
 #endif

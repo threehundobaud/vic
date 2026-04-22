@@ -5,6 +5,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=cuda/src/kernels.cu");
+    println!("cargo:rerun-if-changed=cuda/src/cutlass_mla.cu");
     println!("cargo:rerun-if-changed=build.rs");
     // Re-run if the CUDA toolkit or its discovery inputs change so a later
     // `apt install cuda-toolkit-*` takes effect without requiring `cargo clean`.
@@ -127,6 +128,9 @@ fn compile_cuda() {
         let cutlass_fmha_dir = cutlass_dir.join("examples/77_blackwell_fmha");
         let cutlass_fmha_common = cutlass_dir.join("examples/77_blackwell_fmha/common");
         let cutlass_fmha_collective = cutlass_dir.join("examples/77_blackwell_fmha/collective");
+        // 77_blackwell_fmha's kernels include "gather_tensor.hpp" from
+        // examples/common (the cross-example shared dir).
+        let cutlass_examples_common = cutlass_dir.join("examples/common");
 
         let obj_path = format!("{}/cutlass_mla.o", out_dir);
         let mut cmd = std::process::Command::new("nvcc");
@@ -147,7 +151,8 @@ fn compile_cuda() {
             .arg(format!("-I{}", cutlass_tools_util.display()))
             .arg(format!("-I{}", cutlass_fmha_dir.display()))
             .arg(format!("-I{}", cutlass_fmha_common.display()))
-            .arg(format!("-I{}", cutlass_fmha_collective.display()));
+            .arg(format!("-I{}", cutlass_fmha_collective.display()))
+            .arg(format!("-I{}", cutlass_examples_common.display()));
 
         for flag in &cutlass_arch_flags {
             cmd.arg(flag);

@@ -409,6 +409,31 @@ pub struct Engine {
     #[allow(dead_code)]
     mla_v_out_f16_dev: DeviceBuffer,
 
+    /// CUTLASS MLA decode staging buffers. Lazily populated on first use
+    /// when `VIB3_CUTLASS_MLA=1`. When `None` the engine uses the built-in
+    /// 9-kernel MLA pipeline.
+    ///
+    /// Layout:
+    ///   q_nope_f16:    [CUTLASS_H=128, kv_lora_rank=512] FP16, zero-padded
+    ///                   — our 64 heads live in rows 0..63, rows 64..127 stay 0.
+    ///   q_pe_f16:      [128, qk_rope_dim=64] FP16, zero-padded.
+    ///   kv_c_f16:      [max_seq_len, kv_lora_rank=512] FP16 staging.
+    ///   k_pe_f16:      [max_seq_len, qk_rope_dim=64] FP16 staging.
+    ///   out_f16:       [128, 512] FP16 attention output in latent space.
+    ///   workspace:     kernel scratch (size from vib3_cutlass_mla_workspace_size).
+    ///   seq_lens:      [1] i32 device scalar — current seq_len.
+    ///   page_table:    [1, 1] i32 device — always [0] (single-page mode).
+    mla_cutlass_q_nope_f16: Option<DeviceBuffer>,
+    mla_cutlass_q_pe_f16: Option<DeviceBuffer>,
+    mla_cutlass_kv_c_f16: Option<DeviceBuffer>,
+    mla_cutlass_k_pe_f16: Option<DeviceBuffer>,
+    mla_cutlass_out_f16: Option<DeviceBuffer>,
+    mla_cutlass_workspace: Option<DeviceBuffer>,
+    mla_cutlass_seq_lens: Option<DeviceBuffer>,
+    mla_cutlass_page_table: Option<DeviceBuffer>,
+    /// True if `VIB3_CUTLASS_MLA=1` was set at engine init.
+    mla_cutlass_enabled: bool,
+
     /// Cache for shared tensors in device memory (VRAM).
     /// Used when gpu_mode is true — avoids repeated H2D copies for
     /// embeddings, norms, QKV projections, router weights, lm_head, etc.
@@ -1312,6 +1337,16 @@ impl Engine {
             mla_rope_freqs_dev,
             mla_kv_norm_weight_dev: std::collections::HashMap::new(),
             mla_v_out_f16_dev: DeviceBuffer::new(mla_v_out_f16_bytes)?,
+            mla_cutlass_q_nope_f16: None,
+            mla_cutlass_q_pe_f16: None,
+            mla_cutlass_kv_c_f16: None,
+            mla_cutlass_k_pe_f16: None,
+            mla_cutlass_out_f16: None,
+            mla_cutlass_workspace: None,
+            mla_cutlass_seq_lens: None,
+            mla_cutlass_page_table: None,
+            mla_cutlass_enabled: std::env::var("VIB3_CUTLASS_MLA")
+                .map_or(false, |v| v == "1"),
             shared_tensor_cache_device: std::collections::HashMap::new(),
             pre_assembled_weights: std::collections::HashMap::new(),
             task_context: None,
@@ -4834,6 +4869,226 @@ impl Engine {
     /// Run MLA attention for one layer.
     /// Returns `Ok(None)` when GPU path was used — output is in `self.mla_o_out_dev`.
     /// Returns `Ok(Some(vec))` when CPU fallback was used — output is the returned vector.
+    /// Ensure CUTLASS MLA staging buffers are allocated. Called lazily from
+    /// `mla_cutlass_decode`. Sized for up to CUTLASS_H=128 heads and the
+    /// maximum sequence length reserved by `mla_gpu_kv_latent[0]` (rounded
+    /// up to a multiple of PAGE_SIZE=128, the CUTLASS tile-S size).
+    fn ensure_cutlass_mla_buffers(
+        &mut self,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<()> {
+        if self.mla_cutlass_q_nope_f16.is_some() {
+            return Ok(());
+        }
+        const CUTLASS_H: usize = 128;
+        const PAGE_SIZE: usize = 128;
+        let padded_max_seq = (max_seq_len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let page_count_total = padded_max_seq / PAGE_SIZE;
+
+        // Q staging (padded to CUTLASS_H heads)
+        let q_nope_bytes = CUTLASS_H * kv_lora_rank * std::mem::size_of::<f16>();
+        let q_pe_bytes = CUTLASS_H * qk_rope_dim * std::mem::size_of::<f16>();
+        // KV staging (padded_max_seq rows, zero-filled beyond seq_len at runtime)
+        let kv_c_bytes = padded_max_seq * kv_lora_rank * std::mem::size_of::<f16>();
+        let k_pe_bytes = padded_max_seq * qk_rope_dim * std::mem::size_of::<f16>();
+        // Output in latent space [CUTLASS_H, kv_lora_rank] FP16
+        let out_bytes = CUTLASS_H * kv_lora_rank * std::mem::size_of::<f16>();
+        // Workspace from CUTLASS (queries internal split_kv and batch sizes).
+        #[cfg(feature = "cuda")]
+        let workspace_bytes = unsafe {
+            cuda_ffi::vib3_cutlass_mla_workspace_size(
+                CUTLASS_H as i32,
+                padded_max_seq as i32,
+                1,
+                0, // auto-detect SM count
+                -1, // auto split_kv
+            )
+        };
+        #[cfg(not(feature = "cuda"))]
+        let workspace_bytes: usize = 0;
+        let workspace_bytes = workspace_bytes.max(4096);
+
+        self.mla_cutlass_q_nope_f16 = Some(DeviceBuffer::new(q_nope_bytes)?);
+        self.mla_cutlass_q_pe_f16 = Some(DeviceBuffer::new(q_pe_bytes)?);
+        self.mla_cutlass_kv_c_f16 = Some(DeviceBuffer::new(kv_c_bytes)?);
+        self.mla_cutlass_k_pe_f16 = Some(DeviceBuffer::new(k_pe_bytes)?);
+        self.mla_cutlass_out_f16 = Some(DeviceBuffer::new(out_bytes)?);
+        self.mla_cutlass_workspace = Some(DeviceBuffer::new(workspace_bytes)?);
+        self.mla_cutlass_seq_lens = Some(DeviceBuffer::new(4)?);
+
+        // page_table: [batch=1, pages_per_seq=page_count_total] i32
+        // Contiguous identity mapping [0, 1, 2, ...] so the kernel reads each
+        // page from its natural position in the staging buffer.
+        let page_table_bytes = page_count_total * std::mem::size_of::<i32>();
+        let page_table = DeviceBuffer::new(page_table_bytes)?;
+        let page_ids: Vec<i32> = (0..page_count_total as i32).collect();
+        cuda_ffi::memcpy_h2d_sync(
+            page_table.as_mut_ptr(),
+            page_ids.as_ptr() as *const u8,
+            page_table_bytes,
+        )?;
+        self.mla_cutlass_page_table = Some(page_table);
+
+        tracing::info!(
+            "CUTLASS MLA staging: q_nope={}B q_pe={}B kv_c={}B k_pe={}B out={}B workspace={}B padded_max_seq={} pages={}",
+            q_nope_bytes, q_pe_bytes, kv_c_bytes, k_pe_bytes, out_bytes, workspace_bytes,
+            padded_max_seq, page_count_total,
+        );
+        Ok(())
+    }
+
+    /// Replaces `mla_decode_attention` when `VIB3_CUTLASS_MLA=1`. Reads
+    /// `mla_q_absorbed_dev` + `mla_q_rope_f32_dev` + `mla_gpu_kv_latent[layer]`
+    /// + `mla_gpu_kv_rope[layer]` (all FP32), runs the CUTLASS MLA decode
+    /// kernel in FP16, and writes the attention latent output (FP32) into
+    /// `mla_v_latent_dev` — the same buffer the builtin kernel writes into,
+    /// so `mla_v_reconstruct` and `o_proj` remain unchanged downstream.
+    fn mla_cutlass_decode(
+        &mut self,
+        layer: usize,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        seq_len: usize,
+        sm_scale: f32,
+    ) -> Result<()> {
+        const CUTLASS_H: usize = 128;
+        const PAGE_SIZE: usize = 128;
+        debug_assert!(num_heads <= CUTLASS_H, "CUTLASS MLA tile assumes H<=128");
+
+        // Max seq_len reserved in the KV cache buffer for this layer.
+        let max_seq_bytes = self.mla_gpu_kv_latent[layer].size();
+        let max_seq_len = max_seq_bytes / (kv_lora_rank * std::mem::size_of::<f32>());
+        self.ensure_cutlass_mla_buffers(kv_lora_rank, qk_rope_dim, max_seq_len)?;
+        let padded_max_seq = (max_seq_len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let page_count_total = padded_max_seq / PAGE_SIZE;
+
+        // Unwrap staging buffers (populated by ensure_cutlass_mla_buffers).
+        let q_nope_f16 = self.mla_cutlass_q_nope_f16.as_ref().unwrap().as_mut_ptr();
+        let q_pe_f16 = self.mla_cutlass_q_pe_f16.as_ref().unwrap().as_mut_ptr();
+        let kv_c_f16 = self.mla_cutlass_kv_c_f16.as_ref().unwrap().as_mut_ptr();
+        let k_pe_f16 = self.mla_cutlass_k_pe_f16.as_ref().unwrap().as_mut_ptr();
+        let out_f16 = self.mla_cutlass_out_f16.as_ref().unwrap().as_mut_ptr();
+        let workspace = self.mla_cutlass_workspace.as_ref().unwrap().as_mut_ptr();
+        let seq_lens_ptr = self.mla_cutlass_seq_lens.as_ref().unwrap().as_mut_ptr();
+        let page_table_ptr = self.mla_cutlass_page_table.as_ref().unwrap().as_ptr();
+
+        let stream = &self.stream;
+
+        // Zero-pad Q staging to CUTLASS_H heads (rows num_heads..CUTLASS_H stay 0).
+        // Zero-fill KV staging too so positions beyond seq_len are 0 in FP16
+        // (the kernel ignores positions >= seq_lens[b], but the TMA load path
+        // still reads the full page_size tile — zeros keep it well-defined).
+        self.mla_cutlass_q_nope_f16.as_ref().unwrap().zero_async(stream);
+        self.mla_cutlass_q_pe_f16.as_ref().unwrap().zero_async(stream);
+        self.mla_cutlass_kv_c_f16.as_ref().unwrap().zero_async(stream);
+        self.mla_cutlass_k_pe_f16.as_ref().unwrap().zero_async(stream);
+
+        // Convert first `num_heads` rows of Q from FP32 to FP16.
+        let q_nope_elems = num_heads * kv_lora_rank;
+        let q_pe_elems = num_heads * qk_rope_dim;
+        let kv_c_elems = seq_len * kv_lora_rank;
+        let k_pe_elems = seq_len * qk_rope_dim;
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let err = cuda_ffi::vib3_mla_f32_to_f16(
+                self.mla_q_absorbed_dev.as_ptr(),
+                q_nope_f16,
+                q_nope_elems as i32,
+                stream.raw_ptr(),
+            );
+            if err != 0 {
+                return Err(Error::Cuda(format!("f32->f16 q_nope failed: err={}", err)));
+            }
+            let err = cuda_ffi::vib3_mla_f32_to_f16(
+                self.mla_q_rope_f32_dev.as_ptr(),
+                q_pe_f16,
+                q_pe_elems as i32,
+                stream.raw_ptr(),
+            );
+            if err != 0 {
+                return Err(Error::Cuda(format!("f32->f16 q_pe failed: err={}", err)));
+            }
+            let err = cuda_ffi::vib3_mla_f32_to_f16(
+                self.mla_gpu_kv_latent[layer].as_ptr(),
+                kv_c_f16,
+                kv_c_elems as i32,
+                stream.raw_ptr(),
+            );
+            if err != 0 {
+                return Err(Error::Cuda(format!("f32->f16 kv_c failed: err={}", err)));
+            }
+            let err = cuda_ffi::vib3_mla_f32_to_f16(
+                self.mla_gpu_kv_rope[layer].as_ptr(),
+                k_pe_f16,
+                k_pe_elems as i32,
+                stream.raw_ptr(),
+            );
+            if err != 0 {
+                return Err(Error::Cuda(format!("f32->f16 k_pe failed: err={}", err)));
+            }
+        }
+
+        // Write seq_len to device scalar (host→device, async on stream).
+        let seq_len_i32: i32 = seq_len as i32;
+        let seq_len_bytes = (&seq_len_i32 as *const i32) as *const u8;
+        cuda_ffi::memcpy_h2d_async(seq_lens_ptr, seq_len_bytes, 4, stream)?;
+
+        // Page layout: page_size=128 (== TileShapeS), page_count=padded_max_seq/128.
+        // Each physical page in our staging buffer covers 128 consecutive tokens.
+        // page_table[i] = i (identity mapping), so the kernel reads pages in order.
+        // seq_lens[0] = actual seq_len masks out positions >= seq_len inside the
+        // last page for softmax.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let err = cuda_ffi::vib3_launch_cutlass_mla_decode(
+                q_nope_f16 as *const u8,
+                q_pe_f16 as *const u8,
+                kv_c_f16 as *const u8,
+                k_pe_f16 as *const u8,
+                seq_lens_ptr as *const i32,
+                page_table_ptr as *const i32,
+                out_f16,
+                std::ptr::null_mut(), // LSE not needed
+                workspace,
+                CUTLASS_H as i32,
+                padded_max_seq as i32,
+                page_count_total as i32,
+                PAGE_SIZE as i32,
+                sm_scale,
+                -1,          // auto split_kv
+                0,           // sm_count auto
+                stream.raw_ptr(),
+            );
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "cutlass_mla_decode failed: err={}",
+                    err
+                )));
+            }
+        }
+
+        // Convert first `num_heads` rows of output back to FP32 into mla_v_latent_dev.
+        let out_elems = num_heads * kv_lora_rank;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let err = cuda_ffi::vib3_mla_f16_to_f32(
+                out_f16 as *const u8,
+                self.mla_v_latent_dev.as_mut_ptr(),
+                out_elems as i32,
+                stream.raw_ptr(),
+            );
+            if err != 0 {
+                return Err(Error::Cuda(format!("f16->f32 out failed: err={}", err)));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn run_mla_attention(
         &mut self,
         layer_idx: u16,
@@ -5058,11 +5313,19 @@ impl Engine {
                     &self.stream,
                 )?;
 
-                // Step 5: GPU mla_q_absorb_rope — fused Q absorption + RoPE
-                let kv_b_dev = self.kv_b_proj_f32_device.get(&layer_idx).unwrap();
+                // Step 5: GPU mla_q_absorb_rope — fused Q absorption + RoPE.
+                // Capture kv_b as a raw pointer so we don't hold an immutable
+                // borrow across the mla_cutlass_decode call (which needs &mut self).
+                // kv_b_proj_f32_device is insert-only during run_mla_attention,
+                // so the buffer lifetime is stable across the pointer use.
+                let kv_b_dev_ptr = self
+                    .kv_b_proj_f32_device
+                    .get(&layer_idx)
+                    .unwrap()
+                    .as_ptr();
                 kernels::mla_q_absorb_rope(
                     self.mla_q_full_dev.as_ptr(),
-                    kv_b_dev.as_ptr(),
+                    kv_b_dev_ptr,
                     rope_freqs_ptr,
                     self.mla_q_absorbed_dev.as_mut_ptr(),
                     self.mla_q_rope_f32_dev.as_mut_ptr(),
@@ -5076,26 +5339,53 @@ impl Engine {
                     &self.stream,
                 )?;
 
-                // Step 6: GPU MLA decode attention
+                // Step 6: GPU MLA decode attention.
+                // When VIB3_CUTLASS_MLA=1, try the CUTLASS kernel first but
+                // transparently fall back to the built-in pipeline if it
+                // errors out (e.g. smem-too-small on sm_120a). The fallback
+                // is sticky for the rest of the session so we only pay the
+                // launch-fail cost once.
                 let scale = mla.softmax_scale;
-                kernels::mla_decode_attention(
-                    self.mla_q_absorbed_dev.as_ptr(),
-                    self.mla_q_rope_f32_dev.as_ptr(),
-                    self.mla_gpu_kv_latent[layer].as_ptr(),
-                    self.mla_gpu_kv_rope[layer].as_ptr(),
-                    self.mla_v_latent_dev.as_mut_ptr(),
-                    kv_lora_rank,
-                    qk_rope_dim,
-                    num_heads,
-                    seq_len,
-                    scale,
-                    &self.stream,
-                )?;
+                let mut used_cutlass = false;
+                if self.mla_cutlass_enabled {
+                    match self.mla_cutlass_decode(
+                        layer,
+                        num_heads,
+                        kv_lora_rank,
+                        qk_rope_dim,
+                        seq_len,
+                        scale,
+                    ) {
+                        Ok(()) => used_cutlass = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "CUTLASS MLA decode failed, disabling and falling back to built-in: {}",
+                                e
+                            );
+                            self.mla_cutlass_enabled = false;
+                        }
+                    }
+                }
+                if !used_cutlass {
+                    kernels::mla_decode_attention(
+                        self.mla_q_absorbed_dev.as_ptr(),
+                        self.mla_q_rope_f32_dev.as_ptr(),
+                        self.mla_gpu_kv_latent[layer].as_ptr(),
+                        self.mla_gpu_kv_rope[layer].as_ptr(),
+                        self.mla_v_latent_dev.as_mut_ptr(),
+                        kv_lora_rank,
+                        qk_rope_dim,
+                        num_heads,
+                        seq_len,
+                        scale,
+                        &self.stream,
+                    )?;
+                }
 
                 // Step 7: GPU V reconstruction
                 kernels::mla_v_reconstruct(
                     self.mla_v_latent_dev.as_ptr(),
-                    kv_b_dev.as_ptr(),
+                    kv_b_dev_ptr,
                     self.mla_v_out_f32_dev.as_mut_ptr(),
                     kv_lora_rank,
                     qk_nope_dim,

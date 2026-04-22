@@ -882,6 +882,63 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+    /// CUTLASS 4.2.1 Blackwell MLA decode (batch=1, single-page). Expects
+    /// separate FP16 buffers for q_nope/q_pe/kv_c/k_pe and writes FP32 output
+    /// in latent space [H, D_latent=512]. Caller applies V-up-projection and
+    /// o_proj afterwards.
+    ///
+    /// `num_heads` must match the tile-shape H used in cutlass_mla.cu
+    /// (currently 128 — callers with fewer heads must pad Q by zeros).
+    /// `seq_len` == current sequence length; `page_count_total=1`,
+    /// `page_size = seq_len` for the single-page shortcut.
+    /// Returns 0 on success, negative on error.
+    pub fn vib3_launch_cutlass_mla_decode(
+        q_nope: *const u8,
+        q_pe: *const u8,
+        kv_c: *const u8,
+        k_pe: *const u8,
+        seq_lens_device: *const i32,
+        page_table_device: *const i32,
+        out: *mut u8,
+        lse: *mut u8, // may be null
+        workspace: *mut u8,
+        num_heads: i32,
+        seq_len: i32,
+        page_count_total: i32,
+        page_size: i32,
+        sm_scale: f32,
+        num_kv_splits: i32,
+        sm_count: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Workspace bytes required by the CUTLASS MLA decode kernel. Caller
+    /// allocates this much scratch and passes to the launcher.
+    pub fn vib3_cutlass_mla_workspace_size(
+        num_heads: i32,
+        max_seq_len: i32,
+        num_batches: i32,
+        sm_count: i32,
+        num_kv_splits: i32,
+    ) -> usize;
+
+    /// Simple element-wise FP32 → FP16 conversion (used to stage Q/KV for
+    /// the CUTLASS MLA kernel from vib3's FP32 buffers).
+    pub fn vib3_mla_f32_to_f16(
+        input: *const u8,
+        output: *mut u8,
+        n: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Simple element-wise FP16 → FP32 conversion.
+    pub fn vib3_mla_f16_to_f32(
+        input: *const u8,
+        output: *mut u8,
+        n: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
     /// Convert FP16 weight matrix [M, K] to NVFP4 MMA format at runtime.
     /// out_data must be M * K/2 bytes, out_scales must be M * (K/32) * 2 bytes.
     /// Output is split-half packed FP4 data + BF16 block scales, ready for MMA GEMV.
