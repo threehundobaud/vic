@@ -3731,12 +3731,14 @@ pub fn linear_projection(
     out_dim: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    // GPU dispatch: uses the FP16 matmul kernel
+    // GPU dispatch. `_fast` uses float4 input caching in shared memory and
+    // 4-rows-per-block × 64-threads-per-row tiling. It internally falls back
+    // to the basic kernel when in_dim is not a multiple of 512.
     #[cfg(feature = "cuda")]
     {
         if stream.is_real() {
             let err = unsafe {
-                cuda_ffi::vib3_launch_partial_matmul_fp16(
+                cuda_ffi::vib3_launch_partial_matmul_fp16_fast(
                     input,
                     weight,
                     output,
