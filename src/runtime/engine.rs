@@ -1977,18 +1977,29 @@ impl Engine {
         prompt: &str,
         params: SamplingParams,
     ) -> Result<GenerateResult> {
-        let start = Instant::now();
-
-        // Tokenize
         let normalized_prompt =
             Self::normalize_prompt_for_model(&self.model_config.architecture, prompt);
         let input_tokens = self.tokenizer.encode(&normalized_prompt);
+        self.generate_with_tokens(&input_tokens, params).await
+    }
+
+    /// Run inference on a pre-tokenized prompt. Use this when you need to
+    /// insert special token IDs (e.g. chat-template markers like
+    /// `<|im_system|>`) that the tokenizer's pre-tokenizer won't produce
+    /// from a plain string — the Vib3Tokenizer::encode_chat helper does
+    /// exactly that and hands its token list here.
+    pub async fn generate_with_tokens(
+        &mut self,
+        input_tokens: &[u32],
+        params: SamplingParams,
+    ) -> Result<GenerateResult> {
+        let start = Instant::now();
         let prompt_len = input_tokens.len();
         tracing::debug!("Prompt: {} tokens", prompt_len);
 
         // Prefill
         let prefill_start = Instant::now();
-        self.prefill(&input_tokens).await?;
+        self.prefill(input_tokens).await?;
         let ttft = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         // Generate

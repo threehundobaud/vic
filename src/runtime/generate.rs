@@ -289,7 +289,10 @@ impl TokenizerWrapper {
                 text.push_str(&format!("user: {}", user_message));
                 t.encode(&text)
             }
-            TokenizerWrapper::Real(t) => t.encode_chat(user_message, system_prompt, false),
+            TokenizerWrapper::Real(t) => {
+                let thinking = t.token_to_id("<think>").is_some();
+                t.encode_chat(user_message, system_prompt, thinking)
+            }
         }
     }
 
@@ -313,6 +316,21 @@ impl TokenizerWrapper {
                 // during warmup. We let the caller decide via max_tokens.
                 stops
             }
+        }
+    }
+
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        match self {
+            TokenizerWrapper::Simple(_) => None,
+            TokenizerWrapper::Real(t) => t.token_to_id(token),
+        }
+    }
+
+    /// Effective tokenizer vocabulary size.
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            TokenizerWrapper::Simple(t) => t.vocab_size as usize,
+            TokenizerWrapper::Real(t) => t.vocab_size as usize,
         }
     }
 }
@@ -469,46 +487,106 @@ impl Vib3Tokenizer {
         }
     }
 
-    /// Encode with a tokenizer-aware chat template.
+    /// Encode plain text with special-token addition DISABLED. Used by
+    /// `encode_chat` so it can inject special token IDs at the exact
+    /// offsets the template demands, without the tokenizer's post-processor
+    /// adding unwanted BOS/EOS around plain-text segments.
+    fn encode_plain(&self, text: &str) -> Vec<u32> {
+        match self.inner.encode(text, false) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                tracing::warn!("Tokenizer encode(plain) failed: {}", e);
+                vec![]
+            }
+        }
+    }
+
+    /// Encode with a tokenizer-aware chat template, **constructing the
+    /// token stream directly** from pre-looked-up special-token IDs
+    /// rather than hoping the tokenizer re-tokenizes a template string
+    /// back into the right specials. Many Kimi-family `tokenizer.json`
+    /// files list the chat markers only in the BPE vocab — not in
+    /// `added_tokens` — so a ByteLevel pre-tokenizer would break
+    /// `<|im_system|>` into 14 ASCII-byte tokens instead of the single
+    /// id-163594 special, causing catastrophic model divergence.
     ///
-    /// Prefers Qwen ChatML (`<|im_start|>`) when available, otherwise falls
-    /// back to Kimi-style tags (`<|im_system|>`, `<|im_middle|>`).
+    /// Dispatch rules:
+    ///   - Qwen ChatML (`<|im_start|>` present): wrap with
+    ///     `<|im_start|>role\n...<|im_end|>`.
+    ///   - Kimi-style (`<|im_system|>` etc. present): wrap with
+    ///     `<|im_system|>system<|im_middle|>...<|im_end|>\n...`.
+    ///   - Neither: fall back to encoding the template as literal text.
     pub fn encode_chat(
         &self,
         user_message: &str,
         system_prompt: Option<&str>,
         thinking: bool,
     ) -> Vec<u32> {
-        let has_qwen_chatml = self.inner.token_to_id("<|im_start|>").is_some()
-            && self.inner.token_to_id("<|im_end|>").is_some();
-
+        let im_start = self.inner.token_to_id("<|im_start|>");
+        let im_end = self.inner.token_to_id("<|im_end|>");
+        let im_system = self.inner.token_to_id("<|im_system|>");
+        let im_user = self.inner.token_to_id("<|im_user|>");
+        let im_assistant = self.inner.token_to_id("<|im_assistant|>");
+        let im_middle = self.inner.token_to_id("<|im_middle|>");
         let system = system_prompt.unwrap_or("You are a helpful assistant.");
 
-        let template = if has_qwen_chatml {
-            if thinking {
-                format!(
-                    "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
-                    system, user_message
-                )
-            } else {
-                format!(
-                    "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                    system, user_message
-                )
-            }
-        } else if thinking {
-            format!(
-                "<|im_system|>system<|im_middle|>{}<|im_end|>\n<|im_user|>user<|im_middle|>{}<|im_end|>\n<|im_assistant|>assistant<|im_middle|><think>",
-                system, user_message
-            )
-        } else {
-            format!(
-                "<|im_system|>system<|im_middle|>{}<|im_end|>\n<|im_user|>user<|im_middle|>{}<|im_end|>\n<|im_assistant|>assistant<|im_middle|>",
-                system, user_message
-            )
-        };
+        let mut tokens: Vec<u32> = Vec::new();
 
-        self.encode(&template)
+        if let (Some(im_start), Some(im_end)) = (im_start, im_end) {
+            // Qwen-style ChatML:
+            //   <|im_start|>system\n{sys}<|im_end|>\n
+            //   <|im_start|>user\n{user}<|im_end|>\n
+            //   <|im_start|>assistant\n[<think>\n]
+            tokens.push(im_start);
+            tokens.extend(self.encode_plain(&format!("system\n{}", system)));
+            tokens.push(im_end);
+            tokens.extend(self.encode_plain("\n"));
+            tokens.push(im_start);
+            tokens.extend(self.encode_plain(&format!("user\n{}", user_message)));
+            tokens.push(im_end);
+            tokens.extend(self.encode_plain("\n"));
+            tokens.push(im_start);
+            tokens.extend(self.encode_plain("assistant\n"));
+            if thinking {
+                tokens.extend(self.encode_plain("<think>\n"));
+            }
+        } else if let (Some(im_system), Some(im_middle), Some(im_end)) =
+            (im_system, im_middle, im_end)
+        {
+            // Kimi-style:
+            //   <|im_system|>system<|im_middle|>{sys}<|im_end|>\n
+            //   <|im_user|>user<|im_middle|>{user}<|im_end|>\n
+            //   <|im_assistant|>assistant<|im_middle|>[<think>]
+            let im_user = im_user.unwrap_or(im_system); // fallback — unlikely to hit
+            let im_assistant = im_assistant.unwrap_or(im_system);
+            tokens.push(im_system);
+            tokens.extend(self.encode_plain("system"));
+            tokens.push(im_middle);
+            tokens.extend(self.encode_plain(system));
+            tokens.push(im_end);
+            tokens.extend(self.encode_plain("\n"));
+            tokens.push(im_user);
+            tokens.extend(self.encode_plain("user"));
+            tokens.push(im_middle);
+            tokens.extend(self.encode_plain(user_message));
+            tokens.push(im_end);
+            tokens.extend(self.encode_plain("\n"));
+            tokens.push(im_assistant);
+            tokens.extend(self.encode_plain("assistant"));
+            tokens.push(im_middle);
+            if thinking {
+                tokens.extend(self.encode_plain("<think>"));
+            }
+        } else {
+            // No chat markers in the tokenizer — just encode as literal text.
+            let template = format!(
+                "system: {}\nuser: {}\nassistant: ",
+                system, user_message
+            );
+            tokens = self.encode(&template);
+        }
+
+        tokens
     }
 
     /// Decode token IDs to text.

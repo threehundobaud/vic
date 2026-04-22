@@ -68,9 +68,22 @@ enum Commands {
         /// Path to tokenizer.json (auto-detected if not specified)
         #[arg(long)]
         tokenizer: Option<String>,
-        /// Enable chat template (wraps input with model-specific chat format)
+        /// Wrap user input in the model's chat template (role markers +
+        /// assistant prefix) before tokenizing. When off (the default),
+        /// prompts are sent raw — continue-the-text style. Chat mode is
+        /// what produces real "ask a question / get an answer" behaviour
+        /// from instruction-tuned checkpoints. Still experimental on K2.6
+        /// (the Kimi-style role markers currently trigger a downstream
+        /// NaN in the MLA pipeline on some token sequences — under
+        /// investigation; see roadmap §4).
         #[arg(long)]
         chat: bool,
+        /// Repetition penalty (1.0 = off). 1.05 is a mild default that
+        /// keeps greedy decoding from locking into single-token loops.
+        /// Applied BEFORE temperature / top-k / top-p. Bump to 1.2+ if
+        /// the bare-prompt "masked masked" spiral shows up.
+        #[arg(long, default_value = "1.05")]
+        rep_penalty: f32,
     },
 
     /// Start an OpenAI-compatible API server
@@ -143,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             no_check,
             tokenizer,
             chat,
+            rep_penalty,
         } => {
             cmd_run(
                 &model,
@@ -156,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 no_check,
                 tokenizer.as_deref(),
                 chat,
+                rep_penalty,
             )
             .await
         }
@@ -201,6 +216,7 @@ async fn cmd_run(
     no_check: bool,
     tokenizer_path: Option<&str>,
     chat: bool,
+    rep_penalty: f32,
 ) -> anyhow::Result<()> {
     print_banner();
 
@@ -263,18 +279,37 @@ async fn cmd_run(
         mc.name, mc.num_experts, mc.num_moe_layers
     );
 
-    // 6. Interactive loop
-    if chat {
-        println!("Chat mode enabled (Qwen3.5 thinking template)");
+    // 6. Interactive loop.
+    //
+    // Default is raw (continue-the-text) mode with a small repetition
+    // penalty so the greedy path can't lock into a single-token loop.
+    // `--chat` opts into the model's chat template (role markers +
+    // special stop tokens). Still experimental on K2.6 — the Kimi-style
+    // markers trigger an MLA-side NaN on some token sequences pending
+    // diagnosis; use `--chat` with care until that lands.
+    let tok = engine.tokenizer();
+    let chat_supported = tok.token_to_id("<|im_start|>").is_some()
+        || tok.token_to_id("<|im_system|>").is_some();
+    let use_chat = chat && chat_supported;
+    let stop_tokens = if use_chat {
+        tok.stop_token_ids()
+    } else {
+        Vec::new()
+    };
+    if use_chat {
+        println!(
+            "Chat mode (arch={}, stop tokens={:?}, rep_penalty={}).",
+            mc.architecture, stop_tokens, rep_penalty
+        );
+    } else if chat && !chat_supported {
+        println!("--chat requested but tokenizer has no chat-template markers; falling back to raw mode.");
+    } else {
+        println!(
+            "Raw mode (rep_penalty={}). Pass --chat for instruction-format wrapping.",
+            rep_penalty
+        );
     }
     println!("Type your prompt (Ctrl+D to exit):\n");
-
-    // Chat mode stop tokens: <|im_end|> = 248046, <|endoftext|> = 248044
-    let chat_stop_tokens: Vec<u32> = if chat {
-        vec![248046, 248044]
-    } else {
-        vec![]
-    };
 
     loop {
         print!(">>> ");
@@ -290,25 +325,28 @@ async fn cmd_run(
             continue;
         }
 
-        // In chat mode, wrap input with the Qwen3.5 chat template
-        let prompt = if chat {
-            format!(
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
-                input
-            )
-        } else {
-            input.to_string()
-        };
-
         let params = vib3::runtime::generate::SamplingParams {
             max_tokens,
             temperature,
             top_k,
             top_p,
-            stop_tokens: chat_stop_tokens.clone(),
+            repetition_penalty: rep_penalty,
+            stop_tokens: stop_tokens.clone(),
             ..Default::default()
         };
-        let result = engine.generate_with_params(&prompt, params).await?;
+
+        // Route through encode_chat when chat templating is on — it builds
+        // the token stream with raw special-token IDs injected directly,
+        // which is the only reliable way to get chat markers into models
+        // whose `tokenizer.json` lists them in the BPE vocab but NOT in
+        // `added_tokens` (ByteLevel pre-tokenizer would otherwise break
+        // `<|im_system|>` into 14 ASCII byte tokens).
+        let result = if use_chat {
+            let prompt_tokens = engine.tokenizer().encode_chat(input, None);
+            engine.generate_with_tokens(&prompt_tokens, params).await?
+        } else {
+            engine.generate_with_params(input, params).await?
+        };
 
         println!("{}\n", result.text);
         println!(
