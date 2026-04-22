@@ -238,12 +238,12 @@ extern "C" int vib3_launch_cutlass_mla_decode(
     void* stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    // Force CP.Async mode (kIsCpAsync=!IsPaged128=true). On consumer/workstation
-    // Blackwell (sm_120a) the TMA path's per-block shared memory footprint
-    // exceeds the device limit, so cudaFuncSetAttribute fails inside
-    // device::MLA::initialize(). The CP.Async variant uses less shared memory
-    // and accepts page_size=128 (power of two, == TileShapeS) same as paged.
-    const bool is_paged_128 = false;
+    // is_paged_128=true selects the TMA path, false selects cp.async.
+    // Both require ~129 KB smem with StagesQK=2 (the minimum CUTLASS
+    // allows), which doesn't fit in sm_120a's 99 KB opt-in budget. So on
+    // that arch the kernel is effectively unreachable; the runtime
+    // fallback kicks in. On sm_100 either path works.
+    const bool is_paged_128 = (page_size == 128);
     const bool manual_split = (num_kv_splits > 1);
 
     // FP16 I/O for K2.6 (MLA projections are FP16).

@@ -19,4 +19,9 @@ git clone --depth 1 --branch "$CUTLASS_VERSION" \
 
 echo ""
 echo "CUTLASS $CUTLASS_VERSION fetched into $TARGET"
+echo ""
+echo "Applying vib3-local patches..."
+"$(dirname "$0")/patch_cutlass.sh"
+
+echo ""
 echo "build.rs will now compile cuda/src/cutlass_mla.cu on next \`cargo build\`."

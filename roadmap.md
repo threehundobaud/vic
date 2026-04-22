@@ -133,21 +133,42 @@ against the 150 ms baseline with the same prompt sequence.
 ### Week-scoped — real engineering, big levers
 
 - **#31  Port vLLM's sm_100 CUTLASS MLA kernel** — SCAFFOLDING SHIPPED
-  `a082735`, **blocked on sm_120a smem limit**.
+  `a082735`, **partial knob reduction, still blocked on sm_120a smem**.
   Full CUTLASS 4.2.1 tree in `third_party/cutlass/` (gitignored, fetch
-  via `scripts/fetch_cutlass.sh`). `cuda/src/cutlass_mla.cu` wraps
+  via `scripts/fetch_cutlass.sh` which also applies
+  `scripts/patch_cutlass.sh`). `cuda/src/cutlass_mla.cu` wraps
   `Sm100FmhaMlaKernelTmaWarpspecialized` with raw-pointer (no-torch)
   entry points, builds clean. `run_mla_attention` has a
-  `VIB3_CUTLASS_MLA=1` gate with a sticky runtime fallback. **But**:
-  kernel needs 212 KB shared memory per block, RTX PRO 6000 Blackwell
-  Workstation (sm_120a) only exposes 99 KB opt-in — `cudaFuncSetAttribute`
-  rejects. Both TMA (IsPaged128=true) and cp.async (IsPaged128=false)
-  paths share the same TileShape `<_128,_128,<_512,_64>>` and so share
-  the wall. Unblocking requires either a smaller-tile CUTLASS
-  instantiation that fits in 99 KB or a port of `xqa/mla_sm120.cu`
-  from flashinfer (already bundled in the system's flashinfer archive,
-  written specifically for sm_120). Either is substantial kernel work.
-  The scaffolding is reusable when that work happens.
+  `VIB3_CUTLASS_MLA=1` gate with a sticky runtime fallback.
+  
+  Smem wall investigation results:
+    upstream (StagesQK=12): 212 KB  ✗  (> 99 KB device opt-in)
+    patched  (StagesQK=2):  129 KB  ✗  (still > 99 KB by 30 KB)
+    StagesQK=1:             doesn't compile — StagesPV = StagesQK and
+                            the CollectiveMma template asserts >= 2.
+    IsPersistent=false:     same 129 KB — scheduler state isn't the driver.
+    cp.async vs TMA:        same 129 KB — load path doesn't change tile.
+  
+  The 129 KB floor is dominated by the tile shape
+  `<TileShapeH=128, TileShapeS=128, <TileShapeL=512, TileShapeR=64>>`
+  which `static_asserts TileShapeH == 128`. Cutting H to 64 (what K2.6
+  actually needs) would roughly halve smem but requires rewriting the
+  kernel around a different MMA tile shape. That's kernel-author-scope
+  work, not knob-tweaking.
+  
+  Two concrete unblock paths:
+    1. Fork kernel/sm100_fmha_mla_tma_warpspecialized.hpp, drop the
+       TileShapeH=128 assert, and re-thread 64-head MMA tiles through
+       the collective. Est. 1-3 days + correctness debugging.
+    2. Port xqa/mla_sm120.cu from flashinfer's archive
+       (/code/.homecache/.../flashinfer/data/csrc/xqa/mla_sm120.cu) —
+       NVIDIA-written specifically for sm_120, so smem already fits.
+       4200 LOC across 8-10 files with coupling to an internal KV cache
+       abstraction. Est. 2-4 days.
+  
+  Either way, the CUTLASS scaffolding (build infra, wrapper, FFI,
+  runtime integration, fallback) stays as-is — drop the new kernel in,
+  flip `VIB3_CUTLASS_MLA=1`, done.
 
 - **#32  CUDA graph replay with dynamic MoE dispatch.**
   The `VIB3_CUDA_GRAPH=1` fast path exists but NaNs on K2.6 because
