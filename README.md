@@ -31,8 +31,9 @@ vib3 builds **indexes over the weight matrices** and manages them as a three-tie
 
 ## Target
 
-- **Model**: Kimi K2.5 (1T MoE, 384 experts, INT4 = 630 GB)
-- **Hardware**: 1× 96 GB Blackwell + 256 GB RAM + Gen5 NVMe array
+- **Model**: Kimi K2.6 (1T MoE, 61 layers, 384 routed + 1 shared expert, top-8, MLA attention)
+- **Reference hardware**: 1× **NVIDIA RTX PRO 6000 Blackwell Workstation** (96 GB GDDR7, compute capability **12.0 / SM120a**) + 256 GB RAM + Gen5 NVMe array on /data
+- **Toolchain minimum**: CUDA 12.8+ (required for `sm_120a` block-scaled MMA used by the native NVFP4 path)
 - **Target**: 50+ tokens/sec single-user decode
 
 ## Building
@@ -55,18 +56,50 @@ cargo bench
 
 ```bash
 # Convert model to .vib3 format
-cargo run --release --bin vib3-convert -- \
+cargo run --release --bin vic-convert -- \
   --model ./Kimi-K2.5-INT4/ --output kimi-k2.5.vib3 --build-indexes
 
 # Run inference server
-cargo run --release --bin vib3-serve -- --model kimi-k2.5.vib3 --port 8080
+cargo run --release --bin vic-serve -- --model kimi-k2.5.vib3 --port 8080
 
 # Benchmark
-cargo run --release --bin vib3-bench -- --model kimi-k2.5.vib3 --runs 5
+cargo run --release --bin vic-bench -- --model kimi-k2.5.vib3 --runs 5
 
 # Inspect model file
-cargo run --release --bin vib3-inspect -- --model kimi-k2.5.vib3 --all
+cargo run --release --bin vic-inspect -- --model kimi-k2.5.vib3 --all
 ```
+
+## MLA Attention Backends
+
+K2.6 uses DeepSeek-style Multi-head Latent Attention (MLA). vib3 has three
+decode backends available, selected via env vars:
+
+| backend | selector | status on sm_120a |
+|---|---|---|
+| **built-in** (9-kernel pipeline in `kernels.cu`) | (default, no flag) | works |
+| **CUTLASS** (CUTLASS 4.2 `Sm100FmhaMlaKernelTmaWarpspecialized`) | `VIB3_CUTLASS_MLA=1` | can't fit smem on sm_120a; runtime falls back to built-in |
+| **xqa K26** (forked flashinfer `mla_sm120.cu`, `third_party/xqa/`) | `VIB3_CUTLASS_MLA=1 VIB3_MLA_BACKEND=xqa` | works, numerics match built-in at first-token decode (bit-exact L2/max_abs across layers 0–60) |
+
+The xqa K26 port lives in `third_party/xqa/mla_sm120_k26.cu` — a 64-head
+FP16 derivation of flashinfer's xqa `mla_sm120.cu` whose upstream is hard-gated
+to 128 heads × FP8 e4m3. The NOTICE, the delta vs upstream, and the debug
+history are in `third_party/xqa/PORT_STATUS.md`.
+
+### Decode attention wall time (K2.6 on RTX PRO 6000 Blackwell)
+
+Per-step attention across 61 MLA layers, 30-token warm prompt, greedy decode,
+steady-state step (post-paging-warmup):
+
+| backend | attn/step (ms) | first-token numerics |
+|---|---|---|
+| built-in | 74.2 | reference |
+| xqa K26 | 72.1 | matches reference to FP16 noise |
+
+Attention is ~1% of K2.6 decode latency (MoE dominates at ~5–7s/step), so
+the port is primarily a correctness landing that unblocks the `--chat` path
+(previously hit a NaN mid-MLA on certain token sequences). Further attention
+perf work is bounded by this ceiling — attention kernel speed does not
+move end-to-end tok/s meaningfully on K2.6.
 
 ## Runtime Env Vars (Debug/Guardrails)
 
@@ -76,9 +109,12 @@ cargo run --release --bin vib3-inspect -- --model kimi-k2.5.vib3 --all
 - `VIB3_ALLOW_UNSAFE_DELTANET_NVFP4=1` — explicit override for Qwen3.5 models; without this, DeltaNet NVFP4 is ignored due known severe quality regression.
 - `VIB3_NVFP4_DELTANET_QKV=0|1`, `VIB3_NVFP4_DELTANET_Z=0|1`, `VIB3_NVFP4_DELTANET_OUT=0|1` — per-projection DeltaNet NVFP4 toggles (when enabled).
 - `VIB3_NVFP4_DELTANET_SCALAR=1` — force scalar NVFP4 GEMV for DeltaNet (kernel-path isolation).
+- `VIB3_ALLOW_UNSAFE_NVFP4_EXPERTS=1` — opt into NVFP4 expert fast path on Qwen3.5; default is safer FP16 expert path for serving quality.
 - `VIB3_DIAG=1` — enable runtime diagnostics.
 - `VIB3_DIAG_NVFP4_COMPARE=1` — log runtime FP16-vs-NVFP4 projection deltas (`NVFP4_COMPARE`).
 - `VIB3_DIAG_NVFP4_WEIGHT_AUDIT=1` — log load-time FP16-vs-dequantized-NVFP4 weight deltas (`NVFP4_WEIGHT_AUDIT`).
+- `VIB3_CUTLASS_MLA=1` — route MLA decode through `mla_cutlass_decode` instead of the built-in pipeline.
+- `VIB3_MLA_BACKEND=xqa` — when `VIB3_CUTLASS_MLA=1` is also set, dispatch to the xqa K26 kernel (`third_party/xqa/mla_sm120_k26.cu`) instead of CUTLASS.
 
 ## Project Structure
 

@@ -922,6 +922,30 @@ extern "C" {
         num_kv_splits: i32,
     ) -> usize;
 
+    /// xqa MLA K26 variant (sm_120a). 64-head FP16 port of flashinfer's
+    /// mla_sm120.cu — see third_party/xqa/mla_sm120_k26.cu. Consumes the
+    /// same separate q_nope/q_pe/kv_c/k_pe buffers as cutlass_mla and writes
+    /// FP16 output in latent space. Workspace layout is internal; size is
+    /// queried via vib3_xqa_mla_workspace_size_k26.
+    /// Returns 0 on success, negative on error.
+    pub fn vib3_launch_xqa_mla_decode_k26(
+        q_nope: *const u8,
+        q_pe: *const u8,
+        kv_c: *const u8,
+        k_pe: *const u8,
+        seq_lens_device: *const i32,
+        out: *mut u8,
+        workspace: *mut u8,
+        num_heads: i32,
+        seq_len: i32,
+        sm_scale: f32,
+        sm_count: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Workspace bytes required by the xqa MLA K26 decode kernel.
+    pub fn vib3_xqa_mla_workspace_size_k26(num_heads: i32, seq_len: i32) -> usize;
+
     /// Simple element-wise FP32 → FP16 conversion (used to stage Q/KV for
     /// the CUTLASS MLA kernel from vib3's FP32 buffers).
     pub fn vib3_mla_f32_to_f16(

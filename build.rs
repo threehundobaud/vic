@@ -6,6 +6,9 @@
 fn main() {
     println!("cargo:rerun-if-changed=cuda/src/kernels.cu");
     println!("cargo:rerun-if-changed=cuda/src/cutlass_mla.cu");
+    println!("cargo:rerun-if-changed=third_party/xqa/mla_sm120_k26.cu");
+    println!("cargo:rerun-if-changed=third_party/xqa/xqa_wrapper_k26.cu");
+    println!("cargo:rerun-if-changed=third_party/xqa/tensorMap.cpp");
     println!("cargo:rerun-if-changed=build.rs");
     // Re-run if the CUDA toolkit or its discovery inputs change so a later
     // `apt install cuda-toolkit-*` takes effect without requiring `cargo clean`.
@@ -116,6 +119,70 @@ fn compile_cuda() {
             panic!("nvcc compilation failed for {}", cuda_file);
         }
         obj_paths.push(obj_path);
+    }
+
+    // xqa MLA (K26 variant) — forked from flashinfer's xqa/mla_sm120.cu.
+    // Only targets sm_120a (smem-constrained) for now.
+    let xqa_dir = std::path::Path::new("third_party/xqa");
+    let xqa_mla_k26_src = xqa_dir.join("mla_sm120_k26.cu");
+    let xqa_wrapper_k26_src = xqa_dir.join("xqa_wrapper_k26.cu");
+    let xqa_tensor_map_src = xqa_dir.join("tensorMap.cpp");
+    let build_xqa_k26 = xqa_mla_k26_src.exists()
+        && xqa_wrapper_k26_src.exists()
+        && xqa_tensor_map_src.exists();
+
+    if build_xqa_k26 {
+        println!("cargo:warning=Building xqa MLA K26 kernel from {}", xqa_dir.display());
+        let xqa_arch_flags = [
+            "-gencode=arch=compute_120a,code=[sm_120a,compute_120a]",
+        ];
+        for (src, stem) in [
+            (xqa_mla_k26_src.as_path(), "xqa_mla_sm120_k26"),
+            (xqa_wrapper_k26_src.as_path(), "xqa_wrapper_k26"),
+        ] {
+            let obj_path = format!("{}/{}.o", out_dir, stem);
+            let mut cmd = std::process::Command::new("nvcc");
+            cmd.arg("-c")
+                .arg("-O3")
+                .arg("--use_fast_math")
+                .arg("-std=c++17")
+                .arg("-Xcompiler=-fPIC")
+                .arg("-Xcompiler=-Wno-deprecated-declarations")
+                .arg("-Xcudafe=--diag_suppress=177")
+                .arg("-Xcudafe=--diag_suppress=174")
+                .arg("--expt-relaxed-constexpr")
+                .arg("--expt-extended-lambda")
+                .arg("-DNDEBUG")
+                .arg("-DVIB3_MLA_K26=1")
+                .arg(format!("-I{}", xqa_dir.display()));
+            for flag in &xqa_arch_flags {
+                cmd.arg(flag);
+            }
+            cmd.arg("-o").arg(&obj_path).arg(src);
+            let status = cmd.status().expect("Failed to run nvcc for xqa K26");
+            if !status.success() {
+                panic!("nvcc compilation failed for {}", src.display());
+            }
+            obj_paths.push(obj_path);
+        }
+        // tensorMap.cpp — host-only CUDA driver-API helper used by launchMLA.
+        let tm_obj = format!("{}/xqa_tensor_map.o", out_dir);
+        let mut cmd = std::process::Command::new("nvcc");
+        cmd.arg("-c")
+            .arg("-O3")
+            .arg("-std=c++17")
+            .arg("-x").arg("c++")
+            .arg("-Xcompiler=-fPIC")
+            .arg(format!("-I{}", xqa_dir.display()))
+            .arg("-o").arg(&tm_obj).arg(&xqa_tensor_map_src);
+        let status = cmd.status().expect("Failed to run nvcc for xqa tensorMap.cpp");
+        if !status.success() {
+            panic!("nvcc compilation failed for {}", xqa_tensor_map_src.display());
+        }
+        obj_paths.push(tm_obj);
+        println!("cargo:rustc-cfg=has_xqa_mla_k26");
+        // launchMLA uses the cuda driver API for tensor-map encoding.
+        println!("cargo:rustc-link-lib=cuda");
     }
 
     if build_cutlass_mla {
