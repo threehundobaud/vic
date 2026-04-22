@@ -1,5 +1,84 @@
 # Qwen3.6-27B port — status & remaining work
 
+## Bisection against HF reference (2026-04-22)
+
+**HF reference top-1 on "The capital of France is":** token 11751 = `" Paris"` with logit 15.625.
+**vib3 top-1:** token 180887 = `"asilan"` with logit 4.5.
+
+**Layer-by-layer cosine vs HF reference** (tools/qwen36_hf_reference.py + qwen36_diff_layers.py):
+
+| Layer | type | vib3 L2 | HF L2 | cos |
+|---|---|---|---|---|
+| L0 output | DeltaNet+FFN | 12.04 | 17.96 | **0.8422** |
+| L1 output | DeltaNet+FFN | 13.41 | 28.16 | **0.7725** |
+| L2 output | DeltaNet+FFN | 12.19 | 39.96 | **0.5840** |
+| L3 output | GatedAttn+FFN | 37.95 | 46.46 | 0.9075 |
+| L4 output | DeltaNet+FFN | 37.00 | 49.54 | 0.8679 |
+| L5 output | DeltaNet+FFN | 39.02 | 53.51 | 0.8522 |
+| ... (stays ~0.8 through L9) | | | | |
+
+**Root cause: DeltaNet layers silently produce wrong output.** Evidence:
+- Full-attention layer L3 sharply recovers cosine (0.58 → 0.91).
+- Magnitude shrinkage is cumulative through L0→L2.
+- `DELTANET_DIAG L1 pos=0`: `q_head_L2 first4=[0.0884, 0.0884, 0.0884, 0.0884]` — identical across heads (suspicious, should differ per head).
+- `DELTANET_STEP L1 pos=0: step_out L2=0.0036` — tiny, suggests state-read-before-update at pos 0 returning near-zero state contribution.
+
+**Top suspects** (ranked by likelihood, for next session):
+1. **DeltaNet state update order** — classic bug: reading state before writing it on the first position gives ~0 output (since initial state is 0). HF does update-then-read.
+2. **Per-head Q reshape** — `q_head_L2` being identical across 4 probed heads suggests Q is not being split per head correctly.
+3. **`in_proj_a` / `in_proj_b` semantics** — Qwen3.6 has these split, shapes `[48, 5120]` each (projecting to per-head alpha/beta scalars). vib3's Qwen3.5 path may combine them differently.
+4. **Per-head RMSNorm on DeltaNet intermediate** — norm weight shape `[128]` matches head_dim; the kernel stride for per-head norm needs verification.
+
+**Tooling committed:**
+- `tools/qwen36_hf_reference.py` — runs Qwen3.6-27B through HF transformers and dumps per-layer hidden states for tok0 and tok1 into `/tmp/hfref/`.
+- `tools/qwen36_diff_layers.py` — compares vib3's `dump/vib3_postlayer_f32_L*_tok*.bin` against HF dumps, prints cos/L2/diff per layer.
+- `VIB3_DIAG_ALL_LAYERS=1` env var forces vib3 to dump hidden state at every (layer, token) pair (default is sparse).
+
+To reproduce the bisection from a fresh checkout:
+```bash
+# 1. vib3 dumps (all layers, tok 0..4)
+rm -f dump/vib3_postlayer_*
+VIB3_DIAG=1 VIB3_DIAG_ALL_LAYERS=1 VIB3_LOG=vib3=warn \
+  ./target/release/vic run /data/huggingface/vib3-models/qwen3.6-27b.vib3 \
+    --tokenizer /data/huggingface/vib3-models/qwen3.6-27b-hf/tokenizer.json \
+    --max-tokens 1 --temperature 0.0 --no-check < <(echo "The capital of France is")
+
+# 2. HF reference dumps (requires PyTorch + transformers in env)
+uvx --with torch --with transformers --with accelerate --with safetensors --with numpy \
+  python tools/qwen36_hf_reference.py
+
+# 3. Diff
+uvx --with numpy python tools/qwen36_diff_layers.py
+```
+
+## Unsloth Qwen3.6 comparison (2026-04-22)
+
+From https://unsloth.ai/docs/models/qwen3.6:
+
+| dimension | Unsloth | vib3 (Qwen3.6-27B today) |
+|---|---|---|
+| Backend | llama.cpp + Unsloth Studio | custom Rust + CUDA, sm_120a block-scaled MMA |
+| Quants shipped | UD-Q2_K_XL, UD-Q4_K_XL (Dynamic 4-bit), Q4_K_M, Q6_K, BF16 | BF16 native converter, runtime NVFP4 FFN (drafted) |
+| 27B footprint | 15 GB (3-bit) → 18 GB (4-bit) → 30 GB (8-bit) → 55 GB (BF16) | 39 GB (zstd-compressed BF16 .vib3), 52 GB raw BF16 |
+| Perf claims | none published for 27B on Blackwell | n/a until correctness lands |
+| Quality (KLD vs BF16) | "Pareto frontier, top-perf in 21/22 sizes" (35B-A3B chart) | not yet measurable |
+| DeltaNet handling | "important layers upcasted" under Dynamic 2.0 | same shape support; correctness bug currently |
+| Vision | skipped by default (separate mmproj) | skipped by design, text-only |
+| Ollama compatible | no (mmproj split) | — |
+
+**Unsloth's advantage right now** is breadth of quants (down to 3-bit) + mature llama.cpp tooling. They don't publish raw throughput numbers so no direct perf comparison possible.
+
+**vib3's structural bet** is sm_120a block-scaled NVFP4 MMA that llama.cpp doesn't use + the page-indexed weight system for oversized models (K2.6-style). For Qwen3.6-27B dense (fits 96 GB BF16) that bet isn't tested yet — Unsloth's Q4_K_XL at 18 GB will be faster on smaller cards. vib3's lever is on >96 GB models (K2.6-style) and on Blackwell-specific MMA that llama.cpp kernels don't hit.
+
+To move past "plumbing works" into "beats Unsloth on a meaningful axis":
+1. Fix the DeltaNet correctness bug (above) to produce coherent output.
+2. Wire the NVFP4 FFN conversion (drafted in PORT_QWEN3_6_27B §NVFP4 lever).
+3. Bench both side-by-side on a long-context prompt where the sm_120a MMA beats llama.cpp's GPU kernels.
+
+---
+
+
+
 ## What's landed
 
 | Layer | State | Commit |

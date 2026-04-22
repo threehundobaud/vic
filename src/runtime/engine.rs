@@ -2218,8 +2218,16 @@ impl Engine {
 
                 // Diagnostic: log hidden state stats after each layer
                 // Dump for ALL tokens at layer 0, and for last token at other layers
+                // VIB3_DIAG_ALL_LAYERS=1 forces a dump at EVERY (tok, layer) for
+                // full bisection against a reference; otherwise fall back to the
+                // sparser default so normal runs don't hammer the disk.
+                let dump_all = std::env::var("VIB3_DIAG_ALL_LAYERS")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
                 let should_dump_layer = self.diag_enabled && (
-                    layer_idx == 0  // always dump layer 0 for all tokens
+                    dump_all
+                    || layer_idx == 0  // always dump layer 0 for all tokens
                     || (is_last_token && (layer_idx <= 15 || layer_idx % 5 == 0 || layer_idx >= num_layers as u16 - 2))
                 );
                 if should_dump_layer {
