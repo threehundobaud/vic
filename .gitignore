@@ -20,3 +20,10 @@ Thumbs.db
 
 # Env
 .env
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Vendored third-party sources — fetched via scripts/fetch_cutlass.sh
+third_party/cutlass/

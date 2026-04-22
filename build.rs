@@ -5,6 +5,11 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=cuda/src/kernels.cu");
+    println!("cargo:rerun-if-changed=build.rs");
+    // Re-run if the CUDA toolkit or its discovery inputs change so a later
+    // `apt install cuda-toolkit-*` takes effect without requiring `cargo clean`.
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=PATH");
 
     // Only compile CUDA if the feature is enabled and nvcc is available
     if std::env::var("CARGO_FEATURE_CUDA").is_ok() {
@@ -47,14 +52,27 @@ fn find_nvcc() -> Option<std::path::PathBuf> {
 }
 
 fn compile_cuda() {
+    // Regular kernels (compiled once with standard flags).
     let cuda_files = ["cuda/src/kernels.cu"];
+    // CUTLASS MLA wrapper — needs CUTLASS include paths and C++17.
+    // Only builds if the full CUTLASS tree is present (see third_party/cutlass).
+    let cutlass_dir = std::path::Path::new("third_party/cutlass");
+    let cutlass_mla_src = std::path::Path::new("cuda/src/cutlass_mla.cu");
+    let build_cutlass_mla = cutlass_dir.exists()
+        && cutlass_dir.join("include/cutlass/cutlass.h").exists()
+        && cutlass_dir
+            .join("examples/77_blackwell_fmha/device/sm100_mla.hpp")
+            .exists()
+        && cutlass_mla_src.exists();
 
     // Target architectures:
     //   sm_89  = Ada Lovelace (RTX 4090)
     //   sm_90  = Hopper (H100/H200)
-    //   sm_100 = Blackwell (RTX 5090, B200)
-    //   sm_120  = Blackwell (RTX PRO 6000 base)
-    //   sm_120a = Blackwell with block-scaled MMA (required for NVFP4 Tensor Core MMA)
+    //   sm_100  = Blackwell DC      (B200, GB200)
+    //   sm_120  = Blackwell client  (RTX 5090)
+    //   sm_120a = Blackwell Workstation (RTX PRO 6000) with block-scaled MMA
+    //             — REFERENCE ARCH for vib3. Required for native NVFP4 Tensor
+    //             Core MMA via mma.sync.aligned.kind::mxf4. Needs CUDA 12.8+.
     // The last entry also embeds PTX (compute_120a) for forward compatibility
     // with future architectures that can JIT-compile from PTX.
     let arch_flags = [
@@ -63,8 +81,14 @@ fn compile_cuda() {
         "-gencode=arch=compute_100,code=sm_100",
         "-gencode=arch=compute_120a,code=[sm_120a,compute_120a]",
     ];
+    // CUTLASS MLA kernel only targets Blackwell (TMA+WGMMA specialized).
+    let cutlass_arch_flags = [
+        "-gencode=arch=compute_100,code=sm_100",
+        "-gencode=arch=compute_120a,code=[sm_120a,compute_120a]",
+    ];
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
+    let mut obj_paths: Vec<String> = Vec::new();
 
     for cuda_file in &cuda_files {
         let stem = std::path::Path::new(cuda_file)
@@ -90,16 +114,65 @@ fn compile_cuda() {
         if !status.success() {
             panic!("nvcc compilation failed for {}", cuda_file);
         }
+        obj_paths.push(obj_path);
+    }
 
-        // Create static library
-        let lib_path = format!("{}/libvib3_cuda.a", out_dir);
-        let ar_status = std::process::Command::new("ar")
-            .args(["rcs", &lib_path, &obj_path])
-            .status()
-            .expect("Failed to run ar");
-        if !ar_status.success() {
-            panic!("ar failed");
+    if build_cutlass_mla {
+        println!(
+            "cargo:warning=Building CUTLASS MLA kernel from {}",
+            cutlass_dir.display()
+        );
+        let cutlass_include = cutlass_dir.join("include");
+        let cutlass_tools_util = cutlass_dir.join("tools/util/include");
+        let cutlass_fmha_dir = cutlass_dir.join("examples/77_blackwell_fmha");
+        let cutlass_fmha_common = cutlass_dir.join("examples/77_blackwell_fmha/common");
+        let cutlass_fmha_collective = cutlass_dir.join("examples/77_blackwell_fmha/collective");
+
+        let obj_path = format!("{}/cutlass_mla.o", out_dir);
+        let mut cmd = std::process::Command::new("nvcc");
+        cmd.arg("-c")
+            .arg("-O3")
+            .arg("--use_fast_math")
+            .arg("-std=c++17")
+            .arg("-Xcompiler=-fPIC")
+            .arg("-Xcompiler=-Wno-deprecated-declarations")
+            // CUTLASS template machinery generates enormous error messages;
+            // silence the most noisy warnings so we can see the real ones.
+            .arg("-Xcudafe=--diag_suppress=177") // set-but-not-used
+            .arg("-Xcudafe=--diag_suppress=550")
+            .arg("-Xcudafe=--diag_suppress=174") // expression has no effect
+            .arg("--expt-relaxed-constexpr")
+            .arg("--expt-extended-lambda")
+            .arg(format!("-I{}", cutlass_include.display()))
+            .arg(format!("-I{}", cutlass_tools_util.display()))
+            .arg(format!("-I{}", cutlass_fmha_dir.display()))
+            .arg(format!("-I{}", cutlass_fmha_common.display()))
+            .arg(format!("-I{}", cutlass_fmha_collective.display()));
+
+        for flag in &cutlass_arch_flags {
+            cmd.arg(flag);
         }
+
+        cmd.arg("-o").arg(&obj_path).arg(cutlass_mla_src);
+
+        let status = cmd.status().expect("Failed to run nvcc for CUTLASS MLA");
+        if !status.success() {
+            panic!("nvcc compilation failed for cuda/src/cutlass_mla.cu");
+        }
+        obj_paths.push(obj_path);
+        println!("cargo:rustc-cfg=has_cutlass_mla");
+    }
+
+    // Create combined static library from all object files.
+    let lib_path = format!("{}/libvib3_cuda.a", out_dir);
+    let mut ar_cmd = std::process::Command::new("ar");
+    ar_cmd.args(["rcs", &lib_path]);
+    for o in &obj_paths {
+        ar_cmd.arg(o);
+    }
+    let ar_status = ar_cmd.status().expect("Failed to run ar");
+    if !ar_status.success() {
+        panic!("ar failed");
     }
 
     // Link
