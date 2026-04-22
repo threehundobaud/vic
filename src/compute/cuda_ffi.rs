@@ -375,12 +375,15 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
-    // Fused router GEMV + GPU top-k (eliminates stream.synchronize())
+    // Fused router GEMV + GPU top-k (eliminates stream.synchronize()).
+    // `bias` is the aux-loss-free expert selection bias (DeepSeek-V3 /
+    // Kimi K2.6 exp_probs_b.bias), stored as FP16 in the .vib3 sidecar;
+    // NULL for models without aux-free balancing.
     pub fn vib3_launch_router_topk(
         hidden_state: *const u8,
         router_weights: *const u8,
         scores_buf: *mut f32,
-        bias: *const f32,      // NULL if no bias
+        bias: *const u8,       // FP16 [num_experts], or NULL
         out_ids: *mut u16,     // [top_k] device output
         out_weights: *mut f32, // [top_k] device output
         hidden_dim: i32,
@@ -841,6 +844,40 @@ extern "C" {
         m_mid: i32,
         k_mid: i32,
         m_out: i32,
+        layer_output: *mut f32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Batched INT4 MoE layer (multi-page). Collapses per-expert+per-page
+    /// launches (8 experts × N pages × 3 stages) into exactly 2 kernel launches:
+    /// one batched SwiGLU and one batched down·weighted_atomic_accumulate.
+    /// `layer_output` must be pre-zeroed FP32.
+    pub fn vib3_launch_moe_int4_experts_fused(
+        input_f32: *const u8,
+        // SwiGLU tasks (each = one up/gate page pair)
+        sw_up_w: *const *const u8,
+        sw_up_s: *const *const u8,
+        sw_gate_w: *const *const u8,
+        sw_gate_s: *const *const u8,
+        sw_expert_slots: *const i32,
+        sw_row_starts: *const i32,
+        sw_m_slices: *const i32,
+        num_sw_tasks: i32,
+        max_sw_m_slice: i32,
+        // Down tasks (each = one down page)
+        dn_w: *const *const u8,
+        dn_s: *const *const u8,
+        dn_expert_slots: *const i32,
+        dn_row_starts: *const i32,
+        dn_m_slices: *const i32,
+        dn_expert_weights_host: *const f32,
+        num_dn_tasks: i32,
+        max_dn_m_slice: i32,
+        // Dims
+        k_in: i32,
+        m_mid: i32,
+        k_mid: i32,
+        group_size: i32,
         layer_output: *mut f32,
         stream: *mut std::ffi::c_void,
     ) -> i32;

@@ -6249,10 +6249,10 @@ impl Engine {
                         }
 
                         let te = Instant::now();
-                        let used_fused = if self.model_config.expert_dtype == DType::NVFP4
-                            && self.stream.is_real()
+                        let expert_hidden_dim = self.model_config.expert_hidden_dim as usize;
+                        let used_fused = if self.stream.is_real()
+                            && self.model_config.expert_dtype == DType::NVFP4
                         {
-                            let expert_hidden_dim = self.model_config.expert_hidden_dim as usize;
                             let mut fused_experts: Vec<(*const u8, *const u8, *const u8, f32)> = Vec::new();
                             let mut all_single_page = true;
                             for ep in &plan.experts {
@@ -6286,6 +6286,92 @@ impl Engine {
                                     hidden_dim,
                                     expert_hidden_dim,
                                     hidden_dim,
+                                    self.layer_output_buf.as_mut_ptr() as *mut f32,
+                                    &self.stream,
+                                )?;
+                                true
+                            } else {
+                                false
+                            }
+                        } else if self.stream.is_real()
+                            && matches!(self.model_config.expert_dtype, DType::INT4 | DType::NF4)
+                        {
+                            // Flatten (expert, page) into SwiGLU and down task lists.
+                            // All pages must be on device, and up_pages/gate_pages
+                            // must align 1:1 on (row_start, m_slice) per expert.
+                            let mut sw_up: Vec<kernels::MoeInt4Page> = Vec::new();
+                            let mut sw_gate: Vec<kernels::MoeInt4Page> = Vec::new();
+                            let mut dn: Vec<kernels::MoeInt4Page> = Vec::new();
+                            let mut dn_weights: Vec<f32> = Vec::new();
+                            let mut all_resident = true;
+                            let num_slots = plan.experts.len().min(8);
+                            'outer: for (slot, ep) in plan.experts.iter().take(num_slots).enumerate() {
+                                // Bucket pages by segment for pairing.
+                                let mut up_pages: Vec<&crate::runtime::query_planner::ResolvedPage> = Vec::new();
+                                let mut gate_pages: Vec<&crate::runtime::query_planner::ResolvedPage> = Vec::new();
+                                let mut down_pages: Vec<&crate::runtime::query_planner::ResolvedPage> = Vec::new();
+                                for rp in &ep.pages {
+                                    if rp.device_ptr.is_null() {
+                                        all_resident = false;
+                                        break 'outer;
+                                    }
+                                    match rp.id.segment {
+                                        0 => up_pages.push(rp),
+                                        1 => gate_pages.push(rp),
+                                        2 => down_pages.push(rp),
+                                        _ => {}
+                                    }
+                                }
+                                if up_pages.is_empty() || gate_pages.is_empty() || down_pages.is_empty() {
+                                    all_resident = false;
+                                    break 'outer;
+                                }
+                                // Sort by row_start so pairing works.
+                                up_pages.sort_by_key(|p| p.row_start);
+                                gate_pages.sort_by_key(|p| p.row_start);
+                                down_pages.sort_by_key(|p| p.row_start);
+                                if up_pages.len() != gate_pages.len() {
+                                    all_resident = false;
+                                    break 'outer;
+                                }
+                                for (u, g) in up_pages.iter().zip(gate_pages.iter()) {
+                                    if u.row_start != g.row_start || u.row_count != g.row_count {
+                                        all_resident = false;
+                                        break 'outer;
+                                    }
+                                    sw_up.push(kernels::MoeInt4Page {
+                                        weight: u.device_ptr as *const u8,
+                                        expert_slot: slot as i32,
+                                        row_start: u.row_start as i32,
+                                        m_slice: u.row_count as i32,
+                                    });
+                                    sw_gate.push(kernels::MoeInt4Page {
+                                        weight: g.device_ptr as *const u8,
+                                        expert_slot: slot as i32,
+                                        row_start: g.row_start as i32,
+                                        m_slice: g.row_count as i32,
+                                    });
+                                }
+                                for d in down_pages.iter() {
+                                    dn.push(kernels::MoeInt4Page {
+                                        weight: d.device_ptr as *const u8,
+                                        expert_slot: slot as i32,
+                                        row_start: d.row_start as i32,
+                                        m_slice: d.row_count as i32,
+                                    });
+                                    dn_weights.push(ep.weight);
+                                }
+                            }
+                            if all_resident && !sw_up.is_empty() && !dn.is_empty() {
+                                kernels::moe_int4_experts_fused(
+                                    self.moe_normed_f32.as_ptr(),
+                                    &sw_up,
+                                    &sw_gate,
+                                    &dn,
+                                    &dn_weights,
+                                    hidden_dim,
+                                    expert_hidden_dim,
+                                    expert_hidden_dim,
                                     self.layer_output_buf.as_mut_ptr() as *mut f32,
                                     &self.stream,
                                 )?;

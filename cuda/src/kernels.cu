@@ -5864,6 +5864,353 @@ int vib3_launch_moe_experts_fused(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Batched INT4 MoE (analogue of NVFP4 moe_experts_fused for Q4_0 / INT4 weights)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Two kernel launches per MoE layer instead of 3 × num_active:
+//   1. vib3_moe_multi_int4_swiglu — batched up·gate·silu_mul across all experts,
+//      writes per-expert FP16 intermediate buffers.
+//   2. vib3_moe_multi_int4_down_accum — batched down GEMV + weighted atomicAdd
+//      into the shared FP32 layer_output buffer.
+//
+// Reduction for K2.6 (num_active=8, 60 MoE layers):
+//   Before: 8 × 3 launches × 60 layers = 1440 launches/token
+//   After:  2 launches × 60 layers = 120 launches/token
+//
+// Saves ~1320 launches × ~5 µs = ~6 ms/token of launch overhead.
+
+// Per-expert FP16 intermediate buffers for batched INT4 SwiGLU → down_proj handoff.
+static half* g_moe_int4_mid_fp16[MOE_MAX_EXPERTS] = {};
+static int g_moe_int4_buf_M_mid = 0;
+
+static void ensure_moe_int4_bufs(int M_mid) {
+    if (M_mid <= g_moe_int4_buf_M_mid) return;
+    for (int i = 0; i < MOE_MAX_EXPERTS; i++) {
+        if (g_moe_int4_mid_fp16[i]) cudaFree(g_moe_int4_mid_fp16[i]);
+        cudaMalloc(&g_moe_int4_mid_fp16[i], M_mid * sizeof(half));
+    }
+    g_moe_int4_buf_M_mid = M_mid;
+}
+
+// Per-task pointer arrays for INT4 MoE (each expert may be split across
+// multiple weight pages → up to MOE_MAX_EXPERTS × MOE_MAX_PAGES tasks).
+#define MOE_INT4_MAX_TASKS 128
+static const uint8_t**        d_moe_int4_up_w = nullptr;
+static const unsigned short** d_moe_int4_up_s = nullptr;
+static const uint8_t**        d_moe_int4_gate_w = nullptr;
+static const unsigned short** d_moe_int4_gate_s = nullptr;
+static const uint8_t**        d_moe_int4_down_w = nullptr;
+static const unsigned short** d_moe_int4_down_s = nullptr;
+static half**                 d_moe_int4_mid_out_ptrs = nullptr; // per-swiglu-task (offset to row_start)
+static const half**           d_moe_int4_mid_in_ptrs = nullptr;  // per-down-task (full expert buffer)
+static float*                 d_moe_int4_task_expert_wts = nullptr;
+static int*                   d_moe_int4_sw_m_slices = nullptr;
+static int*                   d_moe_int4_dn_m_slices = nullptr;
+static int*                   d_moe_int4_dn_row_starts = nullptr;
+static bool                   d_moe_int4_ptrs_allocated = false;
+
+static void ensure_moe_int4_device_ptrs() {
+    if (d_moe_int4_ptrs_allocated) return;
+    cudaMalloc(&d_moe_int4_up_w,   MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_up_s,   MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_gate_w, MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_gate_s, MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_down_w, MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_down_s, MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_mid_out_ptrs, MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_mid_in_ptrs,  MOE_INT4_MAX_TASKS * sizeof(void*));
+    cudaMalloc(&d_moe_int4_task_expert_wts, MOE_INT4_MAX_TASKS * sizeof(float));
+    cudaMalloc(&d_moe_int4_sw_m_slices, MOE_INT4_MAX_TASKS * sizeof(int));
+    cudaMalloc(&d_moe_int4_dn_m_slices, MOE_INT4_MAX_TASKS * sizeof(int));
+    cudaMalloc(&d_moe_int4_dn_row_starts, MOE_INT4_MAX_TASKS * sizeof(int));
+    d_moe_int4_ptrs_allocated = true;
+}
+
+// Kernel 1 — batched INT4 fused SwiGLU, multi-page.
+// Each "task" is one (up_page, gate_page) pair (may be a slice of one expert's
+// up/gate matrix). The task owns its own m_slice of the expert's intermediate
+// buffer — row_start is already baked into output_ptrs (caller offsets).
+//
+// Grid: (ceil(max_m_slice/ROWS_PER_BLOCK), num_tasks)
+// Block: THREADS_PER_ROW × ROWS_PER_BLOCK = BLOCK_SIZE threads.
+__global__ void vib3_moe_multi_int4_swiglu_kernel(
+    const float* __restrict__ input,                              // [K] FP32 shared
+    const uint8_t* const* __restrict__ up_weight_ptrs,            // [num_tasks]
+    const unsigned short* const* __restrict__ up_scale_ptrs,
+    const uint8_t* const* __restrict__ gate_weight_ptrs,
+    const unsigned short* const* __restrict__ gate_scale_ptrs,
+    half* const* __restrict__ output_ptrs,                        // [num_tasks] offset to row_start
+    const int* __restrict__ m_slices,                             // [num_tasks]
+    int K,
+    int group_size
+) {
+    const int task_idx = blockIdx.y;
+    const int m_slice_local = m_slices[task_idx];
+    const uint8_t* up_weight = up_weight_ptrs[task_idx];
+    const unsigned short* up_scales = up_scale_ptrs[task_idx];
+    const uint8_t* gate_weight = gate_weight_ptrs[task_idx];
+    const unsigned short* gate_scales = gate_scale_ptrs[task_idx];
+    half* output = output_ptrs[task_idx];
+
+    const int local_row = threadIdx.x / THREADS_PER_ROW;
+    const int lane = threadIdx.x % THREADS_PER_ROW;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + local_row;
+
+    if (row >= m_slice_local) return;
+
+    const int packed_k = (K + 1) / 2;
+    const int num_groups = (K + group_size - 1) / group_size;
+    const uint8_t* up_row = up_weight + (long long)row * packed_k;
+    const unsigned short* up_s = up_scales + (long long)row * num_groups;
+    const uint8_t* gate_row = gate_weight + (long long)row * packed_k;
+    const unsigned short* gate_s = gate_scales + (long long)row * num_groups;
+
+    float up_acc = 0.0f;
+    float gate_acc = 0.0f;
+    for (int k = lane * 2; k < K; k += THREADS_PER_ROW * 2) {
+        int byte_idx = k / 2;
+        int group = k / group_size;
+
+        uint8_t up_packed = up_row[byte_idx];
+        float up_scale = bf16_scale_to_float(up_s[group]);
+        int up_w0 = (int)((up_packed >> 0) & 0xF) - 8;
+        int up_w1 = (int)((up_packed >> 4) & 0xF) - 8;
+
+        uint8_t gate_packed = gate_row[byte_idx];
+        float gate_scale = bf16_scale_to_float(gate_s[group]);
+        int gate_w0 = (int)((gate_packed >> 0) & 0xF) - 8;
+        int gate_w1 = (int)((gate_packed >> 4) & 0xF) - 8;
+
+        float inp0 = input[k];
+        up_acc += inp0 * (float)up_w0 * up_scale;
+        gate_acc += inp0 * (float)gate_w0 * gate_scale;
+
+        if (k + 1 < K) {
+            float inp1 = input[k + 1];
+            up_acc += inp1 * (float)up_w1 * up_scale;
+            gate_acc += inp1 * (float)gate_w1 * gate_scale;
+        }
+    }
+
+    up_acc = warp_reduce_sum(up_acc);
+    gate_acc = warp_reduce_sum(gate_acc);
+
+    __shared__ float smem[ROWS_PER_BLOCK * (THREADS_PER_ROW / WARP_SIZE) * 2];
+    const int warp_id = lane / WARP_SIZE;
+    const int warp_lane = lane % WARP_SIZE;
+    const int n_warps = THREADS_PER_ROW / WARP_SIZE;
+
+    if (warp_lane == 0) {
+        smem[(local_row * n_warps + warp_id) * 2 + 0] = up_acc;
+        smem[(local_row * n_warps + warp_id) * 2 + 1] = gate_acc;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float final_up = (warp_lane < n_warps)
+            ? smem[(local_row * n_warps + warp_lane) * 2 + 0]
+            : 0.0f;
+        float final_gate = (warp_lane < n_warps)
+            ? smem[(local_row * n_warps + warp_lane) * 2 + 1]
+            : 0.0f;
+        final_up = warp_reduce_sum(final_up);
+        final_gate = warp_reduce_sum(final_gate);
+        if (warp_lane == 0) {
+            float silu = final_gate / (1.0f + expf(-final_gate));
+            output[row] = __float2half(silu * final_up);
+        }
+    }
+}
+
+// Kernel 2 — batched INT4 down-proj GEMV + weighted atomicAdd into layer_output.
+// Each "task" is one down_page for one expert. Different experts may have
+// different row_start / m_slice per page; different pages of the same expert
+// cover disjoint rows of layer_output.
+//
+// Grid: (ceil(max_m_slice/ROWS_PER_BLOCK), num_tasks)
+// atomicAdd to layer_output because multiple tasks (different experts) may
+// contribute to the same row.
+__global__ void vib3_moe_multi_int4_down_accum_kernel(
+    const half* const* __restrict__ mid_ptrs,               // [num_tasks] × [K] FP16 (shared across tasks for same expert)
+    const uint8_t* const* __restrict__ down_weight_ptrs,    // [num_tasks]
+    const unsigned short* const* __restrict__ down_scale_ptrs, // [num_tasks]
+    const float* __restrict__ task_expert_weights,          // [num_tasks] — expert routing weight replicated across its pages
+    const int* __restrict__ row_starts,                     // [num_tasks]
+    const int* __restrict__ m_slices,                       // [num_tasks]
+    float* __restrict__ layer_output,                       // [M_out] FP32, pre-zeroed
+    int K,
+    int group_size
+) {
+    const int task_idx = blockIdx.y;
+    const int m_slice_local = m_slices[task_idx];
+    const int row_start = row_starts[task_idx];
+    const half* input = mid_ptrs[task_idx];
+    const uint8_t* weight = down_weight_ptrs[task_idx];
+    const unsigned short* scales = down_scale_ptrs[task_idx];
+    const float expert_w = task_expert_weights[task_idx];
+
+    const int local_row = threadIdx.x / THREADS_PER_ROW;
+    const int lane = threadIdx.x % THREADS_PER_ROW;
+    const int local = blockIdx.x * ROWS_PER_BLOCK + local_row;
+
+    if (local >= m_slice_local) return;
+    const int row = local;               // row within page's weight matrix
+    const int global_row = row_start + local; // absolute row in layer_output
+
+    const int packed_k = (K + 1) / 2;
+    const int num_groups = (K + group_size - 1) / group_size;
+    const uint8_t* row_weight = weight + (long long)row * packed_k;
+    const unsigned short* row_scales = scales + (long long)row * num_groups;
+
+    float acc = 0.0f;
+    for (int k = lane * 2; k < K; k += THREADS_PER_ROW * 2) {
+        int byte_idx = k / 2;
+        uint8_t packed = row_weight[byte_idx];
+        int w0 = (int)((packed >> 0) & 0xF) - 8;
+        int w1 = (int)((packed >> 4) & 0xF) - 8;
+
+        int group = k / group_size;
+        float scale = bf16_scale_to_float(row_scales[group]);
+
+        acc += __half2float(input[k]) * (float)w0 * scale;
+        if (k + 1 < K) {
+            acc += __half2float(input[k + 1]) * (float)w1 * scale;
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+
+    __shared__ float smem[ROWS_PER_BLOCK * (THREADS_PER_ROW / WARP_SIZE)];
+    const int warp_id = lane / WARP_SIZE;
+    const int warp_lane = lane % WARP_SIZE;
+    const int n_warps = THREADS_PER_ROW / WARP_SIZE;
+
+    if (warp_lane == 0) {
+        smem[local_row * n_warps + warp_id] = acc;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float final_acc = (warp_lane < n_warps)
+            ? smem[local_row * n_warps + warp_lane]
+            : 0.0f;
+        final_acc = warp_reduce_sum(final_acc);
+        if (warp_lane == 0) {
+            atomicAdd(&layer_output[global_row], expert_w * final_acc);
+        }
+    }
+}
+
+// Launcher for batched INT4 MoE (multi-page).
+//
+// Inputs are "tasks". For SwiGLU, each task = one (up_page, gate_page) pair of
+// a single expert. For down, each task = one down_page of a single expert.
+// Each task also names an `expert_slot` (0..MOE_MAX_EXPERTS-1) which
+// determines which internal FP16 intermediate buffer the SwiGLU writes into
+// and the down kernel reads from. Different pages of the same expert share
+// the same expert_slot. Per-task `row_start` indexes into that buffer
+// (SwiGLU) or into `layer_output` (down).
+//
+// layer_output must be pre-zeroed (atomicAdd accumulation across tasks).
+// input_f32 is the shared activation (moe_normed_f32, FP32).
+int vib3_launch_moe_int4_experts_fused(
+    const void* input_f32,
+    // SwiGLU tasks (one per up/gate page pair)
+    const void* const* sw_up_w,
+    const void* const* sw_up_s,
+    const void* const* sw_gate_w,
+    const void* const* sw_gate_s,
+    const int* sw_expert_slots,   // [num_sw_tasks] in 0..MOE_MAX_EXPERTS
+    const int* sw_row_starts,     // [num_sw_tasks] — row offset within expert intermediate
+    const int* sw_m_slices,       // [num_sw_tasks]
+    int num_sw_tasks,
+    int max_sw_m_slice,
+    // Down tasks (one per down page)
+    const void* const* dn_w,
+    const void* const* dn_s,
+    const int* dn_expert_slots,
+    const int* dn_row_starts,     // [num_dn_tasks] — row offset within layer_output
+    const int* dn_m_slices,
+    const float* dn_expert_weights_host, // [num_dn_tasks]
+    int num_dn_tasks,
+    int max_dn_m_slice,
+    // Dims
+    int K_in,
+    int M_mid,
+    int K_mid,
+    int group_size,
+    float* layer_output,
+    void* stream
+) {
+    if (num_sw_tasks <= 0 || num_sw_tasks > MOE_INT4_MAX_TASKS) return -2;
+    if (num_dn_tasks <= 0 || num_dn_tasks > MOE_INT4_MAX_TASKS) return -3;
+    cudaStream_t s = (cudaStream_t)stream;
+
+    ensure_moe_int4_bufs(M_mid);
+    ensure_moe_int4_device_ptrs();
+
+    // Build SwiGLU per-task output pointers: g_moe_int4_mid_fp16[slot] + row_start
+    half* h_sw_mid_out[MOE_INT4_MAX_TASKS];
+    for (int i = 0; i < num_sw_tasks; i++) {
+        int slot = sw_expert_slots[i];
+        int row_start = sw_row_starts[i];
+        h_sw_mid_out[i] = g_moe_int4_mid_fp16[slot] + row_start;
+    }
+    // Build down per-task input pointers: g_moe_int4_mid_fp16[slot] (full buffer)
+    const half* h_dn_mid_in[MOE_INT4_MAX_TASKS];
+    for (int i = 0; i < num_dn_tasks; i++) {
+        int slot = dn_expert_slots[i];
+        h_dn_mid_in[i] = g_moe_int4_mid_fp16[slot];
+    }
+
+    // Upload task pointer/int arrays to device. All async on the given stream.
+    cudaMemcpyAsync((void*)d_moe_int4_up_w,   sw_up_w,   num_sw_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_up_s,   sw_up_s,   num_sw_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_gate_w, sw_gate_w, num_sw_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_gate_s, sw_gate_s, num_sw_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_mid_out_ptrs, h_sw_mid_out, num_sw_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_sw_m_slices, sw_m_slices, num_sw_tasks * sizeof(int), cudaMemcpyHostToDevice, s);
+
+    cudaMemcpyAsync((void*)d_moe_int4_down_w, dn_w, num_dn_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_down_s, dn_s, num_dn_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_mid_in_ptrs, h_dn_mid_in, num_dn_tasks * sizeof(void*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_task_expert_wts, dn_expert_weights_host, num_dn_tasks * sizeof(float), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_dn_row_starts, dn_row_starts, num_dn_tasks * sizeof(int), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync((void*)d_moe_int4_dn_m_slices, dn_m_slices, num_dn_tasks * sizeof(int), cudaMemcpyHostToDevice, s);
+
+    // Launch 1: batched SwiGLU across all (expert, up/gate page) tasks.
+    {
+        int blocks_m = (max_sw_m_slice + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        dim3 grid(blocks_m, num_sw_tasks);
+        vib3_moe_multi_int4_swiglu_kernel<<<grid, BLOCK_SIZE, 0, s>>>(
+            (const float*)input_f32,
+            d_moe_int4_up_w, d_moe_int4_up_s,
+            d_moe_int4_gate_w, d_moe_int4_gate_s,
+            d_moe_int4_mid_out_ptrs,
+            d_moe_int4_sw_m_slices,
+            K_in, group_size
+        );
+    }
+
+    // Launch 2: batched down + weighted atomicAdd across all (expert, down page) tasks.
+    {
+        int blocks_m = (max_dn_m_slice + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        dim3 grid(blocks_m, num_dn_tasks);
+        vib3_moe_multi_int4_down_accum_kernel<<<grid, BLOCK_SIZE, 0, s>>>(
+            d_moe_int4_mid_in_ptrs,
+            d_moe_int4_down_w, d_moe_int4_down_s,
+            d_moe_int4_task_expert_wts,
+            d_moe_int4_dn_row_starts,
+            d_moe_int4_dn_m_slices,
+            layer_output,
+            K_mid, group_size
+        );
+    }
+
+    return (int)cudaGetLastError();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // GPU-Only MoE Dispatch (zero host sync)
 // ════════════════════════════════════════════════════════════════════════════
 //

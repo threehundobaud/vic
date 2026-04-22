@@ -1060,6 +1060,154 @@ pub fn moe_experts_fused(
     Err(Error::Cuda("moe_experts_fused requires GPU".to_string()))
 }
 
+/// One page's contribution to an INT4 expert's up/gate or down matrix.
+/// For SwiGLU tasks, the caller supplies one struct per (up_page, gate_page)
+/// pair per expert; for down tasks, one struct per down_page per expert.
+#[derive(Clone, Copy)]
+pub struct MoeInt4Page {
+    /// Device pointer to the page's packed INT4 weight bytes. Per-group BF16
+    /// scales are expected immediately after the packed data.
+    pub weight: *const u8,
+    /// Expert slot (0..7) — identifies which per-expert intermediate buffer
+    /// this page writes into (SwiGLU) or reads from (down).
+    pub expert_slot: i32,
+    /// Row offset of this page within the expert matrix (SwiGLU: row within
+    /// expert_hidden_dim; down: row within hidden_dim == global layer_output row).
+    pub row_start: i32,
+    /// Number of rows this page covers.
+    pub m_slice: i32,
+}
+
+/// Batched INT4 MoE layer (multi-page). Flattens (expert, page) into a flat
+/// task list and issues exactly two kernel launches (SwiGLU + down·accum).
+///
+/// For K2.6 (8 experts × ~4 pages × 3 stages = 96 launches) this drops to 2.
+///
+/// `input_f32` is the shared FP32 activation (moe_normed_f32).
+/// `sw_tasks`: one per (up,gate) page-pair per expert — up and gate must share
+/// the same expert_slot/row_start/m_slice (caller enforces).
+/// `dn_tasks`: one per down page per expert.
+/// `dn_expert_weights` has one entry per dn_task (routing weight of the task's
+/// expert; callers typically replicate the expert's weight across its pages).
+/// `layer_output` must be pre-zeroed FP32 [m_out].
+#[allow(clippy::too_many_arguments)]
+pub fn moe_int4_experts_fused(
+    input_f32: *const u8,
+    sw_up: &[MoeInt4Page],
+    sw_gate: &[MoeInt4Page],
+    dn: &[MoeInt4Page],
+    dn_expert_weights: &[f32],
+    k_in: usize,
+    m_mid: usize,
+    k_mid: usize,
+    layer_output: *mut f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if stream.is_real() && !sw_up.is_empty() && !dn.is_empty() {
+            assert_eq!(sw_up.len(), sw_gate.len(), "up/gate task count mismatch");
+            assert_eq!(
+                dn.len(),
+                dn_expert_weights.len(),
+                "dn task / weight count mismatch"
+            );
+
+            let group_size = INT4_GROUP_SIZE;
+            let num_sw = sw_up.len();
+            let num_dn = dn.len();
+
+            // Build host-side flat arrays. SwiGLU: per-task up/gate packed ptrs + scales.
+            // Scales follow weight data (packed_k * m_slice bytes in for a [m_slice, K] page).
+            let packed_k_in = k_in.div_ceil(2);
+            let packed_k_mid = k_mid.div_ceil(2);
+
+            let mut sw_up_w = Vec::with_capacity(num_sw);
+            let mut sw_up_s = Vec::with_capacity(num_sw);
+            let mut sw_gate_w = Vec::with_capacity(num_sw);
+            let mut sw_gate_s = Vec::with_capacity(num_sw);
+            let mut sw_slots = Vec::with_capacity(num_sw);
+            let mut sw_row_starts = Vec::with_capacity(num_sw);
+            let mut sw_m_slices = Vec::with_capacity(num_sw);
+            let mut max_sw_m: i32 = 0;
+            for (u, g) in sw_up.iter().zip(sw_gate.iter()) {
+                debug_assert_eq!(u.expert_slot, g.expert_slot);
+                debug_assert_eq!(u.row_start, g.row_start);
+                debug_assert_eq!(u.m_slice, g.m_slice);
+                let up_data_size = packed_k_in * (u.m_slice as usize);
+                let gate_data_size = packed_k_in * (g.m_slice as usize);
+                sw_up_w.push(u.weight);
+                sw_up_s.push(unsafe { u.weight.add(up_data_size) });
+                sw_gate_w.push(g.weight);
+                sw_gate_s.push(unsafe { g.weight.add(gate_data_size) });
+                sw_slots.push(u.expert_slot);
+                sw_row_starts.push(u.row_start);
+                sw_m_slices.push(u.m_slice);
+                if u.m_slice > max_sw_m {
+                    max_sw_m = u.m_slice;
+                }
+            }
+
+            let mut dn_w = Vec::with_capacity(num_dn);
+            let mut dn_s = Vec::with_capacity(num_dn);
+            let mut dn_slots = Vec::with_capacity(num_dn);
+            let mut dn_row_starts = Vec::with_capacity(num_dn);
+            let mut dn_m_slices = Vec::with_capacity(num_dn);
+            let mut max_dn_m: i32 = 0;
+            for d in dn.iter() {
+                let data_size = packed_k_mid * (d.m_slice as usize);
+                dn_w.push(d.weight);
+                dn_s.push(unsafe { d.weight.add(data_size) });
+                dn_slots.push(d.expert_slot);
+                dn_row_starts.push(d.row_start);
+                dn_m_slices.push(d.m_slice);
+                if d.m_slice > max_dn_m {
+                    max_dn_m = d.m_slice;
+                }
+            }
+
+            let err = unsafe {
+                cuda_ffi::vib3_launch_moe_int4_experts_fused(
+                    input_f32,
+                    sw_up_w.as_ptr() as *const *const u8,
+                    sw_up_s.as_ptr() as *const *const u8,
+                    sw_gate_w.as_ptr() as *const *const u8,
+                    sw_gate_s.as_ptr() as *const *const u8,
+                    sw_slots.as_ptr(),
+                    sw_row_starts.as_ptr(),
+                    sw_m_slices.as_ptr(),
+                    num_sw as i32,
+                    max_sw_m,
+                    dn_w.as_ptr() as *const *const u8,
+                    dn_s.as_ptr() as *const *const u8,
+                    dn_slots.as_ptr(),
+                    dn_row_starts.as_ptr(),
+                    dn_m_slices.as_ptr(),
+                    dn_expert_weights.as_ptr(),
+                    num_dn as i32,
+                    max_dn_m,
+                    k_in as i32,
+                    m_mid as i32,
+                    k_mid as i32,
+                    group_size as i32,
+                    layer_output,
+                    stream.raw_ptr(),
+                )
+            };
+            if err != 0 {
+                return Err(Error::Cuda(format!(
+                    "moe_int4_experts_fused launch failed (err={})",
+                    err
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Cuda(
+        "moe_int4_experts_fused requires GPU".to_string(),
+    ))
+}
+
 /// GPU-only fused multi-expert MoE layer: reads expert IDs and weights
 /// directly from device memory (written by router), looks up weight page
 /// pointers from a prebuilt device-side table. Zero host synchronization.
